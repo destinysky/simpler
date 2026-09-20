@@ -110,6 +110,13 @@ __attribute__((weak)) int prepared_run_config_compatible_impl(
 ) {
     return 1;
 }
+// Runtime-specific enrichment of the minimal execution-fault payload. Device
+// orchestration runtimes override this to read their shared runtime status.
+__attribute__((weak)) int collect_native_execution_fault_impl(
+    Runtime * /*runtime*/, const HostApi * /*api*/, NativeExecutionFault * /*fault*/
+) {
+    return 0;
+}
 
 /* ===========================================================================
  * Context-bound HostApi functions passed to runtime implementations.
@@ -807,6 +814,9 @@ int simpler_prepare_run(
         LOG_ERROR("simpler_prepare_run: runtime storage was not zero-initialized before its first use");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    if (descriptor->execution_fault_sink != nullptr) {
+        std::memset(descriptor->execution_fault_sink, 0, sizeof(NativeExecutionFault));
+    }
 
     OnboardNativeRunContext *state = nullptr;
     const uint64_t trace_hid = runner->callable_hash(callable_id);
@@ -1074,6 +1084,27 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     }
     emit_native_run_runner_wall(state);
+
+    // Snapshot execution facts while the Runtime/GM shared-memory image still
+    // belongs to this run. This is intentionally before validate/cleanup. A
+    // launched run is reported when either the host/platform execution path or
+    // the device runtime has latched a non-zero failure.
+    if (launched && state->descriptor.execution_fault_sink != nullptr) {
+        NativeExecutionFault fault{};
+        fault.raw_rc = execution_rc;
+        fault.device_unusable = state->runner->can_accept_run() ? 0 : 1;
+        try {
+            (void)collect_native_execution_fault_impl(&state->runtime, &state->host_api, &fault);
+        } catch (...) {
+            // Fault reporting is diagnostic/control metadata. It must never
+            // replace or mask the execution failure already being finalized.
+        }
+        if (fault.raw_rc != 0 || fault.runtime_status != 0) {
+            std::memcpy(
+                state->descriptor.execution_fault_sink, &fault, sizeof(NativeExecutionFault)
+            );
+        }
+    }
 
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {

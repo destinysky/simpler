@@ -3461,15 +3461,17 @@ NB_MODULE(_task_interface, m) {
             "_submit_chip_run_materialized",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
                uint32_t slot_id, uint64_t generation, uint64_t run_id, uint64_t dispatch_id,
-               uint64_t accepted_state_addr, int32_t accepted_value, bool activated) {
+               uint64_t accepted_state_addr, int32_t accepted_value, bool activated,
+               uint64_t execution_fault_sink_addr) {
                 return self.submit_chip_run(
                     callable_id, args, config, PipelineSlotLease{slot_id, 0, generation}, run_id, dispatch_id,
-                    reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, activated
+                    reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, activated,
+                    reinterpret_cast<NativeExecutionFault *>(execution_fault_sink_addr)
                 );
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("slot_id"), nb::arg("generation"),
             nb::arg("run_id"), nb::arg("dispatch_id"), nb::arg("accepted_state_addr"), nb::arg("accepted_value"),
-            nb::arg("activated"), nb::call_guard<nb::gil_scoped_release>(),
+            nb::arg("activated"), nb::arg("execution_fault_sink_addr") = 0, nb::call_guard<nb::gil_scoped_release>(),
             "Submit materialized task args to the chip native-run lane."
         )
         .def(
@@ -3523,21 +3525,25 @@ NB_MODULE(_task_interface, m) {
             "run_materialized",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
                uint64_t accepted_state_addr, int32_t accepted_value, uint32_t pipeline_slot,
-               uint64_t pipeline_generation) {
+               uint64_t pipeline_generation, uint64_t execution_fault_sink_addr) {
+                auto *execution_fault_sink =
+                    reinterpret_cast<NativeExecutionFault *>(execution_fault_sink_addr);
                 if (pipeline_generation == 0) {
                     self.run(
                         callable_id, &args, config, reinterpret_cast<volatile int32_t *>(accepted_state_addr),
-                        accepted_value
+                        accepted_value, execution_fault_sink
                     );
                 } else {
                     self.run_with_lease(
                         callable_id, &args, config, PipelineSlotLease{pipeline_slot, 0, pipeline_generation},
-                        reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value
+                        reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value,
+                        execution_fault_sink
                     );
                 }
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("accepted_state_addr") = 0,
             nb::arg("accepted_value") = 0, nb::arg("pipeline_slot") = 0, nb::arg("pipeline_generation") = 0,
+            nb::arg("execution_fault_sink_addr") = 0,
             "Launch a callable_id from the runtime.so-ABI POD a chip-child mailbox loop built with "
             "materialize_task_args, so no Python code re-implements the tensor/scalar layout."
         )

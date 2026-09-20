@@ -105,10 +105,12 @@ public:
     void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
     void
     run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config,
-        volatile int32_t *accepted_state, int32_t accepted_value);
+        volatile int32_t *accepted_state, int32_t accepted_value,
+        NativeExecutionFault *execution_fault_sink = nullptr);
     void run_with_lease(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
-        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
+        NativeExecutionFault *execution_fault_sink = nullptr
     );
 
     /**
@@ -134,7 +136,7 @@ public:
     ChipWorkerNativeRun prepare_native_run(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id = 0, uint64_t dispatch_id = 0, volatile int32_t *accepted_state = nullptr,
-        int32_t accepted_value = 0
+        int32_t accepted_value = 0, NativeExecutionFault *execution_fault_sink = nullptr
     );
     void launch_native_run(const ChipWorkerNativeRun &run);
     bool poll_native_run(const ChipWorkerNativeRun &run);
@@ -144,14 +146,15 @@ public:
     ChipRun submit_chip_run(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
-        bool activated = true
+        bool activated = true, NativeExecutionFault *execution_fault_sink = nullptr
     );
     // Direct submission: no pipeline lease, so the lane admits at capacity one
     // by draining its predecessor before this run enters the FIFO. run() is the
     // blocking composition of this call and ChipRun::wait_until.
     ChipRun submit_chip_run(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
-        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
+        NativeExecutionFault *execution_fault_sink = nullptr
     );
     void close_chip_run_lane();
 
@@ -387,12 +390,12 @@ private:
     ChipWorkerNativeRun prepare_native_run_on_slot(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
         uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-        int32_t accepted_value, bool admit_pipeline_generation
+        int32_t accepted_value, NativeExecutionFault *execution_fault_sink, bool admit_pipeline_generation
     );
     ChipWorkerNativeRun prepare_native_run_for_lane(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-        bool pipeline_leased
+        NativeExecutionFault *execution_fault_sink, bool pipeline_leased
     );
     void cleanup_native_runs_noexcept() noexcept;
 

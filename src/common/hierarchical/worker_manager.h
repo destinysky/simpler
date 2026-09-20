@@ -99,7 +99,7 @@ static constexpr size_t MAILBOX_TASK_FRAME_COUNT = 2;
 static constexpr size_t MAILBOX_CONTROL_FRAME = 0;
 static constexpr size_t MAILBOX_FIRST_TASK_FRAME = 1;
 static constexpr size_t MAILBOX_SIZE = MAILBOX_FRAME_SIZE * (1 + MAILBOX_TASK_FRAME_COUNT);
-static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 4;
+static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 5;
 
 // Error message region lives at the mailbox tail. 256 B of headroom is
 // enough for `<ExceptionType>: <short message>` produced by the child-side
@@ -163,6 +163,13 @@ static constexpr ptrdiff_t MAILBOX_OFF_FRAME_GROUP_SIZE = MAILBOX_OFF_ACCEPTED -
 // matter what state word a concurrent control command leaves behind.
 static constexpr ptrdiff_t MAILBOX_OFF_SHUTDOWN = MAILBOX_OFF_ACCEPTED - 72;
 static constexpr int32_t MAILBOX_SHUTDOWN_REQUESTED = 1;
+// Minimal L2 execution-fault payload. The parent zeroes it before publishing a
+// task frame; the native runtime writes it before the child publishes terminal
+// TASK_FAILED.
+static constexpr size_t MAILBOX_NATIVE_EXECUTION_FAULT_SIZE = sizeof(NativeExecutionFault);
+static constexpr ptrdiff_t MAILBOX_OFF_NATIVE_EXECUTION_FAULT =
+    MAILBOX_OFF_SHUTDOWN - static_cast<ptrdiff_t>(MAILBOX_NATIVE_EXECUTION_FAULT_SIZE);
+static_assert(sizeof(NativeExecutionFault) == 16, "NativeExecutionFault mailbox ABI must remain 16 bytes");
 static constexpr ptrdiff_t MAILBOX_OFF_TASK_CALLABLE_HASH = MAILBOX_OFF_ARGS;
 static constexpr ptrdiff_t MAILBOX_OFF_TASK_ARGS_BLOB =
     MAILBOX_OFF_TASK_CALLABLE_HASH + static_cast<ptrdiff_t>(CALLABLE_HASH_DIGEST_SIZE);
@@ -170,13 +177,14 @@ static constexpr size_t CTRL_SHM_NAME_BYTES = 32;
 static constexpr ptrdiff_t MAILBOX_OFF_CONTROL_CALLABLE_HASH =
     MAILBOX_OFF_ARGS + static_cast<ptrdiff_t>(CTRL_SHM_NAME_BYTES);
 static_assert(
-    MAILBOX_OFF_TASK_ARGS_BLOB < MAILBOX_OFF_SHUTDOWN,
-    "mailbox task-args region must precede the shutdown word and the frame protocol trailer"
+    MAILBOX_OFF_TASK_ARGS_BLOB < MAILBOX_OFF_NATIVE_EXECUTION_FAULT,
+    "mailbox task-args region must precede the execution-fault and frame protocol trailers"
 );
-// The shutdown word is reserved on every frame, not just the control frame, so
-// the args region a task frame accepts can never reach it.
+// The fault trailer is reserved on every task frame, so task args cannot
+// overwrite either it or the existing shutdown/identity trailer.
 static constexpr size_t MAILBOX_ARGS_CAPACITY =
-    static_cast<size_t>(MAILBOX_OFF_SHUTDOWN) - static_cast<size_t>(MAILBOX_OFF_TASK_ARGS_BLOB);
+    static_cast<size_t>(MAILBOX_OFF_NATIVE_EXECUTION_FAULT) -
+    static_cast<size_t>(MAILBOX_OFF_TASK_ARGS_BLOB);
 // The blob's element is the wire `Tensor` (144 B), not the device `ChipTensor` (128 B), so a frozen
 // descriptor size and a frame size that cannot hold CHIP_MAX_TENSOR_ARGS of them fail the build
 // rather than the first 256-tensor task.

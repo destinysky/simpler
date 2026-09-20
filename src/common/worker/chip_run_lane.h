@@ -18,6 +18,7 @@
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
 #include "pipeline_slot_pool.h"
+#include "runtime_c_api.h"
 
 class ChipWorker;
 struct ChipRunLaneState;
@@ -66,11 +67,12 @@ public:
     ChipRun submit(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
-        bool activated = true
+        bool activated = true, NativeExecutionFault *execution_fault_sink = nullptr
     );
     ChipRun submit(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
-        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
+        NativeExecutionFault *execution_fault_sink = nullptr
     );
 
     void drain();

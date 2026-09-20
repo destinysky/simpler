@@ -579,15 +579,16 @@ void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
 }
 
 void ChipWorker::run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config) {
-    run(callable_id, args, config, nullptr, 0);
+    run(callable_id, args, config, nullptr, 0, nullptr);
 }
 
 void ChipWorker::run(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, volatile int32_t *accepted_state,
-    int32_t accepted_value
+    int32_t accepted_value, NativeExecutionFault *execution_fault_sink
 ) {
     if (args == nullptr) throw std::runtime_error("run requires task args");
-    ChipRun run = submit_chip_run(callable_id, *args, config, accepted_state, accepted_value);
+    ChipRun run =
+        submit_chip_run(callable_id, *args, config, accepted_state, accepted_value, execution_fault_sink);
     (void)run.wait_until(ChipRun::Deadline::max());
 }
 
@@ -626,7 +627,7 @@ uint64_t ChipWorker::retained_temp_addr(uint32_t slot_id) const {
 
 void ChipWorker::run_with_lease(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
-    volatile int32_t *accepted_state, int32_t accepted_value
+    volatile int32_t *accepted_state, int32_t accepted_value, NativeExecutionFault *execution_fault_sink
 ) {
     if (lease.reserved != 0 || lease.generation == 0 || lease.slot_id >= pipeline_contract_.pipeline_depth) {
         throw std::runtime_error("run pipeline lease is outside the runtime PipelineContract");
@@ -634,32 +635,34 @@ void ChipWorker::run_with_lease(
     if (args == nullptr) throw std::runtime_error("run_with_lease requires task args");
     if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
     ChipRun run = run_lane_->submit(
-        callable_id, *args, config, lease, /*run_id=*/0, /*dispatch_id=*/0, accepted_state, accepted_value, true
+        callable_id, *args, config, lease, /*run_id=*/0, /*dispatch_id=*/0, accepted_state, accepted_value, true,
+        execution_fault_sink
     );
     (void)run.wait_until(ChipRun::Deadline::max());
 }
 
 ChipWorkerNativeRun ChipWorker::prepare_native_run(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
-    uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value
+    uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
+    NativeExecutionFault *execution_fault_sink
 ) {
     if (lease.reserved != 0 || lease.generation == 0 || lease.slot_id >= pipeline_contract_.pipeline_depth) {
         throw std::runtime_error("native-run pipeline lease is outside the runtime PipelineContract");
     }
     return prepare_native_run_on_slot(
         callable_id, args, config, lease.slot_id, lease.generation, run_id, dispatch_id, accepted_state, accepted_value,
-        true
+        execution_fault_sink, true
     );
 }
 
 ChipWorkerNativeRun ChipWorker::prepare_native_run_for_lane(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
     uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-    bool pipeline_leased
+    NativeExecutionFault *execution_fault_sink, bool pipeline_leased
 ) {
     return prepare_native_run_on_slot(
         callable_id, args, config, lease.slot_id, lease.generation, run_id, dispatch_id, accepted_state, accepted_value,
-        pipeline_leased
+        execution_fault_sink, pipeline_leased
     );
 }
 
@@ -671,7 +674,7 @@ bool ChipWorker::supports_concurrent_native_prepare() const {
 ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
     uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-    int32_t accepted_value, bool admit_pipeline_generation
+    int32_t accepted_value, NativeExecutionFault *execution_fault_sink, bool admit_pipeline_generation
 ) {
     config.validate();
     if (!initialized_) {
@@ -730,7 +733,8 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         const NativeRunDescriptor descriptor{slot_id,        arena_bank_for_slot(slot_id),
                                              run_id,         generation,
                                              dispatch_id,    run_epoch,
-                                             accepted_state, accepted_value};
+                                             accepted_state, accepted_value,
+                                             execution_fault_sink};
         rc = prepare_run_fn_(device_ctx_, runtime_bufs_[slot_id].data(), callable_id, args, &config, &descriptor);
     } catch (...) {
         std::lock_guard<std::mutex> lk(native_run_mu_);
@@ -779,20 +783,22 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
 
 ChipRun ChipWorker::submit_chip_run(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
-    uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value, bool activated
+    uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value, bool activated,
+    NativeExecutionFault *execution_fault_sink
 ) {
     if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
     return run_lane_->submit(
-        callable_id, args, config, lease, run_id, dispatch_id, accepted_state, accepted_value, activated
+        callable_id, args, config, lease, run_id, dispatch_id, accepted_state, accepted_value, activated,
+        execution_fault_sink
     );
 }
 
 ChipRun ChipWorker::submit_chip_run(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
-    int32_t accepted_value
+    int32_t accepted_value, NativeExecutionFault *execution_fault_sink
 ) {
     if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
-    return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value);
+    return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value, execution_fault_sink);
 }
 
 void ChipWorker::close_chip_run_lane() {

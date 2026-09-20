@@ -780,6 +780,7 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     int32_t zero_err = 0;
     std::memcpy(frame + MAILBOX_OFF_ERROR, &zero_err, sizeof(zero_err));
     std::memset(frame + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
+    std::memset(frame + MAILBOX_OFF_NATIVE_EXECUTION_FAULT, 0, MAILBOX_NATIVE_EXECUTION_FAULT_SIZE);
     clear_task_accepted(frame);
     const int32_t no_disposition = static_cast<int32_t>(MailboxPreparationDisposition::NONE);
     std::memcpy(frame + MAILBOX_OFF_PREPARATION_DISPOSITION, &no_disposition, sizeof(no_disposition));
@@ -978,11 +979,28 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
             progress.dispatch = record.dispatch;
             progress.completion.task_slot = record.dispatch.task_slot;
             progress.completion.group_index = record.dispatch.group_index;
+            progress.completion.launch_accepted = record.accepted_reported || read_task_accepted(frame);
+            std::memcpy(
+                &progress.completion.native_execution_fault, frame + MAILBOX_OFF_NATIVE_EXECUTION_FAULT,
+                sizeof(progress.completion.native_execution_fault)
+            );
             if (state == MailboxState::TASK_FAILED || error_code != 0) {
                 progress.completion.outcome = EndpointOutcome::TASK_FAILURE;
                 progress.completion.error_message =
                     "LocalMailboxEndpoint child failed (worker_id=" + std::to_string(caps_.worker_id) +
                     ", code=" + std::to_string(error_code) + "): " + read_error_msg(frame);
+                const NativeExecutionFault &fault = progress.completion.native_execution_fault;
+                if (fault.raw_rc != 0 || fault.runtime_status != 0) {
+                    std::ostringstream os;
+                    os << " [native_execution_fault"
+                       << " raw_rc=" << fault.raw_rc
+                       << " runtime_status=" << fault.runtime_status
+                       << " detail_code=" << fault.detail_code
+                       << " device_unusable=" << fault.device_unusable
+                       << " launch_accepted=" << static_cast<int>(progress.completion.launch_accepted)
+                       << "]";
+                    progress.completion.error_message += os.str();
+                }
             } else {
                 progress.completion.outcome = EndpointOutcome::SUCCESS;
             }

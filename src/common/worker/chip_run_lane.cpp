@@ -33,6 +33,7 @@ struct ChipRunState {
     uint64_t dispatch_id{0};
     volatile int32_t *accepted_state{nullptr};
     int32_t accepted_value{0};
+    NativeExecutionFault *execution_fault_sink{nullptr};
     ChipWorkerNativeRun native_run{};
     Phase phase{Phase::QUEUED};
     ChipRunPreparationDisposition disposition{ChipRunPreparationDisposition::VALIDATED_ONLY};
@@ -88,7 +89,7 @@ struct ChipRunLaneState {
     void prepare(const std::shared_ptr<ChipRunState> &run) {
         run->native_run = worker->prepare_native_run_for_lane(
             run->callable_id, &run->args, run->config, run->lease, run->run_id, run->dispatch_id, run->accepted_state,
-            run->accepted_value, run->pipeline_leased
+            run->accepted_value, run->execution_fault_sink, run->pipeline_leased
         );
         run->phase = ChipRunState::Phase::PREPARED;
         run->disposition = ChipRunPreparationDisposition::NATIVE_PREPARED;
@@ -364,7 +365,8 @@ ChipRunLane::~ChipRunLane() {
 
 ChipRun ChipRunLane::submit(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
-    uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value, bool activated
+    uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value, bool activated,
+    NativeExecutionFault *execution_fault_sink
 ) {
     std::lock_guard<std::mutex> lk(state_->mu);
     state_->require_usable();
@@ -399,6 +401,7 @@ ChipRun ChipRunLane::submit(
     run->dispatch_id = dispatch_id;
     run->accepted_state = accepted_state;
     run->accepted_value = accepted_value;
+    run->execution_fault_sink = execution_fault_sink;
     run->pipeline_leased = true;
     run->activated = activated;
     state_->generations[lease.slot_id] = lease.generation;
@@ -428,7 +431,7 @@ ChipRun ChipRunLane::submit(
 
 ChipRun ChipRunLane::submit(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
-    int32_t accepted_value
+    int32_t accepted_value, NativeExecutionFault *execution_fault_sink
 ) {
     std::lock_guard<std::mutex> lk(state_->mu);
     state_->require_usable();
@@ -472,6 +475,7 @@ ChipRun ChipRunLane::submit(
     run->lease = PipelineSlotLease{slot_id, 0, state_->direct_generation};
     run->accepted_state = accepted_state;
     run->accepted_value = accepted_value;
+    run->execution_fault_sink = execution_fault_sink;
     run->pipeline_leased = false;
     run->activated = true;
     state_->fifo.push_back(run);

@@ -119,6 +119,24 @@ enum {
     SIMPLER_NATIVE_RUN_POLL_COMPLETE = 1,
 };
 
+/**
+ * Minimal execution-fault facts carried from L2 to the L3 completion path.
+ *
+ * This intentionally contains no policy/classification fields.  Step 2+ owns
+ * the decision whether a particular (raw_rc, runtime_status, detail_code)
+ * tuple is replayable.
+ */
+typedef struct NativeExecutionFault {
+    /* Direct host/platform execution rc (for example a CANN runtime rc). */
+    int32_t raw_rc;
+    /* Device-runtime semantic status (for example -SIMPLER_ERROR_SCHEDULER_TIMEOUT). */
+    int32_t runtime_status;
+    /* Runtime-specific refinement of runtime_status; zero means no extra detail. */
+    int32_t detail_code;
+    /* Non-zero when the current DeviceRunner generation no longer accepts runs. */
+    int32_t device_unusable;
+} NativeExecutionFault;
+
 enum {
     PTO_PIPELINE_CONTRACT_ABI_VERSION = 1,
     PTO_PIPELINE_MAX_RESOURCES = 8,
@@ -205,7 +223,10 @@ typedef struct PipelineSlotLease {
  * leased slot to a different arena bank. `run_epoch` is the process-unique
  * identity used by later phase calls; lease generation, run id, and dispatch
  * id remain diagnostic after admission. A non-null acceptance sink is written
- * only at the real kernel-launch marker.
+ * only at the real kernel-launch marker. A non-null execution_fault_sink must
+ * remain valid through finalize; for a launched native execution the runtime
+ * writes it when either the host/platform execution rc or the device-runtime
+ * semantic status is non-zero.
  */
 typedef struct NativeRunDescriptor {
     uint32_t pipeline_slot;
@@ -216,6 +237,7 @@ typedef struct NativeRunDescriptor {
     uint64_t run_epoch;
     volatile int32_t *accepted_state;
     int32_t accepted_value;
+    NativeExecutionFault *execution_fault_sink;
 } NativeRunDescriptor;
 
 /* Per-stage run timing is no longer returned. The platform emits it as

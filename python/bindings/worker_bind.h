@@ -870,6 +870,9 @@ inline void bind_worker(nb::module_ &m) {
     m.attr("MAILBOX_FRAME_SIZE") = static_cast<int>(MAILBOX_FRAME_SIZE);
     m.attr("MAILBOX_OFF_ERROR_MSG") = static_cast<int>(MAILBOX_OFF_ERROR_MSG);
     m.attr("MAILBOX_ERROR_MSG_SIZE") = static_cast<int>(MAILBOX_ERROR_MSG_SIZE);
+    m.attr("MAILBOX_OFF_NATIVE_EXECUTION_FAULT") = static_cast<int>(MAILBOX_OFF_NATIVE_EXECUTION_FAULT);
+    m.attr("MAILBOX_NATIVE_EXECUTION_FAULT_SIZE") = static_cast<int>(MAILBOX_NATIVE_EXECUTION_FAULT_SIZE);
+    m.attr("MAILBOX_TASK_PROTOCOL_VERSION") = static_cast<uint32_t>(MAILBOX_TASK_PROTOCOL_VERSION);
     // The MailboxState values as the C++ side defines them, keyed by
     // enumerator name. They are a cross-process wire contract: the word at
     // MAILBOX_OFF_STATE is written by a parent and read by its forked child,

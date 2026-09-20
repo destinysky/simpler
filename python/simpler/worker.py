@@ -263,8 +263,11 @@ from .task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_FRAME_SIZE,
     MAILBOX_OFF_ERROR_MSG,
+    MAILBOX_OFF_NATIVE_EXECUTION_FAULT,
+    MAILBOX_NATIVE_EXECUTION_FAULT_SIZE,
     MAILBOX_PREPARATION_DISPOSITION_VALUES,
     MAILBOX_SIZE,
+    MAILBOX_TASK_PROTOCOL_VERSION,
     MAILBOX_STATE_VALUES,
     PROV_NOT_LIVE,
     CallConfig,
@@ -365,7 +368,7 @@ _OFF_FRAME_DISPATCH_ID = _OFF_ACCEPTED - 8
 _OFF_FRAME_TASK_SLOT = _OFF_ACCEPTED - 48
 _OFF_FRAME_GROUP_INDEX = _OFF_ACCEPTED - 56
 _OFF_FRAME_GROUP_SIZE = _OFF_ACCEPTED - 64
-_TASK_PROTOCOL_VERSION = 4
+_TASK_PROTOCOL_VERSION = MAILBOX_TASK_PROTOCOL_VERSION
 # Mirrors MAILBOX_OFF_SHUTDOWN / MAILBOX_SHUTDOWN_REQUESTED: termination is a
 # sticky one-way word on the control frame, not a MailboxState. _OFF_STATE has
 # three writers (parent CONTROL_REQUEST, child CONTROL_DONE, C++
@@ -374,7 +377,9 @@ _TASK_PROTOCOL_VERSION = 4
 # is reserved on every frame so a task-args blob can never reach it.
 _OFF_SHUTDOWN = _OFF_ACCEPTED - 72
 _SHUTDOWN_REQUESTED = 1
-_MAILBOX_ARGS_CAPACITY = _OFF_SHUTDOWN - _OFF_TASK_ARGS_BLOB
+_OFF_NATIVE_EXECUTION_FAULT = MAILBOX_OFF_NATIVE_EXECUTION_FAULT
+assert MAILBOX_NATIVE_EXECUTION_FAULT_SIZE == 16
+_MAILBOX_ARGS_CAPACITY = _OFF_NATIVE_EXECUTION_FAULT - _OFF_TASK_ARGS_BLOB
 _OFF_CONTROL_CALLABLE_HASH = _OFF_ARGS + 32
 # MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
 # nanobind module so the two sides cannot drift.
@@ -2998,6 +3003,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 _TASK_ACCEPTED,
                 pipeline_slot,
                 pipeline_generation,
+                task_addr + _OFF_NATIVE_EXECUTION_FAULT,
             )
         except Exception as e:  # noqa: BLE001
             code = 1
@@ -3256,6 +3262,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 frame.frame_addr + _OFF_ACCEPTED,
                 _TASK_ACCEPTED,
                 False,
+                frame.frame_addr + _OFF_NATIVE_EXECUTION_FAULT,
             )
             raw_disposition = frame.chip_run.preparation_disposition
             disposition = int(getattr(raw_disposition, "value", raw_disposition))

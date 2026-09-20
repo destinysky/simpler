@@ -953,6 +953,7 @@ class _FakeNativeRunImpl:
         accepted_addr,
         accepted_value,
         activated,
+        execution_fault_sink_addr=0,
     ):
         submission = SimpleNamespace(
             cid=cid,
@@ -964,6 +965,7 @@ class _FakeNativeRunImpl:
             dispatch_id=int(dispatch_id),
             accepted_addr=int(accepted_addr),
             accepted_value=int(accepted_value),
+            execution_fault_sink_addr=int(execution_fault_sink_addr),
         )
         run = _FakeChipRun(self, submission)
         run.activated = bool(activated)

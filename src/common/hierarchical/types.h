@@ -328,6 +328,8 @@ struct WorkerCompletion {
     int32_t group_index{0};
     EndpointOutcome outcome{EndpointOutcome::SUCCESS};
     std::string error_message;
+    bool launch_accepted{false};
+    NativeExecutionFault native_execution_fault{};
 };
 
 // =============================================================================

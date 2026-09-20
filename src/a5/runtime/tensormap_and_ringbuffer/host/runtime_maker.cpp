@@ -227,6 +227,23 @@ static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedM
     return runtime_status_from_error_codes(orch_error_code, sched_error_code);
 }
 
+extern "C" int
+collect_native_execution_fault_impl(Runtime *runtime, const HostApi *api, NativeExecutionFault *fault) {
+    if (runtime == nullptr || api == nullptr || fault == nullptr) {
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+
+    SharedMemoryHeader host_header;
+    memset(&host_header, 0, sizeof(host_header));
+    fault->runtime_status = read_runtime_status(runtime, api, &host_header);
+
+    // sched_stall_detail is defined as NONE (0) for non-timeout runs and is
+    // reset with the shared-memory header. Keep it as an optional refinement;
+    // it never gates whether an execution fault is reported.
+    fault->detail_code = host_header.sched_stall_detail.load(std::memory_order_acquire);
+    return 0;
+}
+
 static void release_run_tensor_leases(Runtime *runtime, const HostApi *api) {
     const TensorLeaseReleaseCounts counts = release_tensor_leases(runtime->tensor_leases_, api);
     LOG_DEBUG(
