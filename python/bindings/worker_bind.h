@@ -432,6 +432,10 @@ inline void bind_worker(nb::module_ &m) {
             "Set run admission depth from the minimum direct-chip runtime capability before init."
         )
         .def(
+            "configure_operator_recovery", &Worker::configure_operator_recovery, nb::arg("enabled") = false,
+            "Enable or disable L3 operator recovery before init (default false)."
+        )
+        .def(
             "add_sub_worker",
             [](Worker &self, uint64_t mailbox_ptr, int child_pid) {
                 self.add_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr), child_pid);

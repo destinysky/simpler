@@ -548,15 +548,28 @@ def test_local_task_frame_count_uses_direct_a2a3_pipeline_depth(platform, runtim
     assert worker_mod._local_task_frame_count(platform, runtime, depth) == expected
 
 
-def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypatch):
+@pytest.mark.parametrize(
+    ("worker_config", "expected_operator_recovery"),
+    [
+        ({}, False),
+        ({"enable_operator_recovery": True}, True),
+    ],
+)
+def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(
+    monkeypatch, worker_config, expected_operator_recovery
+):
     class FakeParentWorker:
         def __init__(self) -> None:
             self.configured_depths: list[int] = []
+            self.operator_recovery_values: list[bool] = []
             self.next_level_calls: list[tuple[int, int, int]] = []
             self.initialized = False
 
         def configure_pipeline_depth(self, depth: int) -> None:
             self.configured_depths.append(int(depth))
+
+        def configure_operator_recovery(self, enabled: bool = False) -> None:
+            self.operator_recovery_values.append(bool(enabled))
 
         def add_next_level_worker(self, mailbox_addr: int, pid: int, task_frame_count: int) -> None:
             self.next_level_calls.append((int(mailbox_addr), int(pid), int(task_frame_count)))
@@ -573,6 +586,7 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypa
         num_sub_workers=0,
         platform="a2a3",
         runtime="host_build_graph",
+        **worker_config,
     )
     worker._chip_shms = [SharedMemory(create=True, size=MAILBOX_SIZE) for _ in range(2)]
     worker._l3_bins = "bins"
@@ -612,6 +626,7 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypa
             shm.unlink()
 
     assert fake_parent.configured_depths == [1]
+    assert fake_parent.operator_recovery_values == [expected_operator_recovery]
     assert [call[1:] for call in fake_parent.next_level_calls] == [(12001, 2), (12002, 1)]
     assert fake_parent.initialized
     assert startup_events[0] == ("log", 60, True)
@@ -632,6 +647,9 @@ def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monk
             self.sub_workers: list[int] = []
 
         def configure_pipeline_depth(self, depth: int) -> None:
+            pass
+
+        def configure_operator_recovery(self, enabled: bool = False) -> None:
             pass
 
         def add_sub_worker(self, _mailbox_addr: int, pid: int) -> None:

@@ -44,6 +44,7 @@
 #include <thread>
 #include <unordered_set>
 
+#include "recovery_coordinator.h"
 #include "types.h"
 
 class WorkerManager;  // forward decl
@@ -100,6 +101,12 @@ public:
         // Called as soon as an endpoint reports failure so the error is
         // attached to the task's run even when a group has other members live.
         std::function<void(TaskSlot, const std::string &)> on_task_failed_cb;
+        // Step 2/3 recovery seam. Scheduler only intercepts a structured local
+        // chip TASK_FAILURE; Orchestrator owns the RUNNING -> RETRY_PENDING
+        // transition and the run-level hold. Policy lives in RecoveryCoordinator.
+        bool operator_recovery_enabled{false};
+        std::function<std::optional<uint32_t>(TaskSlot, uint64_t)> begin_task_recovery_cb;
+        std::function<void(TaskSlot, uint64_t)> finish_task_recovery_cb;
         // Diagnostic-only reservation stall reporting. The sink must not
         // block: it runs on the scheduler dispatch path.
         std::chrono::milliseconds reservation_stall_warn_after{std::chrono::seconds(5)};
@@ -155,6 +162,8 @@ private:
     std::thread sched_thread_;
     std::atomic<bool> stop_requested_{false};
     std::atomic<bool> running_{false};
+    RecoveryCoordinator recovery_coordinator_;
+    std::atomic<uint64_t> next_recovery_id_{1};
     struct NextLevelGroupDispatchResult {
         std::unordered_set<int32_t> reserved_worker_ids;
         TaskSlot blocked_group_slot{INVALID_SLOT};
@@ -182,6 +191,9 @@ private:
     std::optional<ReservationStallEpisode> reservation_stall_episode_;
 
     void run();
+    bool try_intercept_recovery(WorkerCompletion &completion);
+    void progress_recovery();
+    void on_recovery_resolution(RecoveryResolution resolution);
     void on_task_complete(const WorkerCompletion &completion);
     void poison_task(TaskSlot slot, const std::string &root_message);
 

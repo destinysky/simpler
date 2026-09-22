@@ -138,7 +138,8 @@ void Orchestrator::finish_run_if_ready(const std::shared_ptr<RunState> &run) {
     {
         std::lock_guard<std::mutex> lk(run->completion_mu);
         RunPhase phase = run->phase.load(std::memory_order_acquire);
-        if (!run->submission_closed || run->active_tasks.load(std::memory_order_acquire) != 0 || is_terminal(phase) ||
+        if (!run->submission_closed || run->active_tasks.load(std::memory_order_acquire) != 0 ||
+            run->active_recoveries != 0 || is_terminal(phase) ||
             (phase != RunPhase::EXECUTING && !run->submission_failed)) {
             return;
         }
@@ -315,8 +316,12 @@ bool Orchestrator::run_failed(RunId run_id) const {
 bool Orchestrator::dispatchable_locked(RunId run_id) const {
     if (active_run_id_ != run_id) return false;
     auto it = runs_.find(run_id);
-    return it != runs_.end() && it->second->phase.load(std::memory_order_acquire) == RunPhase::EXECUTING &&
-           pipeline_slots_.owns(it->second->lease);
+    if (it == runs_.end() || it->second->phase.load(std::memory_order_acquire) != RunPhase::EXECUTING ||
+        !pipeline_slots_.owns(it->second->lease)) {
+        return false;
+    }
+    std::lock_guard<std::mutex> recovery_lk(it->second->completion_mu);
+    return it->second->active_recoveries == 0;
 }
 
 bool Orchestrator::can_dispatch_run(RunId run_id) const {
@@ -517,13 +522,32 @@ void Orchestrator::decrement_run_accepts(RunId run_id) {
 
 void Orchestrator::record_run_error(const std::shared_ptr<RunState> &run, std::exception_ptr error) {
     if (run == nullptr || !error) return;
-    std::lock_guard<std::mutex> lk(run->completion_mu);
-    if (!run->first_error) run->first_error = std::move(error);
+    bool notify = false;
+    {
+        std::lock_guard<std::mutex> lk(run->completion_mu);
+        if (!run->first_error) {
+            run->first_error = std::move(error);
+            notify = true;
+        }
+    }
+    if (notify) run->completion_cv.notify_all();
 }
 
 void Orchestrator::record_run_error(RunId run_id, std::exception_ptr error) {
     if (!error) return;
     record_run_error(find_run(run_id), std::move(error));
+}
+
+void Orchestrator::wait_recovery_gate(const std::shared_ptr<RunState> &run) {
+    std::unique_lock<std::mutex> lk(run->completion_mu);
+    run->completion_cv.wait(lk, [&run] {
+        return run->active_recoveries == 0 || static_cast<bool>(run->first_error) || run->submission_failed ||
+               is_terminal(run->phase.load(std::memory_order_acquire));
+    });
+    if (run->first_error) std::rethrow_exception(run->first_error);
+    if (run->submission_failed || is_terminal(run->phase.load(std::memory_order_acquire))) {
+        throw std::runtime_error("Orchestrator: run is no longer accepting work");
+    }
 }
 
 bool Orchestrator::current_building_run_failed_for_test() const {
@@ -540,6 +564,59 @@ size_t Orchestrator::begin_run_waiter_count_for_test() const {
 void Orchestrator::report_task_error(TaskSlot slot, const std::string &message) {
     TaskSlotState &task = slot_state(slot);
     record_run_error(task.run_id, std::make_exception_ptr(std::runtime_error(message)));
+}
+
+std::optional<uint32_t> Orchestrator::begin_task_recovery(TaskSlot slot, uint64_t recovery_id) {
+    if (recovery_id == 0) return std::nullopt;
+    TaskSlotState *task = allocator_->slot_state(slot);
+    if (task == nullptr) return std::nullopt;
+    auto run = find_run(task->run_id);
+    if (run == nullptr) return std::nullopt;
+
+    std::lock_guard<std::mutex> lk(run->completion_mu);
+    if (run->submission_failed || run->first_error ||
+        is_terminal(run->phase.load(std::memory_order_acquire))) {
+        return std::nullopt;
+    }
+    TaskState expected = TaskState::RUNNING;
+    if (!task->state.compare_exchange_strong(
+            expected, TaskState::RETRY_PENDING, std::memory_order_acq_rel, std::memory_order_acquire
+        )) {
+        return std::nullopt;
+    }
+
+    if (!task->recovery_active) {
+        task->recovery_active = true;
+        task->recovery_attempt = 0;
+        ++run->active_recoveries;
+    } else {
+        ++task->recovery_attempt;
+    }
+    task->active_recovery_id.store(recovery_id, std::memory_order_release);
+    return task->recovery_attempt;
+}
+
+bool Orchestrator::finish_task_recovery(TaskSlot slot, uint64_t recovery_id) {
+    if (recovery_id == 0) return false;
+    TaskSlotState *task = allocator_->slot_state(slot);
+    if (task == nullptr) return false;
+    auto run = find_run(task->run_id);
+    if (run == nullptr) return false;
+
+    bool notify = false;
+    {
+        std::lock_guard<std::mutex> lk(run->completion_mu);
+        if (!task->recovery_active ||
+            task->active_recovery_id.load(std::memory_order_acquire) != recovery_id) {
+            return false;
+        }
+        task->active_recovery_id.store(0, std::memory_order_release);
+        task->recovery_active = false;
+        if (run->active_recoveries > 0) --run->active_recoveries;
+        notify = run->active_recoveries == 0;
+    }
+    if (notify) run->completion_cv.notify_all();
+    return true;
 }
 
 void Orchestrator::mark_task_accepted(TaskSlot slot) {
@@ -606,6 +683,7 @@ uint64_t Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype,
     if (shape.size() > MAX_TENSOR_DIMS) {
         throw std::invalid_argument("Orchestrator::alloc: shape exceeds MAX_TENSOR_DIMS");
     }
+    wait_recovery_gate(run);
 
     uint64_t numel = 1;
     for (uint32_t d : shape)
@@ -743,11 +821,7 @@ SubmitResult Orchestrator::submit_impl(
     validate_remote_sidecars(args_list, remote_sidecars, eligible_worker_ids);
     validate_explicit_deps(run->id, args_list);
     validate_submit_args(args_list);
-
-    {
-        std::lock_guard<std::mutex> lk(run->completion_mu);
-        if (run->first_error) std::rethrow_exception(run->first_error);
-    }
+    wait_recovery_gate(run);
 
     // --- Step 1: Atomically claim slot + auto-alloc any OUTPUT tensors that
     // arrived with a null data pointer. Both resources come from the same

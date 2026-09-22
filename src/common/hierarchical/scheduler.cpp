@@ -29,6 +29,14 @@ bool is_failure(EndpointOutcome outcome) {
     return outcome == EndpointOutcome::TASK_FAILURE || outcome == EndpointOutcome::ENDPOINT_FAILURE;
 }
 
+bool is_native_recovery_candidate(const TaskSlotState &task, const WorkerCompletion &completion) {
+    const NativeExecutionFault &fault = completion.native_execution_fault;
+    const bool has_native_execution_fault = fault.raw_rc != 0 || fault.runtime_status != 0;
+    return completion.outcome == EndpointOutcome::TASK_FAILURE && has_native_execution_fault &&
+           task.worker_type == WorkerType::NEXT_LEVEL && !task.is_group() &&
+           task.callable.target_namespace == TargetNamespace::LOCAL_CHIP && task.target_worker_ids.size() == 1;
+}
+
 bool is_terminal_group_state(GroupMemberState state) {
     return state == GroupMemberState::SUCCESS || state == GroupMemberState::FAILED ||
            state == GroupMemberState::SKIPPED;
@@ -107,7 +115,11 @@ void Scheduler::start(const Config &cfg) {
     if (cfg.reservation_stall_warn_after < std::chrono::milliseconds::zero()) {
         throw std::invalid_argument("Scheduler::start: negative reservation stall warning interval");
     }
+    if (cfg.operator_recovery_enabled && (!cfg.begin_task_recovery_cb || !cfg.finish_task_recovery_cb)) {
+        throw std::invalid_argument("Scheduler::start: recovery enabled without recovery callbacks");
+    }
     cfg_ = cfg;
+    recovery_coordinator_.reset();
 
     {
         // run()'s observed generation restarts at zero, so any advance here
@@ -146,6 +158,7 @@ void Scheduler::stop() {
 
 void Scheduler::worker_done(WorkerCompletion completion) {
     TaskSlotState &s = *cfg_.ring->slot_state(completion.task_slot);
+    if (try_intercept_recovery(completion)) return;
     bool failure_reported = is_failure(completion.outcome);
     if (failure_reported && cfg_.on_task_failed_cb) {
         cfg_.on_task_failed_cb(completion.task_slot, completion.error_message);
@@ -242,6 +255,68 @@ void Scheduler::worker_done(WorkerCompletion completion) {
     completion_cv_.notify_one();
 }
 
+bool Scheduler::try_intercept_recovery(WorkerCompletion &completion) {
+    if (!cfg_.operator_recovery_enabled || stop_requested_.load(std::memory_order_acquire)) return false;
+    TaskSlotState *task = cfg_.ring->slot_state(completion.task_slot);
+    if (task == nullptr || !is_native_recovery_candidate(*task, completion)) return false;
+
+    uint64_t recovery_id = next_recovery_id_.fetch_add(1, std::memory_order_relaxed);
+    if (recovery_id == 0) recovery_id = next_recovery_id_.fetch_add(1, std::memory_order_relaxed);
+    std::optional<uint32_t> attempt = cfg_.begin_task_recovery_cb(completion.task_slot, recovery_id);
+    if (!attempt.has_value()) return false;
+
+    RecoveryRequest request;
+    request.ticket.run_id = task->run_id;
+    request.ticket.task_slot = completion.task_slot;
+    request.ticket.recovery_id = recovery_id;
+    request.ticket.attempt = *attempt;
+    request.worker_id = task->target_worker_ids.front();
+    request.pipeline_lease = task->pipeline_lease;
+    request.callable = task->callable;
+    request.failure = std::move(completion);
+    recovery_coordinator_.submit(std::move(request));
+
+    // RecoveryCoordinator progresses on the next scheduler pass. This makes
+    // RETRY_PENDING a real ownership state instead of an in-function label.
+    notify_ready();
+    return true;
+}
+
+void Scheduler::progress_recovery() {
+    recovery_coordinator_.progress();
+    RecoveryResolution resolution;
+    while (recovery_coordinator_.try_pop_resolution(resolution)) {
+        on_recovery_resolution(std::move(resolution));
+    }
+}
+
+void Scheduler::on_recovery_resolution(RecoveryResolution resolution) {
+    if (resolution.kind != RecoveryResolutionKind::GIVE_UP ||
+        resolution.request.stage != RecoveryStage::GIVE_UP) {
+        return;
+    }
+    const RecoveryTicket &ticket = resolution.request.ticket;
+    TaskSlotState *task = cfg_.ring->slot_state(ticket.task_slot);
+    if (task == nullptr || task->run_id != ticket.run_id ||
+        task->state.load(std::memory_order_acquire) != TaskState::RETRY_PENDING ||
+        task->active_recovery_id.load(std::memory_order_acquire) != ticket.recovery_id) {
+        return;
+    }
+
+    WorkerCompletion completion = std::move(resolution.request.failure);
+    if (!completion.error_message.empty()) completion.error_message.push_back(' ');
+    completion.error_message +=
+        "[recovery id=" + std::to_string(ticket.recovery_id) + " attempt=" + std::to_string(ticket.attempt) +
+        " trace=DETECTED->ELIGIBILITY_CHECK->GIVE_UP]";
+
+    // Preserve the old fatal ordering after GIVE_UP: publish the run's first
+    // error before releasing the recovery hold, then reuse the unchanged
+    // FAILED/poison/consume path.
+    if (cfg_.on_task_failed_cb) cfg_.on_task_failed_cb(ticket.task_slot, completion.error_message);
+    cfg_.finish_task_recovery_cb(ticket.task_slot, ticket.recovery_id);
+    on_task_complete(completion);
+}
+
 void Scheduler::notify_ready() {
     {
         std::lock_guard<std::mutex> lk(completion_mu_);
@@ -295,6 +370,10 @@ void Scheduler::run() {
         // dispatch_ready is still reading them.
         std::lock_guard<std::mutex> loop_lk(loop_mu_);
 
+        // Resolve requests created on the previous pass before polling new
+        // endpoint progress. A newly intercepted fault therefore remains in
+        // RETRY_PENDING across a scheduler boundary.
+        progress_recovery();
         cfg_.manager->progress();
 
         // Phase 1: drain completions
@@ -341,6 +420,10 @@ void Scheduler::run() {
         // Exit when stop requested and all workers idle
         if (stop_requested_.load(std::memory_order_acquire)) {
             if (!cfg_.manager->any_busy()) {
+                // A fault intercepted by the progress call above still owns a
+                // RETRY_PENDING slot. Give the coordinator one more pass before
+                // allowing teardown to leave that slot permanently held.
+                if (recovery_coordinator_.has_work()) continue;
                 // Final drain
                 while (true) {
                     WorkerCompletion completion;

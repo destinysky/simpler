@@ -34,6 +34,9 @@ void TaskSlotState::reset() {
     output_keys.clear();
     fanin_producers.clear();
     failure_message.clear();
+    recovery_active = false;
+    recovery_attempt = 0;
+    active_recovery_id.store(0, std::memory_order_relaxed);
     worker_type = WorkerType::NEXT_LEVEL;
     callable = CallableIdentity{};
     config = CallConfig{};

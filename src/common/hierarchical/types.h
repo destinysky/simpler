@@ -152,6 +152,10 @@ struct RunState {
     std::atomic<int32_t> pending_accepts{0};
     mutable std::mutex completion_mu;
     std::condition_variable completion_cv;
+    // Number of task recovery episodes currently holding this run. Protected
+    // by completion_mu; a non-zero value freezes further dispatch/submission
+    // without turning the run into FAILED.
+    uint32_t active_recoveries{0};
     std::exception_ptr first_error;
     std::vector<TaskSlot> task_slots;
     bool submission_closed{false};
@@ -216,6 +220,10 @@ enum class TaskState : int32_t {
     // release for submit to observe, and a producer that fails parks the slot
     // at FAILED for submit to propagate. See claim_task_failure().
     BUILDING = 7,
+    // The endpoint reported a structured native execution failure and L3 has
+    // intercepted terminal propagation while RecoveryCoordinator owns the
+    // decision. Consumers/producers are untouched until recovery resolves.
+    RETRY_PENDING = 8,
 };
 
 enum class EndpointOutcome : int32_t {
@@ -393,6 +401,15 @@ struct TaskSlotState {
     // and reads the consumer list under one acquisition, so a consumer that
     // sees FAILED while wiring itself in also sees the reason.
     std::string failure_message;
+
+    // --- Recovery state ---
+    // recovery_active/recovery_attempt are protected by the originating
+    // RunState::completion_mu. active_recovery_id is atomic because Scheduler
+    // uses it to reject a stale coordinator resolution before committing the
+    // original fatal path.
+    bool recovery_active{false};
+    uint32_t recovery_attempt{0};
+    std::atomic<uint64_t> active_recovery_id{0};
 
     // --- Task data (stored on parent heap, lives until slot CONSUMED) ---
     WorkerType worker_type{WorkerType::NEXT_LEVEL};

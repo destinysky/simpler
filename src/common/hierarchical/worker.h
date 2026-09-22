@@ -97,6 +97,11 @@ public:
     // otherwise be accidentally inherited across fork.
     void init();
 
+    void configure_operator_recovery(bool enabled = false) {
+        if (initialized_) throw std::logic_error("Worker: configure_operator_recovery after init");
+        operator_recovery_enabled_ = enabled;
+    }
+
     void configure_pipeline_depth(uint32_t depth) {
         if (initialized_) throw std::logic_error("Worker: configure_pipeline_depth after init");
         orchestrator_.configure_pipeline_depth(depth);
@@ -241,6 +246,7 @@ public:
 private:
     int32_t level_;
     bool initialized_{false};
+    bool operator_recovery_enabled_{false};
 
     // --- Scheduling engine components ---
     // Per-task slot state lives inside `allocator_` (Ring) — Orchestrator

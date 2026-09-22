@@ -8274,6 +8274,7 @@ class Worker:
         dw = self._worker
         assert dw is not None
         dw.configure_pipeline_depth(direct_chip_pipeline_depth)
+        dw.configure_operator_recovery(bool(self._config.get("enable_operator_recovery", False)))
 
         # Register chip workers as NEXT_LEVEL (L3). The child pid lets the C++
         # endpoint fail a dispatch whose child died instead of spinning on a

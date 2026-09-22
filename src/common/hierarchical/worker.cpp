@@ -202,6 +202,13 @@ void Worker::init() {
     cfg.on_task_failed_cb = [this](TaskSlot slot, const std::string &message) {
         orchestrator_.report_task_error(slot, message);
     };
+    cfg.operator_recovery_enabled = operator_recovery_enabled_;
+    cfg.begin_task_recovery_cb = [this](TaskSlot slot, uint64_t recovery_id) {
+        return orchestrator_.begin_task_recovery(slot, recovery_id);
+    };
+    cfg.finish_task_recovery_cb = [this](TaskSlot slot, uint64_t recovery_id) {
+        (void)orchestrator_.finish_task_recovery(slot, recovery_id);
+    };
     cfg.reservation_stall_sink = report_reservation_stall;
 
     scheduler_.start(cfg);

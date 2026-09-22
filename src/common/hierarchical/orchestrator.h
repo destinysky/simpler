@@ -37,6 +37,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -191,6 +192,13 @@ public:
     // Attach a scheduler/endpoint failure to the task's originating run.
     void report_task_error(TaskSlot slot, const std::string &message);
 
+    // Recovery interception is owned by L3. begin_task_recovery atomically
+    // establishes RUNNING -> RETRY_PENDING together with a run-level recovery
+    // hold and returns the zero-based attempt for the episode. finish only
+    // releases that hold; Scheduler still owns the eventual FAILED commit.
+    std::optional<uint32_t> begin_task_recovery(TaskSlot slot, uint64_t recovery_id);
+    bool finish_task_recovery(TaskSlot slot, uint64_t recovery_id);
+
     // Called once for each dispatched group member after its endpoint has
     // accepted the launch, or conservatively at endpoint completion.
     void mark_task_accepted(TaskSlot slot);
@@ -261,6 +269,7 @@ private:
     void decrement_run_accepts(RunId run_id);
     static void record_run_error(const std::shared_ptr<RunState> &run, std::exception_ptr error);
     void record_run_error(RunId run_id, std::exception_ptr error);
+    void wait_recovery_gate(const std::shared_ptr<RunState> &run);
 
     // Slot state lives in the Ring; the pointer stays stable for the
     // slot's lifetime. Throws if the id is out of range — callers that
