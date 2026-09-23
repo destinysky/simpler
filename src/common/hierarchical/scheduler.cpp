@@ -120,6 +120,9 @@ void Scheduler::start(const Config &cfg) {
     }
     cfg_ = cfg;
     recovery_coordinator_.reset();
+    recovery_coordinator_.set_eligibility_decision(cfg.recovery_eligibility_cb);
+    recovery_frozen_.store(false, std::memory_order_release);
+    active_recovery_ids_.clear();
 
     {
         // run()'s observed generation restarts at zero, so any advance here
@@ -136,6 +139,8 @@ void Scheduler::start(const Config &cfg) {
 
 void Scheduler::request_stop() {
     stop_requested_.store(true, std::memory_order_release);
+    if (recovery_frozen_.exchange(false, std::memory_order_acq_rel) &&
+        cfg_.on_global_recovery_freeze_cb) cfg_.on_global_recovery_freeze_cb(false);
     if (running_.load(std::memory_order_acquire)) cfg_.manager->stop_workers();
     {
         std::lock_guard<std::mutex> lk(completion_mu_);
@@ -260,6 +265,12 @@ bool Scheduler::try_intercept_recovery(WorkerCompletion &completion) {
     TaskSlotState *task = cfg_.ring->slot_state(completion.task_slot);
     if (task == nullptr || !is_native_recovery_candidate(*task, completion)) return false;
 
+    const int32_t worker_id = task->target_worker_ids.front();
+    WorkerThread *worker = cfg_.manager->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+    if (worker == nullptr) return false;
+    const uint64_t expected_endpoint_generation = worker->endpoint_generation();
+    if (expected_endpoint_generation == 0) return false;
+
     uint64_t recovery_id = next_recovery_id_.fetch_add(1, std::memory_order_relaxed);
     if (recovery_id == 0) recovery_id = next_recovery_id_.fetch_add(1, std::memory_order_relaxed);
     std::optional<uint32_t> attempt = cfg_.begin_task_recovery_cb(completion.task_slot, recovery_id);
@@ -270,11 +281,16 @@ bool Scheduler::try_intercept_recovery(WorkerCompletion &completion) {
     request.ticket.task_slot = completion.task_slot;
     request.ticket.recovery_id = recovery_id;
     request.ticket.attempt = *attempt;
-    request.worker_id = task->target_worker_ids.front();
+    request.ticket.expected_endpoint_generation = expected_endpoint_generation;
+    request.worker_id = worker_id;
     request.pipeline_lease = task->pipeline_lease;
     request.callable = task->callable;
     request.failure = std::move(completion);
     recovery_coordinator_.submit(std::move(request));
+    active_recovery_ids_.insert(recovery_id);
+    if (!recovery_frozen_.exchange(true, std::memory_order_acq_rel) && cfg_.on_global_recovery_freeze_cb) {
+        cfg_.on_global_recovery_freeze_cb(true);
+    }
 
     // RecoveryCoordinator progresses on the next scheduler pass. This makes
     // RETRY_PENDING a real ownership state instead of an in-function label.
@@ -291,23 +307,65 @@ void Scheduler::progress_recovery() {
 }
 
 void Scheduler::on_recovery_resolution(RecoveryResolution resolution) {
-    if (resolution.kind != RecoveryResolutionKind::GIVE_UP ||
-        resolution.request.stage != RecoveryStage::GIVE_UP) {
-        return;
-    }
     const RecoveryTicket &ticket = resolution.request.ticket;
     TaskSlotState *task = cfg_.ring->slot_state(ticket.task_slot);
     if (task == nullptr || task->run_id != ticket.run_id ||
         task->state.load(std::memory_order_acquire) != TaskState::RETRY_PENDING ||
         task->active_recovery_id.load(std::memory_order_acquire) != ticket.recovery_id) {
+        // A delayed policy/action resolution may belong to an older episode.
+        // It must never release or reset an endpoint now owned by another one.
+        finish_recovery_episode(ticket.recovery_id);
+        return;
+    }
+
+    const EndpointRecoveryRequest request{
+        resolution.request.worker_id, ticket.recovery_id, ticket.expected_endpoint_generation};
+    if (resolution.kind == RecoveryResolutionKind::REBUILD_ENDPOINT) {
+        EndpointRecoveryResult result;
+        try {
+            result = cfg_.manager->rebuild_endpoint(request);
+        } catch (const std::exception &e) {
+            result = {request.worker_id, request.recovery_id, false, request.expected_endpoint_generation, e.what()};
+        }
+        // The coordinator, not a side-channel callback, owns the action result
+        // and the ENDPOINT_REBUILD -> ENDPOINT_READY/GIVE_UP transition.
+        recovery_coordinator_.submit_endpoint_result(std::move(resolution.request), std::move(result));
+        notify_ready();
         return;
     }
 
     WorkerCompletion completion = std::move(resolution.request.failure);
+    const bool endpoint_ready = resolution.endpoint_result.has_value() && resolution.endpoint_result->ok;
+    if (resolution.endpoint_result.has_value()) {
+        const EndpointRecoveryResult &result = *resolution.endpoint_result;
+        if (!completion.error_message.empty()) completion.error_message.push_back(' ');
+        completion.error_message += result.ok
+                                        ? "[endpoint rebuild succeeded; ENDPOINT_READY generation=" +
+                                              std::to_string(result.endpoint_generation) +
+                                              "; replay pipeline not implemented]"
+                                        : "[endpoint rebuild failed: " + result.error_message + "]";
+    }
+
+    // A successful rebuild already cleared the old hold and committed the new
+    // generation. Eligibility denial or rebuild failure leaves the old child
+    // held and must use the same transaction/generation fence to release it.
+    if (!endpoint_ready) {
+        try {
+            cfg_.manager->release_faulted_endpoint(request);
+        } catch (const std::exception &e) {
+            if (!completion.error_message.empty()) completion.error_message.push_back(' ');
+            completion.error_message += "[faulted endpoint release failed: " + std::string(e.what()) + "]";
+        }
+    }
     if (!completion.error_message.empty()) completion.error_message.push_back(' ');
     completion.error_message +=
         "[recovery id=" + std::to_string(ticket.recovery_id) + " attempt=" + std::to_string(ticket.attempt) +
-        " trace=DETECTED->ELIGIBILITY_CHECK->GIVE_UP]";
+        " expected_endpoint_generation=" + std::to_string(ticket.expected_endpoint_generation) +
+        " trace=DETECTED->ELIGIBILITY_CHECK->" +
+        (resolution.endpoint_result.has_value()
+             ? (endpoint_ready ? "ENDPOINT_REBUILD->ENDPOINT_READY->GIVE_UP]"
+                               : "ENDPOINT_REBUILD->GIVE_UP]")
+             : "GIVE_UP(recovery-not-authorized)]");
 
     // Preserve the old fatal ordering after GIVE_UP: publish the run's first
     // error before releasing the recovery hold, then reuse the unchanged
@@ -315,6 +373,14 @@ void Scheduler::on_recovery_resolution(RecoveryResolution resolution) {
     if (cfg_.on_task_failed_cb) cfg_.on_task_failed_cb(ticket.task_slot, completion.error_message);
     cfg_.finish_task_recovery_cb(ticket.task_slot, ticket.recovery_id);
     on_task_complete(completion);
+    finish_recovery_episode(ticket.recovery_id);
+}
+
+void Scheduler::finish_recovery_episode(uint64_t recovery_id) {
+    if (active_recovery_ids_.erase(recovery_id) == 0 || !active_recovery_ids_.empty()) return;
+    if (recovery_frozen_.exchange(false, std::memory_order_acq_rel) && cfg_.on_global_recovery_freeze_cb) {
+        cfg_.on_global_recovery_freeze_cb(false);
+    }
 }
 
 void Scheduler::notify_ready() {
@@ -374,7 +440,7 @@ void Scheduler::run() {
         // endpoint progress. A newly intercepted fault therefore remains in
         // RETRY_PENDING across a scheduler boundary.
         progress_recovery();
-        cfg_.manager->progress();
+        cfg_.manager->progress(&recovery_frozen_);
 
         // Phase 1: drain completions
         [[maybe_unused]] uint64_t drained = 0;
@@ -396,7 +462,8 @@ void Scheduler::run() {
 
         // Phase 2: dispatch ready tasks. Once teardown publishes stop, the
         // existing endpoint-owned work drains but no new slot enters a worker.
-        if (!stop_requested_.load(std::memory_order_acquire)) dispatch_ready();
+        if (!stop_requested_.load(std::memory_order_acquire) &&
+            !recovery_frozen_.load(std::memory_order_acquire)) dispatch_ready();
 
 #if SIMPLER_HOST_STRACE
         const uint64_t dispatched = dispatched_total_.load(std::memory_order_relaxed) - dispatched_before;

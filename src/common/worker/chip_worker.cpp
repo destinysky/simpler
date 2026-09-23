@@ -236,6 +236,7 @@ void ChipWorker::init(
         get_run_stream_set_create_count_fn_ =
             load_symbol<GetAicpuDlopenCountFn>(handle, "get_run_stream_set_create_count");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
+        recovery_finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "recovery_finalize_device");
         // ACL lifecycle + comm_* + kernel mode are part of the uniform
         // host_runtime.so ABI. Every platform runtime exports all of them —
         // runtimes that do not have a real backend (today: a5 for comm, every
@@ -378,6 +379,7 @@ void ChipWorker::init(
         get_host_dlopen_count_fn_ = nullptr;
         get_run_stream_set_create_count_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
+        recovery_finalize_device_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
         create_comm_stream_fn_ = nullptr;
         destroy_comm_stream_fn_ = nullptr;
@@ -440,6 +442,7 @@ void ChipWorker::init(
         get_host_dlopen_count_fn_ = nullptr;
         get_run_stream_set_create_count_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
+        recovery_finalize_device_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
         create_comm_stream_fn_ = nullptr;
         destroy_comm_stream_fn_ = nullptr;
@@ -478,7 +481,16 @@ void ChipWorker::init(
     run_lane_ = std::make_unique<ChipRunLane>(*this);
 }
 
-void ChipWorker::finalize() {
+void ChipWorker::recovery_finalize() {
+    if (!initialized_ || recovery_finalize_device_fn_ == nullptr) {
+        throw std::runtime_error("endpoint rebuild requires an initialized onboard program-mode ChipWorker");
+    }
+    finalize_impl(true);
+}
+
+void ChipWorker::finalize() { finalize_impl(false); }
+
+void ChipWorker::finalize_impl(bool recovery) {
     if (run_lane_ != nullptr) {
         try {
             run_lane_->close();
@@ -488,10 +500,10 @@ void ChipWorker::finalize() {
         }
         run_lane_.reset();
     }
-    cleanup_native_runs_noexcept();
+    if (!recovery) cleanup_native_runs_noexcept();
     // Global domains are independent of the legacy communicator sessions.
     // Release them while the host runtime and device context are still alive.
-    if (comm_global_domain_release_fn_ != nullptr) {
+    if (!recovery && comm_global_domain_release_fn_ != nullptr) {
         for (uint64_t domain_id : global_domain_ids_) {
             comm_global_domain_release_fn_(domain_id);
         }
@@ -500,10 +512,21 @@ void ChipWorker::finalize() {
 
     // Defensive: if the user never called comm_destroy, reclaim all owned
     // communicator handles and streams before tearing down the device context.
-    clear_comm_sessions();
+    if (recovery) {
+        comm_sessions_.clear();
+        comm_session_index_.clear();
+        base_comm_handle_ = 0;
+    } else {
+        clear_comm_sessions();
+    }
 
+    int recovery_rc = 0;
     if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) {
-        finalize_device_fn_(device_ctx_);
+        if (recovery) {
+            recovery_rc = recovery_finalize_device_fn_(device_ctx_);
+        } else {
+            finalize_device_fn_(device_ctx_);
+        }
     }
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
         destroy_device_context_fn_(device_ctx_);
@@ -538,6 +561,7 @@ void ChipWorker::finalize() {
     get_host_dlopen_count_fn_ = nullptr;
     get_run_stream_set_create_count_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
+    recovery_finalize_device_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
     create_comm_stream_fn_ = nullptr;
     destroy_comm_stream_fn_ = nullptr;
@@ -563,6 +587,9 @@ void ChipWorker::finalize() {
     initialized_ = false;
     device_id_ = -1;
     finalized_ = true;
+    if (recovery_rc != 0) {
+        throw std::runtime_error("recovery reset/probe failed with code " + std::to_string(recovery_rc));
+    }
 }
 
 void ChipWorker::register_callable(int32_t callable_id, const void *callable) {

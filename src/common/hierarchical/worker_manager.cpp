@@ -134,6 +134,12 @@ namespace {
 }  // namespace
 
 uint64_t WorkerEndpoint::control_malloc(size_t) { throw_unsupported_control("control_malloc"); }
+EndpointRecoveryResult WorkerEndpoint::rebuild_endpoint(const EndpointRecoveryRequest &request) {
+    return {request.worker_id, request.recovery_id, false, 0, "endpoint rebuild is unsupported"};
+}
+void WorkerEndpoint::release_faulted_endpoint(const EndpointRecoveryRequest &) {
+    throw_unsupported_control("release_faulted_endpoint");
+}
 uint64_t WorkerEndpoint::control_committed_device_memory() {
     throw_unsupported_control("control_committed_device_memory");
 }
@@ -316,6 +322,67 @@ void LocalMailboxEndpoint::shutdown_child() {
     int32_t requested = MAILBOX_SHUTDOWN_REQUESTED;
     __atomic_store(ptr, &requested, __ATOMIC_RELEASE);
     write_mailbox_state(MailboxState::SHUTDOWN);
+}
+
+EndpointRecoveryResult LocalMailboxEndpoint::rebuild_endpoint(const EndpointRecoveryRequest &request) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    const uint64_t current_generation = endpoint_generation_.load(std::memory_order_acquire);
+    EndpointRecoveryResult result{request.worker_id, request.recovery_id, false, current_generation, {}};
+    if (caps_.kind != WorkerEndpointKind::LOCAL_MAILBOX || request.worker_id != caps_.worker_id ||
+        request.recovery_id == 0 || current_generation == UINT64_MAX ||
+        request.expected_endpoint_generation != current_generation) {
+        result.error_message = "stale or invalid endpoint recovery request";
+        return result;
+    }
+    try {
+        const uint64_t sub_cmd = CTRL_REBUILD_ENDPOINT;
+        std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(sub_cmd));
+        std::memcpy(
+            mbox() + CTRL_OFF_RECOVERY_ID,
+            &request.recovery_id,
+            sizeof(request.recovery_id)
+        );
+        std::memcpy(
+            mbox() + CTRL_OFF_EXPECTED_ENDPOINT_GENERATION,
+            &request.expected_endpoint_generation,
+            sizeof(request.expected_endpoint_generation)
+        );
+        run_control_command("rebuild_endpoint");
+        uint64_t rebuilt_generation = 0;
+        std::memcpy(&rebuilt_generation, mbox() + CTRL_OFF_RESULT, sizeof(rebuilt_generation));
+        if (rebuilt_generation != current_generation + 1) {
+            result.error_message = "child returned an invalid endpoint recovery generation";
+            return result;
+        }
+        endpoint_generation_.store(rebuilt_generation, std::memory_order_release);
+        result.ok = true;
+        result.endpoint_generation = rebuilt_generation;
+    } catch (const std::exception &e) {
+        result.error_message = e.what();
+    }
+    return result;
+}
+
+void LocalMailboxEndpoint::release_faulted_endpoint(const EndpointRecoveryRequest &request) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    const uint64_t current_generation = endpoint_generation_.load(std::memory_order_acquire);
+    if (caps_.kind != WorkerEndpointKind::LOCAL_MAILBOX || request.worker_id != caps_.worker_id ||
+        request.recovery_id == 0 || request.expected_endpoint_generation != current_generation) {
+        throw std::runtime_error("stale or invalid faulted endpoint release request");
+    }
+    const uint64_t sub_cmd = CTRL_RELEASE_FAULTED_ENDPOINT;
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(sub_cmd));
+    std::memcpy(
+        mbox() + CTRL_OFF_RECOVERY_ID,
+        &request.recovery_id,
+        sizeof(request.recovery_id)
+    );
+    std::memcpy(
+        mbox() + CTRL_OFF_EXPECTED_ENDPOINT_GENERATION,
+        &request.expected_endpoint_generation,
+        sizeof(request.expected_endpoint_generation)
+    );
+    run_control_command("release_faulted_endpoint");
 }
 
 char *LocalMailboxEndpoint::task_frame(size_t index) const {
@@ -557,6 +624,20 @@ void WorkerThread::shutdown_child() {
     if (endpoint_) endpoint_->shutdown_child();
 }
 
+EndpointRecoveryResult WorkerThread::rebuild_endpoint(const EndpointRecoveryRequest &request) {
+    if (!endpoint_ || request.worker_id != worker_id()) {
+        return {request.worker_id, request.recovery_id, false, 0, "recovery target does not match endpoint"};
+    }
+    return endpoint_->rebuild_endpoint(request);
+}
+
+void WorkerThread::release_faulted_endpoint(const EndpointRecoveryRequest &request) {
+    if (!endpoint_ || request.worker_id != worker_id()) {
+        throw std::runtime_error("faulted endpoint release target does not match endpoint");
+    }
+    endpoint_->release_faulted_endpoint(request);
+}
+
 const WorkerEndpointCaps &WorkerThread::caps() const {
     if (!endpoint_) throw std::runtime_error("WorkerThread::caps: null endpoint");
     return endpoint_->caps();
@@ -568,7 +649,7 @@ int32_t WorkerThread::worker_id() const { return caps().worker_id; }
 // WorkerThread — Scheduler-owned endpoint progress
 // =============================================================================
 
-void WorkerThread::progress() {
+void WorkerThread::progress(const std::atomic<bool> *recovery_frozen) {
     if (shutdown_.load(std::memory_order_acquire)) {
         // A child finishing a control handler may overwrite an earlier stop
         // state, so the request remains level-triggered until terminalization.
@@ -578,7 +659,8 @@ void WorkerThread::progress() {
     RunId activated = INVALID_RUN_ID;
     {
         std::lock_guard<std::mutex> admission_lk(admission_mu_);
-        if (!shutdown_.load(std::memory_order_acquire)) {
+        if (!shutdown_.load(std::memory_order_acquire) &&
+            (recovery_frozen == nullptr || !recovery_frozen->load(std::memory_order_acquire))) {
             {
                 std::lock_guard<std::mutex> lane_lk(lane_mu_);
                 const LaneState &active = lane(LaneKind::ACTIVE);
@@ -1167,11 +1249,11 @@ void WorkerManager::stop() {
     sub_threads_.clear();
 }
 
-void WorkerManager::progress() {
+void WorkerManager::progress(const std::atomic<bool> *recovery_frozen) {
     for (auto &worker : next_level_threads_)
-        worker->progress();
+        worker->progress(recovery_frozen);
     for (auto &worker : sub_threads_)
-        worker->progress();
+        worker->progress(recovery_frozen);
 }
 
 WorkerThread *WorkerManager::get_worker_by_id(WorkerType type, int32_t worker_id) const {
@@ -1652,6 +1734,20 @@ bool WorkerManager::activate_prepared_run(RunId run_id) {
     for (const auto &worker : next_level_threads_)
         activated = worker->activate_prepared(run_id) || activated;
     return activated;
+}
+
+EndpointRecoveryResult WorkerManager::rebuild_endpoint(const EndpointRecoveryRequest &request) {
+    WorkerThread *worker = get_worker_by_id(WorkerType::NEXT_LEVEL, request.worker_id);
+    if (worker == nullptr) {
+        return {request.worker_id, request.recovery_id, false, 0, "unknown endpoint recovery target"};
+    }
+    return worker->rebuild_endpoint(request);
+}
+
+void WorkerManager::release_faulted_endpoint(const EndpointRecoveryRequest &request) {
+    WorkerThread *worker = get_worker_by_id(WorkerType::NEXT_LEVEL, request.worker_id);
+    if (worker == nullptr) throw std::runtime_error("unknown faulted endpoint release target");
+    worker->release_faulted_endpoint(request);
 }
 
 // =============================================================================

@@ -713,6 +713,11 @@ public:
      */
     virtual int finalize() = 0;
 
+    // Reclaim an exclusively owned program-mode execution environment for an
+    // endpoint rebuild. Implementations use the fatal reset/probe path even
+    // when the execution fault did not mark the device unusable.
+    virtual int recovery_finalize() { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
     /**
      * Arm or disarm this thread's host-side dep_gen capture, from the run's own
      * config, before it binds.

@@ -431,6 +431,10 @@ int finalize_device(DeviceContextHandle ctx) {
     }
 }
 
+int recovery_finalize_device(DeviceContextHandle) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,

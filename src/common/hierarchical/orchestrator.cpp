@@ -77,6 +77,7 @@ RunId Orchestrator::begin_run() {
         ++begin_run_waiters_;
         try {
             runs_cv_.wait(lk, [this, &lease] {
+                if (global_recovery_frozen_) return false;
                 lease = pipeline_slots_.try_acquire(admission_depth_);
                 return lease.has_value();
             });
@@ -617,6 +618,14 @@ bool Orchestrator::finish_task_recovery(TaskSlot slot, uint64_t recovery_id) {
     }
     if (notify) run->completion_cv.notify_all();
     return true;
+}
+
+void Orchestrator::set_global_recovery_freeze(bool frozen) {
+    {
+        std::lock_guard<std::mutex> lk(runs_mu_);
+        global_recovery_frozen_ = frozen;
+    }
+    if (!frozen) runs_cv_.notify_all();
 }
 
 void Orchestrator::mark_task_accepted(TaskSlot slot) {

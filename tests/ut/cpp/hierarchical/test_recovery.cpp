@@ -18,6 +18,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "call_config.h"
 #include "orchestrator.h"
@@ -105,6 +106,31 @@ public:
 
     bool activate_progress(RunId) override { return true; }
 
+    uint64_t endpoint_generation() const override { return generation_.load(std::memory_order_acquire); }
+
+    EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request) override {
+        recovery_calls_.fetch_add(1, std::memory_order_relaxed);
+        uint64_t current = generation_.load(std::memory_order_acquire);
+        if (request.recovery_id == 0 || request.expected_endpoint_generation != current) {
+            return {request.worker_id, request.recovery_id, false, current, "stale generation"};
+        }
+        if (fail_recovery_) {
+            return {request.worker_id, request.recovery_id, false, current, "injected reset/probe failure"};
+        }
+        generation_.store(current + 1, std::memory_order_release);
+        return {request.worker_id, request.recovery_id, true, current + 1, {}};
+    }
+
+    void release_faulted_endpoint(const EndpointRecoveryRequest &request) override {
+        if (request.recovery_id == 0 || request.expected_endpoint_generation != endpoint_generation()) {
+            throw std::runtime_error("stale release transaction");
+        }
+        releases_.fetch_add(1, std::memory_order_relaxed);
+    }
+    void set_recovery_failure(bool fail) { fail_recovery_ = fail; }
+    uint32_t recovery_calls() const { return recovery_calls_.load(std::memory_order_relaxed); }
+    uint32_t releases() const { return releases_.load(std::memory_order_relaxed); }
+
     void request_progress_stop() noexcept override {
         std::lock_guard<std::mutex> lk(mu_);
         if (!outstanding_) return;
@@ -155,6 +181,10 @@ private:
     bool submitted_{false};
     bool outstanding_{false};
     std::deque<WorkerEndpointProgress> events_;
+    std::atomic<uint64_t> generation_{1};
+    std::atomic<uint32_t> recovery_calls_{0};
+    std::atomic<uint32_t> releases_{0};
+    bool fail_recovery_{false};
 };
 
 TEST(RecoveryCoordinatorTest, RequestResolutionIsAsynchronousAndEndsInGiveUp) {
@@ -182,6 +212,68 @@ TEST(RecoveryCoordinatorTest, RequestResolutionIsAsynchronousAndEndsInGiveUp) {
     EXPECT_FALSE(resolution.request.failure.launch_accepted);
     EXPECT_EQ(resolution.request.failure.native_execution_fault.runtime_status, -9);
     EXPECT_FALSE(coordinator.has_work());
+}
+
+TEST(RecoveryCoordinatorTest, EligibleRequestProducesEndpointActionWithoutReplay) {
+    RecoveryCoordinator coordinator;
+    coordinator.set_eligibility_decision([](const RecoveryRequest &) { return true; });
+    RecoveryRequest request;
+    request.ticket.recovery_id = 51;
+    request.ticket.expected_endpoint_generation = 1;
+    coordinator.submit(request);
+    coordinator.progress();
+    RecoveryResolution resolution;
+    ASSERT_TRUE(coordinator.try_pop_resolution(resolution));
+    EXPECT_EQ(resolution.kind, RecoveryResolutionKind::REBUILD_ENDPOINT);
+    EXPECT_EQ(resolution.request.stage, RecoveryStage::ENDPOINT_REBUILD);
+    EXPECT_EQ(resolution.request.ticket.recovery_id, 51u);
+
+    EndpointRecoveryResult result{resolution.request.worker_id, 51, true, 2, {}};
+    coordinator.submit_endpoint_result(std::move(resolution.request), std::move(result));
+    coordinator.progress();
+    ASSERT_TRUE(coordinator.try_pop_resolution(resolution));
+    EXPECT_EQ(resolution.kind, RecoveryResolutionKind::GIVE_UP);
+    ASSERT_TRUE(resolution.endpoint_result.has_value());
+    EXPECT_TRUE(resolution.endpoint_result->ok);
+}
+
+TEST(EndpointRecoveryCommandTest, StaleGenerationDoesNotPublishResetCommand) {
+    std::vector<char> mailbox(MAILBOX_SIZE, 0);
+    LocalMailboxEndpoint endpoint(4, mailbox.data());
+    const EndpointRecoveryResult result = endpoint.rebuild_endpoint({4, 91, 0});
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(result.endpoint_generation, 1u);
+    EXPECT_EQ(endpoint.endpoint_generation(), 1u);
+    uint64_t command = 0;
+    std::memcpy(&command, mailbox.data() + MAILBOX_OFF_CALLABLE, sizeof(command));
+    EXPECT_NE(command, CTRL_REBUILD_ENDPOINT);
+
+    EXPECT_THROW(endpoint.release_faulted_endpoint({4, 91, 0}), std::runtime_error);
+    std::memcpy(&command, mailbox.data() + MAILBOX_OFF_CALLABLE, sizeof(command));
+    EXPECT_NE(command, CTRL_RELEASE_FAULTED_ENDPOINT);
+}
+
+TEST(OrchestratorRecoveryTest, GlobalFreezeBlocksNewRunAdmissionUntilThaw) {
+    TensorMap tensor_map;
+    Ring allocator;
+    Scope scope;
+    ReadyQueue ready_sub;
+    NextLevelReadyQueues ready_next;
+    Orchestrator orch;
+    allocator.init(/*heap_bytes=*/1ULL << 20);
+    ready_next.reset({0});
+    orch.init(&tensor_map, &allocator, &scope, &ready_sub, &ready_next);
+    orch.set_global_recovery_freeze(true);
+
+    auto begin = std::async(std::launch::async, [&] { return orch.begin_run(); });
+    EXPECT_EQ(begin.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+    orch.set_global_recovery_freeze(false);
+    ASSERT_EQ(begin.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    RunId run = begin.get();
+    orch.close_run_submission(run);
+    orch.wait_run(run);
+    orch.release_run(run);
+    allocator.shutdown();
 }
 
 TEST(OrchestratorRecoveryTest, RecoveryHoldBlocksSubmitUntilGiveUpReleasesEpisode) {
@@ -239,6 +331,8 @@ TEST(OrchestratorRecoveryTest, RecoveryHoldBlocksSubmitUntilGiveUpReleasesEpisod
 
 class SchedulerRecoveryTest : public ::testing::Test {
 protected:
+    virtual bool allow_endpoint_recovery() const { return false; }
+    virtual bool fail_endpoint_recovery() const { return false; }
     TensorMap tensor_map;
     Ring allocator;
     Scope scope;
@@ -254,6 +348,7 @@ protected:
         allocator.init(/*heap_bytes=*/1ULL << 20);
         auto owned_endpoint = std::make_unique<RecoveryEndpoint>();
         endpoint = owned_endpoint.get();
+        endpoint->set_recovery_failure(fail_endpoint_recovery());
         manager.add_next_level_endpoint(std::move(owned_endpoint));
         manager.start(
             &allocator,
@@ -284,6 +379,10 @@ protected:
         };
         config.finish_task_recovery_cb = [this](TaskSlot slot, uint64_t recovery_id) {
             (void)orch.finish_task_recovery(slot, recovery_id);
+        };
+        config.recovery_eligibility_cb = [this](const RecoveryRequest &) { return allow_endpoint_recovery(); };
+        config.on_global_recovery_freeze_cb = [this](bool frozen) {
+            orch.set_global_recovery_freeze(frozen);
         };
         scheduler.start(config);
         orch.set_scheduler_loop_mutex(&scheduler.loop_mutex());
@@ -335,6 +434,39 @@ protected:
         );
     }
 };
+
+class SchedulerEndpointRebuildTest : public SchedulerRecoveryTest {
+protected:
+    bool allow_endpoint_recovery() const override { return true; }
+};
+
+class SchedulerEndpointRebuildFailureTest : public SchedulerEndpointRebuildTest {
+protected:
+    bool fail_endpoint_recovery() const override { return true; }
+};
+
+TEST_F(SchedulerEndpointRebuildTest, RebuildCommitsGenerationAndStillFailsOriginalTask) {
+    NativeExecutionFault fault{};
+    fault.raw_rc = 507018;
+    fault.device_unusable = 1;
+    const std::string message = run_fault(fault, /*launch_accepted=*/true);
+    EXPECT_EQ(endpoint->recovery_calls(), 1u);
+    EXPECT_EQ(endpoint->releases(), 0u);
+    EXPECT_EQ(endpoint->endpoint_generation(), 2u);
+    EXPECT_NE(message.find("ENDPOINT_READY generation=2"), std::string::npos);
+    EXPECT_NE(message.find("ENDPOINT_REBUILD->ENDPOINT_READY->GIVE_UP"), std::string::npos);
+}
+
+TEST_F(SchedulerEndpointRebuildFailureTest, FailedResetKeepsGenerationAndReleasesHeldChild) {
+    NativeExecutionFault fault{};
+    fault.runtime_status = -9;
+    const std::string message = run_fault(fault, /*launch_accepted=*/true);
+    EXPECT_EQ(endpoint->recovery_calls(), 1u);
+    EXPECT_EQ(endpoint->releases(), 1u);
+    EXPECT_EQ(endpoint->endpoint_generation(), 1u);
+    EXPECT_NE(message.find("injected reset/probe failure"), std::string::npos);
+    EXPECT_NE(message.find("ENDPOINT_REBUILD->GIVE_UP"), std::string::npos);
+}
 
 TEST_F(SchedulerRecoveryTest, SemanticOnlyFaultWithUnacceptedLaunchStillUsesRecoveryPath) {
     NativeExecutionFault fault{};

@@ -101,12 +101,16 @@ public:
         // Called as soon as an endpoint reports failure so the error is
         // attached to the task's run even when a group has other members live.
         std::function<void(TaskSlot, const std::string &)> on_task_failed_cb;
-        // Step 2/3 recovery seam. Scheduler only intercepts a structured local
+        // Scheduler only intercepts a structured local
         // chip TASK_FAILURE; Orchestrator owns the RUNNING -> RETRY_PENDING
         // transition and the run-level hold. Policy lives in RecoveryCoordinator.
         bool operator_recovery_enabled{false};
         std::function<std::optional<uint32_t>(TaskSlot, uint64_t)> begin_task_recovery_cb;
         std::function<void(TaskSlot, uint64_t)> finish_task_recovery_cb;
+        std::function<void(bool)> on_global_recovery_freeze_cb;
+        // Production leaves eligibility unset until distributed replay safety
+        // is available. Tests may authorize endpoint rebuilding without replay.
+        RecoveryCoordinator::EligibilityDecision recovery_eligibility_cb;
         // Diagnostic-only reservation stall reporting. The sink must not
         // block: it runs on the scheduler dispatch path.
         std::chrono::milliseconds reservation_stall_warn_after{std::chrono::seconds(5)};
@@ -164,6 +168,11 @@ private:
     std::atomic<bool> running_{false};
     RecoveryCoordinator recovery_coordinator_;
     std::atomic<uint64_t> next_recovery_id_{1};
+    std::atomic<bool> recovery_frozen_{false};
+    // Scheduler-thread-owned episode identities. Queue emptiness is never a
+    // recovery lifecycle signal; only removing a terminal/stale episode here
+    // can release the global freeze.
+    std::unordered_set<uint64_t> active_recovery_ids_;
     struct NextLevelGroupDispatchResult {
         std::unordered_set<int32_t> reserved_worker_ids;
         TaskSlot blocked_group_slot{INVALID_SLOT};
@@ -194,6 +203,7 @@ private:
     bool try_intercept_recovery(WorkerCompletion &completion);
     void progress_recovery();
     void on_recovery_resolution(RecoveryResolution resolution);
+    void finish_recovery_episode(uint64_t recovery_id);
     void on_task_complete(const WorkerCompletion &completion);
     void poison_task(TaskSlot slot, const std::string &root_message);
 

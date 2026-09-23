@@ -27,6 +27,7 @@ from typing import Any, Callable, Protocol, TypeVar, Union
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     BackendKind,
     _region_vmm_allocate_export,
+    _region_vmm_abandon_after_reset,
     _region_vmm_begin,
     _region_vmm_release,
     _region_vmm_zero_bytes,
@@ -790,6 +791,15 @@ class VmmAllocation:
         self._mapping_available = False
         return self._first_cleanup_failure
 
+    def abandon_after_reset(self) -> None:
+        """Discard the native owner after the device reset invalidated its handles."""
+        if self._handle is not None:
+            _region_vmm_abandon_after_reset(self._handle)
+        self._handle = None
+        self._device_addr = None
+        self._shareable_handle = None
+        self._mapping_available = False
+
     def _record_cleanup_failure(self, step: str, exc: BaseException) -> None:
         cause = RegionCleanupCause.INTERRUPTED if _interrupt_like(exc) else RegionCleanupCause.BACKEND_ERROR
         failure = ProviderCleanupFailure(
@@ -1061,6 +1071,26 @@ class ProviderRegionStore:
                 results.append(self._incomplete_result(resource))
         self._state = ProviderRegionStoreState.CLOSE_FAILED if self._resources else ProviderRegionStoreState.CLOSED
         return tuple(results)
+
+    def abandon_after_device_reset(self) -> None:
+        """Retire old-generation ownership after a confirmed device reset."""
+        errors: list[BaseException] = []
+        for resource in self._resources.values():
+            for part in resource.parts.values():
+                try:
+                    allocation = part.allocation
+                    if isinstance(allocation, VmmAllocation):
+                        allocation.abandon_after_reset()
+                    else:
+                        failure = allocation.release_once()
+                        if failure is not None:
+                            errors.append(RuntimeError(f"provider host part cleanup failed: {failure}"))
+                except BaseException as exc:  # noqa: BLE001
+                    errors.append(exc)
+        self._resources.clear()
+        self._state = ProviderRegionStoreState.CLOSED
+        if errors:
+            raise RuntimeError("provider ownership cleanup after reset failed") from errors[0]
 
     def _require_open(self) -> None:
         if self._state is not ProviderRegionStoreState.OPEN:

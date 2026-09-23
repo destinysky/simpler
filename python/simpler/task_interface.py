@@ -1493,6 +1493,20 @@ class ChipWorker:
                 self._identity_registry.clear()
                 self._live_handles.clear()
 
+    def recovery_finalize(self):
+        """Retire this program-mode endpoint after a confirmed reset and probe."""
+        with self._lifecycle_lock:
+            if self._init_owner_thread is not threading.current_thread() or self._init_in_progress:
+                raise RuntimeError("ChipWorker.recovery_finalize() requires the init owner thread")
+        try:
+            self._impl.recovery_finalize()
+        finally:
+            _flush_host_log_or_warn("ChipWorker.recovery_finalize()")
+            with self._registry_lock:
+                self._callable_registry.clear()
+                self._identity_registry.clear()
+                self._live_handles.clear()
+
     def _allocate_slot_locked(self) -> int:
         for slot_id in range(MAX_REGISTERED_CALLABLE_IDS):
             if slot_id not in self._callable_registry:

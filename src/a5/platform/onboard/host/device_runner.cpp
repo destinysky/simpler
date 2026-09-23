@@ -753,6 +753,7 @@ public:
     DeviceBindGuard(const DeviceBindGuard &) = delete;
     DeviceBindGuard &operator=(const DeviceBindGuard &) = delete;
     bool bound() const { return bound_; }
+    void disarm_after_force_reset() noexcept { bound_ = false; }
 
 private:
     int device_id_;
@@ -794,12 +795,22 @@ int DeviceRunner::force_reset_device() {
             LOG_ERROR("force_reset_device: could not bind device %d; reset skipped", device_id_);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        (void)aclrtSynchronizeDeviceWithTimeout(timeout_config_.stream_sync_timeout_ms);
+        aclError drain_rc = aclrtSynchronizeDeviceWithTimeout(timeout_config_.stream_sync_timeout_ms);
+        if (drain_rc != ACL_SUCCESS) {
+            // Best-effort drain: reset is still attempted. Consume the ACL diagnostic
+            // here so it cannot be misattributed to a later unrelated failure.
+            const char *recent = aclGetRecentErrMsg();
+
+            LOG_DEBUG("force_reset_device: best-effort pre-reset drain failed: %d%s%s", static_cast<int>(drain_rc),
+                    recent != nullptr && recent[0] != '\0' ? " recent=" : "", recent != nullptr ? recent : "");
+        }
         aclError rc = aclrtResetDeviceForce(device_id_);
         if (rc != ACL_SUCCESS) {
             LOG_ERROR("force_reset_device: aclrtResetDeviceForce(%d) failed: %d", device_id_, static_cast<int>(rc));
+            ACL_LOG_ERROR_DETAIL(rc);
             return static_cast<int>(rc);
         }
+        bind_guard.disarm_after_force_reset();
     }
     // Post-reset self-check: a 0 rc from aclrtResetDeviceForce does not by itself
     // prove the card is usable. Re-bind (fresh guard, balanced on exit) and
@@ -857,63 +868,78 @@ int DeviceRunner::force_reset_device() {
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.
 
+int DeviceRunner::recovery_finalize() {
+    if (device_id_ < 0 || !execution_mode_latch().is_latched() ||
+        execution_mode_latch().latched_mode() != SIMPLER_MODE_PROGRAM) {
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+    return retire_execution_generation(TeardownReason::OperatorRecovery);
+}
+
 int DeviceRunner::finalize() {
     if (device_id_ == -1) {
         return 0;
     }
+    if (device_unusable_.load(std::memory_order_acquire)) {
+        return retire_execution_generation(TeardownReason::FatalDeviceFailure);
+    }
+    return finalize_healthy();
+}
 
+int DeviceRunner::retire_execution_generation(TeardownReason reason) {
+    if (device_id_ == -1) return 0;
     // Fatal cleanup must not walk poisoned streams, mappings, or allocations.
     // Stop collector threads locally, drain and force-reset the card, then
-    // forget the old generation's handles.
-    if (device_unusable_.load(std::memory_order_acquire)) {
-        finalize_collectors(true);
+    // forget the old generation's handles. Operator recovery deliberately uses
+    // this identical path without changing the device_unusable fault fact.
+    finalize_collectors(true);
 
-        // force_reset_device() drains before it resets and returns 0 only when
-        // its post-reset probe confirms the card, so a second pass runs against
-        // a settled card and can recover a poison the first pass could not. A
-        // Worker holding CP-process SDMA streams gets a single attempt: there a
-        // non-confirming reset already blocks on the driver's remote-event
-        // timeout, which a retry only multiplies. Read dma_workspace_handle_
-        // before abandon_common_after_device_failure() clears it.
-        constexpr int kFatalResetAttempts = 3;
-        const bool sdma_provisioned = dma_workspace_handle_ != nullptr;
-        int reset_rc = attempt_fatal_reset(
-            [this]() {
-                return force_reset_device();
-            },
-            sdma_provisioned ? 1 : kFatalResetAttempts
+    // Each attempt is the complete force-reset + post-reset stream/HBM probe
+    // performed by force_reset_device(). SDMA keeps the existing one-attempt
+    // containment rule because a retry only repeats the driver timeout.
+    constexpr int kFatalResetAttempts = 3;
+    const bool sdma_provisioned = dma_workspace_handle_ != nullptr;
+    int reset_rc = attempt_fatal_reset(
+        [this]() {
+            return force_reset_device();
+        },
+        sdma_provisioned ? 1 : kFatalResetAttempts
+    );
+    const bool reset_confirmed = reset_rc == 0;
+    const char *reason_name =
+        reason == TeardownReason::OperatorRecovery ? "Operator recovery" : "Fatal teardown";
+    if (!reset_confirmed) {
+        LOG_ERROR(
+            "%s: force reset of device %d did not confirm clean (rc=%d); "
+            "quarantining old handles without per-resource RTS calls",
+            reason_name, device_id_, reset_rc
         );
-        const bool reset_confirmed = reset_rc == 0;
-        if (!reset_confirmed) {
-            LOG_ERROR(
-                "Fatal teardown: force reset of device %d did not confirm clean (rc=%d); "
-                "quarantining old handles without per-resource RTS calls",
-                device_id_, reset_rc
-            );
-        }
-
-        int abandon_rc = abandon_common_after_device_failure();
-        if (acl_ready_) {
-            if (reset_confirmed) {
-                int finalize_rc = aclFinalize();
-                if (finalize_rc != 0) {
-                    LOG_ERROR("aclFinalize failed during fatal finalize: %d", finalize_rc);
-                    if (abandon_rc == 0) abandon_rc = finalize_rc;
-                }
-            } else {
-                LOG_WARN("Fatal teardown: skipping aclFinalize because device reset was not confirmed");
-            }
-            acl_ready_ = false;
-        }
-
-        device_id_ = -1;
-        if (reset_confirmed) {
-            device_unusable_.store(false, std::memory_order_release);
-        }
-        LOG_WARN("DeviceRunner finalized after fatal device failure");
-        return abandon_rc != 0 ? abandon_rc : reset_rc;
     }
 
+    int abandon_rc = abandon_common_after_device_failure();
+    if (acl_ready_) {
+        if (reset_confirmed) {
+            int finalize_rc = aclFinalize();
+            if (finalize_rc != 0) {
+                LOG_ERROR("aclFinalize failed during %s: %d", reason_name, finalize_rc);
+                if (abandon_rc == 0) abandon_rc = finalize_rc;
+            }
+        } else {
+            LOG_WARN("%s: skipping aclFinalize because device reset was not confirmed", reason_name);
+        }
+        acl_ready_ = false;
+    }
+
+    device_id_ = -1;
+    if (reset_confirmed) {
+        device_unusable_.store(false, std::memory_order_release);
+    }
+    LOG_WARN("DeviceRunner retired execution generation for %s", reason_name);
+    return abandon_rc != 0 ? abandon_rc : reset_rc;
+}
+
+int DeviceRunner::finalize_healthy() {
+    if (device_id_ == -1) return 0;
     // A kernel-mode context runs on the caller's already-current device, so
     // this thread needs no bind and the context owns no device state to adopt.
     int rc = 0;

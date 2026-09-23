@@ -209,6 +209,9 @@ void Worker::init() {
     cfg.finish_task_recovery_cb = [this](TaskSlot slot, uint64_t recovery_id) {
         (void)orchestrator_.finish_task_recovery(slot, recovery_id);
     };
+    cfg.on_global_recovery_freeze_cb = [this](bool frozen) {
+        orchestrator_.set_global_recovery_freeze(frozen);
+    };
     cfg.reservation_stall_sink = report_reservation_stall;
 
     scheduler_.start(cfg);

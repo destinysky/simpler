@@ -636,6 +636,8 @@ _CTRL_COMMITTED_DEVICE_MEMORY = 18
 # chip-child controls.
 _CTRL_GLOBAL_DOMAIN_NODE = 24
 _CTRL_DEVICE_MEMORY_INFO = 25
+_CTRL_REBUILD_ENDPOINT = 27
+_CTRL_RELEASE_FAULTED_ENDPOINT = 28
 _CTRL_OP_NAMES[_CTRL_DEVICE_MEMORY_INFO] = "device_memory_info"
 _CTRL_DELEGATED_REGION = 26
 _LOCAL_GLOBAL_CONTROL_HEADER = struct.Struct("<IIQ")
@@ -687,6 +689,16 @@ _OFF_DOMAIN_REPLY_COMMITTED = 0
 #   offset 40:                  uint64  result (returned ptr from malloc)
 _CTRL_OFF_ARG0 = 16
 _CTRL_OFF_RESULT = 40
+
+# Recovery-control envelope:
+#   offset 16: uint64 recovery_id
+#   offset 24: uint64 expected_endpoint_generation
+_CTRL_U64_SIZE = struct.calcsize("<Q")
+
+_CTRL_OFF_RECOVERY_ID = _CTRL_OFF_ARG0
+_CTRL_OFF_EXPECTED_ENDPOINT_GENERATION = (_CTRL_OFF_RECOVERY_ID + _CTRL_U64_SIZE)
+
+assert (_CTRL_OFF_EXPECTED_ENDPOINT_GENERATION + _CTRL_U64_SIZE <= _CTRL_OFF_RESULT)
 _DEVICE_MEMORY_INFO = struct.Struct("<QQ")
 
 
@@ -2232,6 +2244,7 @@ def _run_mailbox_loop(
     handle_task,
     handle_control,
     on_shutdown=None,
+    hold_native_fault: bool = False,
 ) -> None:
     """The mailbox state machine every forked child runs.
 
@@ -2267,6 +2280,7 @@ def _run_mailbox_loop(
     # frame 1 always exists.
     task_buf = buf[MAILBOX_FRAME_SIZE : 2 * MAILBOX_FRAME_SIZE]
     task_state_addr = _buffer_field_addr(task_buf, _OFF_STATE)
+    faulted_wait_decision = False
     try:
         while True:
             state = _mailbox_load_i32(state_addr)
@@ -2274,15 +2288,28 @@ def _run_mailbox_loop(
                 if on_shutdown is not None:
                     on_shutdown()
                 break
-            if _mailbox_load_i32(task_state_addr) == _TASK_READY:
+            if not faulted_wait_decision and _mailbox_load_i32(task_state_addr) == _TASK_READY:
                 code, msg = handle_task(task_buf)
                 _write_error(task_buf, code, msg)
                 _mailbox_store_i32(task_state_addr, _TASK_DONE)
+                if hold_native_fault and code:
+                    raw_rc, runtime_status = struct.unpack_from("<ii", task_buf, _OFF_NATIVE_EXECUTION_FAULT)
+                    faulted_wait_decision = raw_rc != 0 or runtime_status != 0
             elif state == _CONTROL_REQUEST:
                 sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-                code, msg = handle_control(int(sub_cmd))
+                if faulted_wait_decision and sub_cmd not in (
+                    _CTRL_REBUILD_ENDPOINT,
+                    _CTRL_RELEASE_FAULTED_ENDPOINT,
+                ):
+                    code, msg = 1, "faulted endpoint awaits L3 recovery decision"
+                else:
+                    code, msg = handle_control(int(sub_cmd))
                 _write_error(buf, code, msg)
                 _mailbox_store_i32(state_addr, _CONTROL_DONE)
+                if faulted_wait_decision and sub_cmd == _CTRL_REBUILD_ENDPOINT and code == 0:
+                    faulted_wait_decision = False
+                if sub_cmd == _CTRL_RELEASE_FAULTED_ENDPOINT and faulted_wait_decision and code == 0:
+                    break
             else:
                 liveness_countdown -= 1
                 if liveness_countdown <= 0:
@@ -2891,6 +2918,9 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     prepared: set[int] | None = None,
     task_frame_count: int = 1,
     chip_rank: int | None = None,
+    rebuild_worker=None,
+    on_worker_replaced=None,
+    hold_native_fault: bool = False,
 ) -> None:
     """Chip-process handlers for `_run_mailbox_loop`.
 
@@ -2927,6 +2957,11 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     )
     global_domain_store = _L2GlobalDomainStore()
     diagnostic_capture_index = 0
+    endpoint_generation = 1
+    faulted = [False]
+    held_endpoint_generation = [0]
+    held_recovery_id = [0]
+    recovery_reset_unconfirmed = [False]
 
     def read_task_config(
         task_buf: memoryview,
@@ -3016,15 +3051,84 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         # staging garbage would mask the real error in post-mortems.
         if code == 0 and on_task_done_success is not None:
             code, msg = on_task_done_success()
+        if code != 0 and hold_native_fault:
+            raw_rc, runtime_status = struct.unpack_from("<ii", task_buf, _OFF_NATIVE_EXECUTION_FAULT)
+            faulted[0] = raw_rc != 0 or runtime_status != 0
+            if faulted[0]:
+                held_endpoint_generation[0] = endpoint_generation
+                held_recovery_id[0] = 0
         return code, msg
+
+    def bind_held_recovery_action() -> tuple[int, int]:
+        recovery_id = struct.unpack_from("<Q", buf, _CTRL_OFF_RECOVERY_ID)[0]
+        expected_generation = struct.unpack_from("<Q", buf, _CTRL_OFF_EXPECTED_ENDPOINT_GENERATION)[0]
+        if not hold_native_fault or not faulted[0]:
+            raise RuntimeError("endpoint recovery control requires a held native execution fault")
+        if recovery_id == 0:
+            raise RuntimeError("endpoint recovery control requires a non-zero recovery id")
+        if expected_generation != held_endpoint_generation[0]:
+            raise RuntimeError("stale endpoint recovery generation")
+        if held_recovery_id[0] == 0:
+            held_recovery_id[0] = recovery_id
+        elif recovery_id != held_recovery_id[0]:
+            raise RuntimeError("stale or wrong endpoint recovery transaction")
+        return int(recovery_id), int(expected_generation)
 
     def handle_control(  # noqa: PLR0912, PLR0915 -- one branch per control sub-command
         sub_cmd: int,
     ) -> tuple[int, str]:
+        nonlocal cw, import_registry, provider_region_store, provider_transaction_table, global_domain_store
+        nonlocal endpoint_generation
         code = 0
         msg = ""
         try:
-            if sub_cmd == _CTRL_MALLOC:
+            if sub_cmd == _CTRL_REBUILD_ENDPOINT:
+                _recovery_id, expected_generation = bind_held_recovery_action()
+                if expected_generation != endpoint_generation:
+                    raise RuntimeError("held endpoint generation no longer matches current generation")
+                if (
+                    endpoint_generation == (1 << 64) - 1
+                    or environment is not RegionEnvironmentKind.ONBOARD
+                    or chip_platform != "a5"
+                    or task_frame_count != 1
+                ):
+                    raise RuntimeError("endpoint rebuild is limited to A5 onboard single-frame program mode")
+                if rebuild_worker is None or on_worker_replaced is None:
+                    raise RuntimeError("endpoint recovery is unavailable in this child")
+                import_registry.close()
+                try:
+                    cw.recovery_finalize()
+                except BaseException:  # noqa: BLE001
+                    recovery_reset_unconfirmed[0] = True
+                    raise
+                global_domain_store.domains.clear()
+                provider_region_store.abandon_after_device_reset()
+                replacement = rebuild_worker()
+                cw = replacement
+                on_worker_replaced(replacement)
+                prepared.clear()
+                for cid, target in registry.items():
+                    if isinstance(target, ChipCallable):
+                        _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
+                import_registry = ImportRegistry(
+                    ImportContext(deployment=DEVICE_AICPU, device_owner_instance_id=owner_instance_id)
+                )
+                provider_region_store = ProviderRegionStore(
+                    RegionAllocationContext(environment_kind=environment, target=DeviceAllocationTarget(int(device_id)))
+                )
+                provider_transaction_table = ProviderTransactionTable()
+                global_domain_store = _L2GlobalDomainStore()
+                endpoint_generation += 1
+                struct.pack_into("<Q", buf, _CTRL_OFF_RESULT, endpoint_generation)
+                faulted[0] = False
+                held_endpoint_generation[0] = 0
+                held_recovery_id[0] = 0
+            elif sub_cmd == _CTRL_RELEASE_FAULTED_ENDPOINT:
+                bind_held_recovery_action()
+                faulted[0] = False
+                held_endpoint_generation[0] = 0
+                held_recovery_id[0] = 0
+            elif sub_cmd == _CTRL_MALLOC:
                 size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
                 ptr = cw.malloc(size)
                 struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ptr)
@@ -3406,9 +3510,13 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         if task_frame_count >= 2:
             run_two_frame_loop()
         else:
-            _run_mailbox_loop(buf, state_addr, handle_task=handle_task, handle_control=handle_control)
+            _run_mailbox_loop(
+                buf, state_addr, handle_task=handle_task, handle_control=handle_control,
+                hold_native_fault=hold_native_fault,
+            )
     finally:
-        _teardown_chip_process_resources(import_registry, cw, global_domain_store, provider_region_store)
+        if not recovery_reset_unconfirmed[0]:
+            _teardown_chip_process_resources(import_registry, cw, global_domain_store, provider_region_store)
 
 
 def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins, identity tables, log config, prewarm sizing) must cross the fork as explicit COW args; the child cannot read parent state after os.fork
@@ -3425,6 +3533,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     prewarm_config=None,
     enable_sdma: bool = False,
     chip_rank: int | None = None,
+    enable_operator_recovery: bool = False,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -3487,6 +3596,20 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
     sys.stderr.flush()
 
+    current_worker = cw
+
+    def rebuild_worker():
+        replacement = ChipWorker()
+        replacement.init(
+            device_id, bins, log_level=log_level, prewarm_config=prewarm_config,
+            enable_sdma=enable_sdma,
+        )
+        return replacement
+
+    def on_worker_replaced(replacement):
+        nonlocal current_worker
+        current_worker = replacement
+
     try:
         _run_chip_main_loop(
             cw,
@@ -3503,9 +3626,12 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             prepared=prepared,
             task_frame_count=_local_task_frame_count(platform, runtime, int(cw.pipeline_depth)),
             chip_rank=chip_rank,
+            rebuild_worker=rebuild_worker,
+            on_worker_replaced=on_worker_replaced,
+            hold_native_fault=enable_operator_recovery,
         )
     finally:
-        cw.finalize()
+        current_worker.finalize()
 
 
 def _read_config_from_mailbox(
@@ -4789,6 +4915,11 @@ class Worker:
         # first run() with the same sizing skips the (~800ms) cold prebuilt
         # runtime-arena build. Set by init(prewarm_config=...); None = disabled.
         self._prewarm_config: Any | None = None
+        # One capability decision is shared by the L3 Scheduler and every
+        # direct chip child. Never let the parent intercept a fault that its
+        # child would not hold (or vice versa).
+        self._effective_operator_recovery: bool = False
+        self._operator_recovery_warning_emitted: bool = False
 
         # Level-2 internals
         self._chip_worker: ChipWorker | None = None
@@ -7789,6 +7920,7 @@ class Worker:
             # check and the epoch claim (register's snapshot install also holds
             # this lock).
             self._validate_eligible_targets()
+            self._resolve_effective_operator_recovery()
             self._prewarm_config = prewarm_config
             self._startup_error = None
             self._init_owner_thread = threading.current_thread()
@@ -7867,6 +7999,33 @@ class Worker:
                         self._lifecycle = _Lifecycle.FAILED
                     self._hierarchical_start_cv.notify_all()
             raise
+
+    def _resolve_effective_operator_recovery(self) -> None:
+        requested = bool(self._config.get("enable_operator_recovery", False))
+        platform = str(self._config.get("platform", ""))
+        runtime = str(self._config.get("runtime", ""))
+        device_ids = self._config.get("device_ids", [])
+        local_single_frame = _local_task_frame_count(platform, runtime, PTO_PIPELINE_MAX_DEPTH) == 1
+        local_only_hierarchy = (
+            self.level == 3
+            and bool(device_ids)
+            and not self._next_level_workers
+            and not self._remote_worker_specs
+            and not self._mpi_l3_groups
+        )
+        # Direct A5 ChipWorker.init uses simpler_init(), which latches PROGRAM
+        # mode before mutating runner state. recovery_finalize() repeats the
+        # mode check as the final L2 safety boundary.
+        self._effective_operator_recovery = bool(
+            requested and platform == "a5" and local_only_hierarchy and local_single_frame
+        )
+        if requested and not self._effective_operator_recovery and not self._operator_recovery_warning_emitted:
+            logging.getLogger("simpler").warning(
+                "operator recovery was requested but is unsupported for this endpoint configuration; "
+                "falling back to the normal fault handling path. Current support is limited to A5 "
+                "onboard single-frame local-chip execution in program mode."
+            )
+            self._operator_recovery_warning_emitted = True
 
     def _init_level2(self) -> None:
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
@@ -8156,6 +8315,7 @@ class Worker:
                             prewarm_config=self._prewarm_config,
                             enable_sdma=bool(self._config.get("enable_sdma", False)),
                             chip_rank=idx,
+                            enable_operator_recovery=self._effective_operator_recovery,
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415
@@ -8274,7 +8434,7 @@ class Worker:
         dw = self._worker
         assert dw is not None
         dw.configure_pipeline_depth(direct_chip_pipeline_depth)
-        dw.configure_operator_recovery(bool(self._config.get("enable_operator_recovery", False)))
+        dw.configure_operator_recovery(self._effective_operator_recovery)
 
         # Register chip workers as NEXT_LEVEL (L3). The child pid lets the C++
         # endpoint fail a dispatch whose child died instead of spinning on a

@@ -451,6 +451,17 @@ int finalize_device(DeviceContextHandle ctx) {
     }
 }
 
+int recovery_finalize_device(DeviceContextHandle ctx) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+        if (runner->native_runs_outstanding()) return PTO_RUNTIME_ERR_INVALID_STATE;
+        return runner->recovery_finalize();
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,

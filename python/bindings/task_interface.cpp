@@ -1500,6 +1500,16 @@ void region_vmm_release(uint64_t handle) {
     );
 }
 
+void region_vmm_abandon_after_reset(uint64_t handle) {
+    std::lock_guard<std::mutex> lk(region_vmm_mu());
+    auto it = g_region_vmm_allocations().find(handle);
+    if (it == g_region_vmm_allocations().end()) return;
+    // A confirmed whole-device reset invalidates every RTS/VMM handle. Do
+    // not issue per-allocation device calls against the retired generation.
+    region_vmm_test_hooks().fake_va_bytes.erase(reinterpret_cast<uint64_t>(it->second.va));
+    g_region_vmm_allocations().erase(it);
+}
+
 void region_vmm_zero_range(uint64_t handle, uint64_t offset, uint64_t nbytes) {
     std::lock_guard<std::mutex> lk(region_vmm_mu());
     auto it = g_region_vmm_allocations().find(handle);
@@ -3406,6 +3416,7 @@ NB_MODULE(_task_interface, m) {
             "kernels can use get_dma_workspace; init raises if the platform lacks support for the requested workspace."
         )
         .def("finalize", &ChipWorker::finalize)
+        .def("recovery_finalize", &ChipWorker::recovery_finalize)
         .def(
             "register_callable",
             [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {
@@ -4132,6 +4143,11 @@ NB_MODULE(_task_interface, m) {
         },
         nb::arg("handle"), nb::call_guard<nb::gil_scoped_release>(),
         "Make one dependency-aware cleanup pass and delete the record only after complete success."
+    );
+    m.def(
+        "_region_vmm_abandon_after_reset", &region_vmm_abandon_after_reset,
+        nb::arg("handle"), nb::call_guard<nb::gil_scoped_release>(),
+        "Forget a VMM owner only after confirmed whole-device recovery reset."
     );
     m.def(
         "_region_vmm_zero_bytes",

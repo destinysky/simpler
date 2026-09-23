@@ -198,6 +198,7 @@ public:
     // releases that hold; Scheduler still owns the eventual FAILED commit.
     std::optional<uint32_t> begin_task_recovery(TaskSlot slot, uint64_t recovery_id);
     bool finish_task_recovery(TaskSlot slot, uint64_t recovery_id);
+    void set_global_recovery_freeze(bool frozen);
 
     // Called once for each dispatched group member after its endpoint has
     // accepted the launch, or conservatively at endpoint completion.
@@ -242,6 +243,7 @@ private:
     RunId building_run_id_{INVALID_RUN_ID};
     RunId active_run_id_{INVALID_RUN_ID};
     size_t begin_run_waiters_{0};
+    bool global_recovery_frozen_{false};
 
     // Scheduler's loop mutex (not owned). Held across optional quiescent
     // compaction so the scheduler cannot retain a slot pointer being removed.

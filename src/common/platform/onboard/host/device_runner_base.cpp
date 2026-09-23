@@ -1592,7 +1592,8 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // / 507899 / 507901 cascade across the whole st-onboard-a2a3 suite).
     // rtStreamDestroy on an error-state stream is the supported teardown path.
     if (abandon_device_resources) {
-        LOG_WARN("Fatal teardown: force reset/quarantine finished; skipping per-resource RTS destroy/free calls");
+        LOG_WARN(
+            "Execution-generation retirement after reset/quarantine; skipping per-resource RTS destroy/free calls");
     }
     if (stream_aicpu_ != nullptr) {
         if (!abandon_device_resources) {
@@ -1757,7 +1758,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         bank->cached_runtime_arena_size = 0;
     }
     if (abandon_device_resources) {
-        LOG_WARN("Fatal teardown: host-side ownership cleared without further device calls");
+        LOG_WARN("Execution-generation retirement: host-side ownership cleared without further device calls");
     }
     return rc;
 }

@@ -96,6 +96,7 @@ public:
     /// Tear down everything: device resources and runtime library.
     /// Terminal — the object cannot be reused after this.
     void finalize();
+    void recovery_finalize();
 
     // Launch a cid previously staged via register_callable. `args` is the runtime.so-ABI POD, which
     // every caller already holds: the wire blob is materialized into one before it gets here.
@@ -256,6 +257,7 @@ public:
     DeviceMemoryInfo device_memory_info() const;
 
 private:
+    void finalize_impl(bool recovery);
     using CreateDeviceContextFn = void *(*)();
     using DestroyDeviceContextFn = void (*)(void *);
     using DeviceMallocCtxFn = void *(*)(void *, size_t);
@@ -348,6 +350,7 @@ private:
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_run_stream_set_create_count_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
+    FinalizeDeviceFn recovery_finalize_device_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;
     DestroyCommStreamFn destroy_comm_stream_fn_ = nullptr;

@@ -44,6 +44,7 @@
 #include "../task_interface/buffer.h"
 #include "../task_interface/call_config.h"
 #include "../worker/device_memory_info.h"
+#include "recovery_coordinator.h"
 #include "remote_wire.h"
 #include "types.h"
 
@@ -235,6 +236,11 @@ static constexpr uint64_t CTRL_COMMITTED_DEVICE_MEMORY = 18;
 // L4-to-local-L3 envelope. Query a chip child's device-wide ACL_HBM_MEM
 // snapshot; the child writes one DeviceMemoryInfo at CTRL_OFF_RESULT.
 static constexpr uint64_t CTRL_DEVICE_MEMORY_INFO = 25;
+// Recovery controls carry a transaction identity and the endpoint generation
+// on which the fault was observed. The child writes the newly committed
+// endpoint generation to CTRL_OFF_RESULT after a successful rebuild.
+static constexpr uint64_t CTRL_REBUILD_ENDPOINT = 27;
+static constexpr uint64_t CTRL_RELEASE_FAULTED_ENDPOINT = 28;
 // 26 is reserved by the Python delegated-region control. It carries the DRCT
 // envelope on control_payload at every hop of the recursive single-owner
 // region protocol, so no C++ endpoint method claims it.
@@ -244,6 +250,21 @@ static constexpr uint64_t CTRL_DEVICE_MEMORY_INFO = 25;
 //   offset 40: uint64 result (returned ptr from malloc)
 static constexpr ptrdiff_t CTRL_OFF_ARG0 = 16;
 static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
+
+// Recovery-control envelope:
+//   offset 16: uint64 recovery_id
+//   offset 24: uint64 expected_endpoint_generation
+static constexpr ptrdiff_t CTRL_OFF_RECOVERY_ID = CTRL_OFF_ARG0;
+static constexpr ptrdiff_t CTRL_OFF_EXPECTED_ENDPOINT_GENERATION =
+    CTRL_OFF_RECOVERY_ID + static_cast<ptrdiff_t>(sizeof(uint64_t));
+
+static_assert(
+    CTRL_OFF_EXPECTED_ENDPOINT_GENERATION +
+            static_cast<ptrdiff_t>(sizeof(uint64_t)) <=
+        CTRL_OFF_RESULT,
+    "recovery control arguments overlap control result"
+);
+
 
 // CTRL_REGISTER puts the NUL-terminated POSIX shm name at MAILBOX_OFF_ARGS,
 // the exact staged blob size at CTRL_OFF_ARG0, and the callable digest
@@ -392,6 +413,9 @@ public:
     virtual bool report_submission_error(const WorkerDispatch &dispatch, const std::string &reason);
 
     virtual void shutdown_child() {}
+    virtual EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request);
+    virtual void release_faulted_endpoint(const EndpointRecoveryRequest &request);
+    virtual uint64_t endpoint_generation() const { return 0; }
     virtual uint64_t control_malloc(size_t size);
     virtual uint64_t control_committed_device_memory();
     virtual DeviceMemoryInfo control_device_memory_info();
@@ -455,6 +479,9 @@ public:
     bool report_submission_error(const WorkerDispatch &dispatch, const std::string &reason) override;
 
     void shutdown_child() override;
+    EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request) override;
+    void release_faulted_endpoint(const EndpointRecoveryRequest &request) override;
+    uint64_t endpoint_generation() const override { return endpoint_generation_.load(std::memory_order_acquire); }
     uint64_t control_malloc(size_t size) override;
     uint64_t control_committed_device_memory() override;
     DeviceMemoryInfo control_device_memory_info() override;
@@ -510,6 +537,7 @@ private:
     std::chrono::steady_clock::time_point next_liveness_check_{};
     std::atomic<bool> mailbox_control_timed_out_{false};
     int child_pid_{-1};
+    std::atomic<uint64_t> endpoint_generation_{1};
     // Set once the child has been reaped or observed unwaitable; the exit
     // status is only available from the reaping waitpid(), so it is retained
     // here to describe every later operation on this dead mailbox.
@@ -588,7 +616,7 @@ public:
     void complete_unpublished(WorkerDispatch d, const std::string &error_message);
     bool has_staged_run(RunId run_id) const;
     bool activate_prepared(RunId run_id);
-    void progress();
+    void progress(const std::atomic<bool> *recovery_frozen = nullptr);
 
     // The active lane and staged-successor lane are intentionally distinct.
     // A staged successor must not make a second task from the active run
@@ -604,6 +632,9 @@ public:
     // Write SHUTDOWN to the mailbox so the child process exits its loop.
     // Does NOT waitpid — the Python facade owns the child PID.
     void shutdown_child();
+    EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request);
+    void release_faulted_endpoint(const EndpointRecoveryRequest &request);
+    uint64_t endpoint_generation() const { return endpoint_ ? endpoint_->endpoint_generation() : 0; }
 
     // Memory control — callable from the orch thread while the Scheduler thread
     // may be running a task. Commands serialize with each other on
@@ -745,7 +776,7 @@ public:
     void start(Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept);
     void stop_workers();
     void stop();
-    void progress();
+    void progress(const std::atomic<bool> *recovery_frozen = nullptr);
 
     WorkerThread *get_worker_by_id(WorkerType type, int32_t worker_id) const;
     std::vector<int32_t> next_level_worker_ids() const;
@@ -757,6 +788,8 @@ public:
     bool any_busy() const;
     bool has_staged_run(RunId run_id) const;
     bool activate_prepared_run(RunId run_id);
+    EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request);
+    void release_faulted_endpoint(const EndpointRecoveryRequest &request);
 
     // Forward CTRL_PREPARE to a specific NEXT_LEVEL worker. Thin wrapper
     // over WorkerThread::control_prepare; exposed at manager level so the

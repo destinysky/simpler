@@ -96,6 +96,7 @@ public:
     int poll_execution(const ActiveExecution &active) override;
     int drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
+    int recovery_finalize() override;
 
     // `set_chip_swimlane_enabled`, `set_dump_args_enabled`,
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
@@ -162,6 +163,11 @@ public:
     int destroy_comm_stream(void *stream);
 
 private:
+    enum class TeardownReason : uint8_t {
+        FatalDeviceFailure,
+        OperatorRecovery,
+    };
+
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
     // worker_count_, executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
@@ -201,7 +207,8 @@ private:
     // 507899), but a *force* reset clears it: finalize() calls
     // force_reset_device() on this path so the next Worker re-inits clean in the
     // same process (see force_reset_device()). This flag drives admission and
-    // recovery. See launch_execution() and recover_device_or_mark_unusable().
+    // fatal teardown only; L3 endpoint-rebuild policy neither reads nor writes
+    // it. See launch_execution() and recover_device_or_mark_unusable().
     // Admission and recovery execute on different host threads.
     std::atomic<bool> device_unusable_{false};
 
@@ -240,6 +247,8 @@ private:
     // keep a still-poisoned card flagged instead of clearing device_unusable_
     // unconditionally.
     int force_reset_device();
+    int finalize_healthy();
+    int retire_execution_generation(TeardownReason reason);
 
     /**
      * Initialize performance profiling device buffers
