@@ -47,6 +47,7 @@ from simpler.task_interface import (
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
     ChipCallable,
+    ChipWorker,
     DataType,
     TaskArgs,
     TensorArgType,
@@ -6093,6 +6094,38 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         assert calls == [("base", 0), ("domain", 10), ("domain", 20)]
         assert tuple(store.physical_bindings) == (10, 20)
 
+    def test_child_comm_recovery_uses_fresh_namespace_from_canonical_path(self):
+        rootinfo_paths: list[str] = []
+        cw = cast(
+            Any,
+            SimpleNamespace(
+                _comm_base_handle_cached=0,
+                comm_init=lambda _rank, _nranks, path: rootinfo_paths.append(path) or 99,
+            ),
+        )
+
+        def retire():
+            cw._comm_base_handle_cached = 0
+
+        cw.comm_retire_after_peer_reset = retire
+        store = worker_mod._L2LocalCommStore(
+            base_spec=worker_mod._L2CommBaseSpec(0, 2, "/tmp/root"),
+            generation=1,
+        )
+
+        assert worker_mod._rebuild_local_comm_state(
+            cw, store, recovery_id=7, expected_local_comm_generation=1
+        ) == 2
+        assert worker_mod._rebuild_local_comm_state(
+            cw, store, recovery_id=8, expected_local_comm_generation=2
+        ) == 3
+
+        assert rootinfo_paths == [
+            "/tmp/root.recovery-7-g2",
+            "/tmp/root.recovery-8-g3",
+        ]
+        assert store.base_spec.rootinfo_path == "/tmp/root"
+
     def test_child_records_base_spec_and_removes_domain_only_after_release_success(self):
         root = b"/tmp/root\x00"
         request = SharedMemory(create=True, size=worker_mod._COMM_INIT_HEADER.size + len(root))
@@ -6217,6 +6250,33 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         assert cw._comm_base_handle_cached == 77
         assert store.generation == 1
         assert store.recovery_id == 7
+
+    def test_child_new_comm_failure_after_retirement_leaves_no_cached_handle(self):
+        class FakeImpl:
+            def comm_retire_after_peer_reset(self):
+                pass
+
+            def comm_init(self, _rank, _nranks, _rootinfo_path):
+                raise RuntimeError("new communicator init failed")
+
+        cw = ChipWorker()
+        cw._impl = FakeImpl()
+        cw._comm_base_handle_cached = 77
+        store = worker_mod._L2LocalCommStore(
+            base_spec=worker_mod._L2CommBaseSpec(0, 2, "/tmp/root"),
+            generation=1,
+        )
+
+        with pytest.raises(RuntimeError, match="new communicator init failed"):
+            worker_mod._rebuild_local_comm_state(
+                cw, store, recovery_id=7, expected_local_comm_generation=1
+            )
+
+        assert cw._comm_base_handle_cached == 0
+        assert store.generation == 1
+        assert store.recovery_id == 7
+        with pytest.raises(RuntimeError, match="chip has no base communicator"):
+            worker_mod._comm_base_handle(cw)
 
     def test_a_fully_failed_domain_allocation_owes_nothing(self, monkeypatch):
         worker = self._worker()

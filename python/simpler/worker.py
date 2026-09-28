@@ -2944,6 +2944,10 @@ def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview, store: _L2Local
     store.physical_bindings.pop(int(allocation_id), None)
 
 
+def _recovery_comm_rootinfo_path(base_path: str, recovery_id: int, target_generation: int) -> str:
+    return f"{base_path}.recovery-{recovery_id}-g{target_generation}"
+
+
 def _rebuild_local_comm_state(
     cw: ChipWorker,
     store: _L2LocalCommStore,
@@ -2963,6 +2967,7 @@ def _rebuild_local_comm_state(
         raise RuntimeError("communication recovery requires a retained base communication spec")
     if store.generation == (1 << 64) - 1:
         raise RuntimeError("local communication generation exhausted")
+    target_generation = expected_local_comm_generation + 1
     store.recovery_id = recovery_id
     store.physical_bindings.clear()
 
@@ -2970,7 +2975,12 @@ def _rebuild_local_comm_state(
         cw.comm_retire_after_peer_reset()
 
     base = store.base_spec
-    handle = cw.comm_init(base.rank, base.nranks, base.rootinfo_path)
+    recovery_rootinfo_path = _recovery_comm_rootinfo_path(
+        base.rootinfo_path,
+        recovery_id,
+        target_generation,
+    )
+    handle = cw.comm_init(base.rank, base.nranks, recovery_rootinfo_path)
     if handle == 0:
         raise RuntimeError("communication recovery returned a null base communicator")
     cw._comm_base_handle_cached = int(handle)

@@ -189,10 +189,12 @@ def kernel_symbol_runtime(tmp_path_factory):
         simpler_prepare_run simpler_launch_run simpler_poll_run simpler_wait_run simpler_finalize_run
         supports_concurrent_native_prepare_ctx get_arena_bank_gm_heap_base_ctx get_retained_temp_addr_ctx
         simpler_unregister_callable get_aicpu_dlopen_count get_host_dlopen_count get_run_stream_set_create_count
+        recovery_finalize_device
         ensure_acl_ready_ctx create_comm_stream_ctx destroy_comm_stream_ctx comm_init comm_alloc_windows
         comm_get_local_window_base comm_get_window_size comm_derive_context comm_alloc_domain_windows
         comm_release_domain_windows comm_global_domain_prepare comm_global_domain_import
         comm_global_domain_release comm_barrier comm_destroy
+        comm_abandon_after_device_reset comm_retire_after_peer_reset
     """.split()
     cache = {}
 
@@ -467,6 +469,33 @@ class TestChipWorkerPython:
         worker = ChipWorker()
         with pytest.raises(TypeError, match="CallableHandle returned by ChipWorker.register_callable"):
             worker.run(0, ChipStorageTaskArgs(), CallConfig())  # pyright: ignore[reportArgumentType]
+
+    def test_comm_retire_success_clears_cached_base_handle(self):
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        worker = ChipWorker()
+        worker._impl = type("FakeImpl", (), {"comm_retire_after_peer_reset": lambda _self: None})()
+        worker._comm_base_handle_cached = 77
+
+        worker.comm_retire_after_peer_reset()
+
+        assert worker._comm_base_handle_cached == 0
+
+    def test_comm_retire_failure_preserves_cached_base_handle(self):
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        class FakeImpl:
+            def comm_retire_after_peer_reset(self):
+                raise RuntimeError("retirement failed")
+
+        worker = ChipWorker()
+        worker._impl = FakeImpl()
+        worker._comm_base_handle_cached = 77
+
+        with pytest.raises(RuntimeError, match="retirement failed"):
+            worker.comm_retire_after_peer_reset()
+
+        assert worker._comm_base_handle_cached == 77
 
     def test_public_wrapper_rejects_cross_thread_finalize(self):
         from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]

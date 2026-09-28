@@ -1821,6 +1821,7 @@ class ChipWorker:
     def comm_retire_after_peer_reset(self) -> None:
         """Retire local communication resources without waiting for old peers."""
         self._impl.comm_retire_after_peer_reset()
+        self._comm_base_handle_cached = 0
 
     @property
     def device_id(self):
