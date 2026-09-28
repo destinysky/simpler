@@ -638,6 +638,7 @@ _CTRL_GLOBAL_DOMAIN_NODE = 24
 _CTRL_DEVICE_MEMORY_INFO = 25
 _CTRL_REBUILD_ENDPOINT = 27
 _CTRL_RELEASE_FAULTED_ENDPOINT = 28
+_CTRL_REBUILD_COMM_STATE = 29
 _CTRL_OP_NAMES[_CTRL_DEVICE_MEMORY_INFO] = "device_memory_info"
 _CTRL_DELEGATED_REGION = 26
 _LOCAL_GLOBAL_CONTROL_HEADER = struct.Struct("<IIQ")
@@ -693,13 +694,24 @@ _CTRL_OFF_RESULT = 40
 # Recovery-control envelope:
 #   offset 16: uint64 recovery_id
 #   offset 24: uint64 expected_endpoint_generation
+#   offset 32: uint64 expected_local_comm_generation
 _CTRL_U64_SIZE = struct.calcsize("<Q")
 
 _CTRL_OFF_RECOVERY_ID = _CTRL_OFF_ARG0
 _CTRL_OFF_EXPECTED_ENDPOINT_GENERATION = (_CTRL_OFF_RECOVERY_ID + _CTRL_U64_SIZE)
+_CTRL_OFF_EXPECTED_LOCAL_COMM_GENERATION = (_CTRL_OFF_EXPECTED_ENDPOINT_GENERATION + _CTRL_U64_SIZE)
 
 assert (_CTRL_OFF_EXPECTED_ENDPOINT_GENERATION + _CTRL_U64_SIZE <= _CTRL_OFF_RESULT)
+assert (_CTRL_OFF_EXPECTED_LOCAL_COMM_GENERATION + _CTRL_U64_SIZE <= _CTRL_OFF_RESULT)
 _DEVICE_MEMORY_INFO = struct.Struct("<QQ")
+
+
+class _LocalCommState(enum.IntEnum):
+    UNINITIALIZED = 0
+    READY = 1
+    STALE = 2
+    REBUILDING = 3
+    BROKEN = 4
 
 
 class _NoBufferConsumerError(RuntimeError):
@@ -2396,7 +2408,32 @@ def _read_shm_name(buf, offset: int) -> str:
     return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
 
 
-def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
+@dataclass(frozen=True)
+class _L2CommBaseSpec:
+    rank: int
+    nranks: int
+    rootinfo_path: str
+
+
+@dataclass(frozen=True)
+class _L2CommDomainSpec:
+    allocation_id: int
+    rank_ids: tuple[int, ...]
+    domain_rank: int
+    window_size: int
+    buffer_nbytes: tuple[int, ...]
+
+
+@dataclass
+class _L2LocalCommStore:
+    base_spec: _L2CommBaseSpec | None = None
+    domain_specs: dict[int, _L2CommDomainSpec] = field(default_factory=dict)
+    physical_bindings: dict[int, tuple[int, int]] = field(default_factory=dict)
+    generation: int = 0
+    recovery_id: int = 0
+
+
+def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview, store: _L2LocalCommStore) -> None:
     """CTRL_ALLOC_DOMAIN handler — runs on the chip child.
 
     Reads the request shm (header + buffer_nbytes + rank_ids), calls
@@ -2425,6 +2462,17 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
         req_buf.release()
         req_shm.close()
 
+    spec = _L2CommDomainSpec(
+        allocation_id=int(allocation_id),
+        rank_ids=tuple(int(rank_id) for rank_id in rank_ids),
+        domain_rank=int(domain_rank),
+        window_size=int(window_size),
+        buffer_nbytes=tuple(int(nbytes) for nbytes in buffer_nbytes),
+    )
+    prior = store.domain_specs.get(spec.allocation_id)
+    if prior is not None and prior != spec:
+        raise RuntimeError(f"allocation_id {spec.allocation_id} conflicts with its retained communication spec")
+
     # Opened before the collective so the commit can be published the instant
     # the window exists. Everything after that point — the carving bounds check,
     # the pack — can fail with the allocation already made, and a parent that
@@ -2434,14 +2482,24 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
     assert reply_buf is not None
     try:
         handle = _comm_base_handle(cw)  # base communicator handle (cached on the ChipWorker)
-        device_ctx, local_window_base = cw._impl.comm_alloc_domain_windows(
-            int(handle),
-            int(allocation_id),
-            rank_ids,
-            int(domain_rank),
-            int(window_size),
-            _buffer_field_addr(reply_buf, _OFF_DOMAIN_REPLY_COMMITTED),
-        )
+        try:
+            device_ctx, local_window_base = cw._impl.comm_alloc_domain_windows(
+                int(handle),
+                int(allocation_id),
+                rank_ids,
+                int(domain_rank),
+                int(window_size),
+                _buffer_field_addr(reply_buf, _OFF_DOMAIN_REPLY_COMMITTED),
+            )
+        except BaseException:
+            if struct.unpack_from("<Q", reply_buf, _OFF_DOMAIN_REPLY_COMMITTED)[0] == 1:
+                store.domain_specs[spec.allocation_id] = spec
+            raise
+        # The backend allocation is committed before response carving. Retain
+        # its logical identity at that same boundary so a later packaging
+        # failure cannot orphan an allocation from recovery.
+        store.domain_specs[spec.allocation_id] = spec
+        store.physical_bindings[spec.allocation_id] = (int(device_ctx), int(local_window_base))
 
         # Carve buffer pointers sequentially inside the local window.
         buffer_ptrs: list[int] = []
@@ -2463,7 +2521,7 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
         reply_shm.close()
 
 
-def _handle_ctrl_comm_init(cw: ChipWorker, buf: memoryview) -> None:
+def _handle_ctrl_comm_init(cw: ChipWorker, buf: memoryview, store: _L2LocalCommStore) -> None:
     """CTRL_COMM_INIT handler — drives `cw.comm_init` on the chip child.
 
     Idempotent: ``ChipWorker.comm_init`` itself caches the handle and returns
@@ -2484,10 +2542,16 @@ def _handle_ctrl_comm_init(cw: ChipWorker, buf: memoryview) -> None:
         req_buf.release()
         req_shm.close()
 
+    spec = _L2CommBaseSpec(int(rank), int(nranks), rootinfo_path)
+    if store.base_spec is not None and store.base_spec != spec:
+        raise RuntimeError("CTRL_COMM_INIT conflicts with the retained base communication spec")
     handle = cw.comm_init(int(rank), int(nranks), rootinfo_path)
     if handle == 0:
         raise RuntimeError("comm_init returned 0 handle for hidden base communicator")
     cw._comm_base_handle_cached = int(handle)
+    store.base_spec = spec
+    if store.generation == 0:
+        store.generation = 1
 
 
 @dataclass
@@ -2862,7 +2926,7 @@ def _teardown_chip_process_resources(
     raise aggregated
 
 
-def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview) -> None:
+def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview, store: _L2LocalCommStore) -> None:
     """CTRL_RELEASE_DOMAIN handler — collective free for one allocation."""
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
@@ -2876,6 +2940,61 @@ def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview) -> None:
 
     handle = _comm_base_handle(cw)
     cw._impl.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
+    store.domain_specs.pop(int(allocation_id), None)
+    store.physical_bindings.pop(int(allocation_id), None)
+
+
+def _rebuild_local_comm_state(
+    cw: ChipWorker,
+    store: _L2LocalCommStore,
+    *,
+    recovery_id: int,
+    expected_local_comm_generation: int,
+) -> int:
+    if recovery_id == 0:
+        raise RuntimeError("communication recovery requires a non-zero recovery id")
+    if expected_local_comm_generation != store.generation:
+        raise RuntimeError("stale local communication recovery generation")
+    if store.recovery_id != 0:
+        if store.recovery_id != recovery_id:
+            raise RuntimeError("stale or wrong local communication recovery transaction")
+        raise RuntimeError("duplicate local communication recovery command")
+    if store.base_spec is None:
+        raise RuntimeError("communication recovery requires a retained base communication spec")
+    if store.generation == (1 << 64) - 1:
+        raise RuntimeError("local communication generation exhausted")
+    store.recovery_id = recovery_id
+    store.physical_bindings.clear()
+
+    if getattr(cw, "_comm_base_handle_cached", 0):
+        cw.comm_retire_after_peer_reset()
+
+    base = store.base_spec
+    handle = cw.comm_init(base.rank, base.nranks, base.rootinfo_path)
+    if handle == 0:
+        raise RuntimeError("communication recovery returned a null base communicator")
+    cw._comm_base_handle_cached = int(handle)
+
+    rebuilt: dict[int, tuple[int, int]] = {}
+    for allocation_id in sorted(store.domain_specs):
+        spec = store.domain_specs[allocation_id]
+        committed = ctypes.c_uint64(0)
+        device_ctx, local_window_base = cw._impl.comm_alloc_domain_windows(
+            int(handle),
+            spec.allocation_id,
+            list(spec.rank_ids),
+            spec.domain_rank,
+            spec.window_size,
+            ctypes.addressof(committed),
+        )
+        if committed.value != 1:
+            raise RuntimeError(f"communication recovery did not commit allocation {allocation_id}")
+        rebuilt[allocation_id] = (int(device_ctx), int(local_window_base))
+
+    store.physical_bindings = rebuilt
+    store.generation += 1
+    store.recovery_id = 0
+    return store.generation
 
 
 def _comm_base_handle(cw: ChipWorker) -> int:
@@ -2956,6 +3075,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         )
     )
     global_domain_store = _L2GlobalDomainStore()
+    local_comm_store = _L2LocalCommStore()
     diagnostic_capture_index = 0
     endpoint_generation = 1
     faulted = [False]
@@ -3102,6 +3222,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     recovery_reset_unconfirmed[0] = True
                     raise
                 global_domain_store.domains.clear()
+                local_comm_store.physical_bindings.clear()
                 provider_region_store.abandon_after_device_reset()
                 replacement = rebuild_worker()
                 cw = replacement
@@ -3128,6 +3249,23 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 faulted[0] = False
                 held_endpoint_generation[0] = 0
                 held_recovery_id[0] = 0
+            elif sub_cmd == _CTRL_REBUILD_COMM_STATE:
+                recovery_id = struct.unpack_from("<Q", buf, _CTRL_OFF_RECOVERY_ID)[0]
+                expected_endpoint_generation = struct.unpack_from(
+                    "<Q", buf, _CTRL_OFF_EXPECTED_ENDPOINT_GENERATION
+                )[0]
+                expected_local_comm_generation = struct.unpack_from(
+                    "<Q", buf, _CTRL_OFF_EXPECTED_LOCAL_COMM_GENERATION
+                )[0]
+                if expected_endpoint_generation != endpoint_generation:
+                    raise RuntimeError("stale endpoint generation for communication recovery")
+                new_generation = _rebuild_local_comm_state(
+                    cw,
+                    local_comm_store,
+                    recovery_id=int(recovery_id),
+                    expected_local_comm_generation=int(expected_local_comm_generation),
+                )
+                struct.pack_into("<Q", buf, _CTRL_OFF_RESULT, new_generation)
             elif sub_cmd == _CTRL_MALLOC:
                 size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
                 ptr = cw.malloc(size)
@@ -3219,11 +3357,11 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         registry.pop(int(cid), None)
                         prepared.discard(int(cid))
             elif sub_cmd == _CTRL_ALLOC_DOMAIN:
-                _handle_ctrl_alloc_domain(cw, buf)
+                _handle_ctrl_alloc_domain(cw, buf, local_comm_store)
             elif sub_cmd == _CTRL_RELEASE_DOMAIN:
-                _handle_ctrl_release_domain(cw, buf)
+                _handle_ctrl_release_domain(cw, buf, local_comm_store)
             elif sub_cmd == _CTRL_COMM_INIT:
-                _handle_ctrl_comm_init(cw, buf)
+                _handle_ctrl_comm_init(cw, buf, local_comm_store)
             elif sub_cmd == _CTRL_DELEGATED_REGION:
                 _handle_ctrl_delegated_region_terminal(buf, provider_transaction_table, provider_region_store)
             elif sub_cmd == _CTRL_COMMITTED_DEVICE_MEMORY:
@@ -4989,11 +5127,9 @@ class Worker:
         self._global_domain_free_mu = threading.Lock()
         self._global_domain_free_results: dict[int, BaseException | None] = {}
         self._alloc_id_lock = threading.Lock()
-        # Base HCCL/sim communicator is built lazily on the first
-        # ``orch.allocate_domain`` call (see ``_ensure_comm_base``).  We
-        # keep ``Worker.init()`` cheap — it only forks chip children and
-        # starts the C++ scheduler; no comm work happens there.
-        self._comm_base_ready: bool = False
+        # The native L3 worker owns local communication state and generation.
+        # Python queries it on every lazy-init decision so endpoint recovery
+        # cannot leave a sticky READY cache behind.
 
         self._endpoint_registry: EndpointRegistry | None = None
         self._endpoint_registry_epoch: int = 0
@@ -8697,8 +8833,6 @@ class Worker:
 
         with contextlib.suppress(BaseException):
             self._teardown_worker_tree(startup_abort=True, deadline=deadline)
-        self._comm_base_ready = False
-
     @property
     def live_domains(self) -> dict[str, CommDomainHandle]:
         """Read-only snapshot of currently-live dynamic CommDomain handles.
@@ -9016,16 +9150,20 @@ class Worker:
     def _ensure_comm_base(self) -> None:
         """Lazily establish the base HCCL/sim communicator across all chips.
 
-        Idempotent — sets ``self._comm_base_ready`` after the first
-        successful collective so subsequent ``allocate_domain`` calls skip
-        straight to the per-allocation IPC handshake.  Dispatched to every
-        ``device_ids`` chip in parallel via CTRL_COMM_INIT control mailbox;
-        the chip child runs ``ChipWorker.comm_init`` (which itself caches
-        the handle, so a re-dispatch would be a no-op anyway).
+        Native state is the authority. Only UNINITIALIZED may run ordinary
+        initialization; recovery-owned STALE/REBUILDING/BROKEN states fail
+        closed instead of accidentally creating a mixed generation.
         """
-        if getattr(self, "_comm_base_ready", False):
-            return
         assert self._worker is not None
+        raw_state, generation = self._worker.local_comm_state()
+        state = _LocalCommState(int(raw_state))
+        if state is _LocalCommState.READY:
+            return
+        if state is not _LocalCommState.UNINITIALIZED:
+            raise RuntimeError(
+                "local communication scope is not available "
+                f"(state={state.name}, generation={int(generation)})"
+            )
         device_ids = self._config.get("device_ids", [])
         rootinfo_path = self._comm_plan_rootinfo_path()
 
@@ -9065,7 +9203,7 @@ class Worker:
             len(device_ids),
             initialize,
             name_prefix="shm-comm-init-lifecycle-",
-            after_success=lambda: setattr(self, "_comm_base_ready", True),
+            after_success=self._worker.commit_initial_local_comm_ready,
         )
 
     def _allocate_domain(  # noqa: PLR0912 -- linear input-validation + per-chip shm staging + dispatch + reply unpack; splitting obscures the fail-fast ordering

@@ -230,24 +230,42 @@ static bool file_barrier(
 // either may be nullptr before its respective step completed.  Base-comm peer
 // imports (alloc_windows_via_ipc) are not tracked and remain reclaimed by
 // aclrtResetDevice; per-domain peer imports are tracked and freed via this call.
-static void release_own_vmm_window(void *va, aclrtDrvMemHandle handle) {
+// This checked core is the authoritative teardown sequence historically used
+// by release_own_vmm_window. Normal teardown and recovery retirement
+// intentionally share it; future lifecycle changes must be made here rather
+// than modifying either caller alone. Recovery callers observe every ACL
+// failure and retain their CommHandle bookkeeping so a partial cleanup cannot
+// be reported as a completed generation retirement.
+static int release_own_vmm_window_checked(void *&va, aclrtDrvMemHandle &handle) {
     if (va != nullptr) {
-        aclrtUnmapMem(va);
-        aclrtReleaseMemAddress(va);
+        if (aclrtUnmapMem(va) != ACL_SUCCESS) return -1;
+        if (aclrtReleaseMemAddress(va) != ACL_SUCCESS) return -1;
+        va = nullptr;
     }
     if (handle != nullptr) {
-        aclrtFreePhysical(handle);
+        if (aclrtFreePhysical(handle) != ACL_SUCCESS) return -1;
+        handle = nullptr;
     }
+    return 0;
+}
+
+static void release_own_vmm_window(void *va, aclrtDrvMemHandle handle) {
+    (void)release_own_vmm_window_checked(va, handle);
 }
 
 // Release every per-peer VMM import recorded on a domain allocation and clear
 // the list, so a re-release is a no-op.  Own window and device_ctx are freed
 // separately by the caller.
-static void release_domain_peer_windows(DomainAllocation &alloc) {
+static int release_domain_peer_windows_checked(DomainAllocation &alloc) {
     for (auto &pw : alloc.peer_windows) {
-        release_own_vmm_window(pw.first, pw.second);
+        if (release_own_vmm_window_checked(pw.first, pw.second) != 0) return -1;
     }
     alloc.peer_windows.clear();
+    return 0;
+}
+
+static void release_domain_peer_windows(DomainAllocation &alloc) {
+    (void)release_domain_peer_windows_checked(alloc);
 }
 
 }  // namespace
@@ -1488,5 +1506,92 @@ extern "C" int comm_destroy(CommHandle h) try {
 } catch (...) {
     LOG_ERROR("[comm] comm_destroy: unknown exception");
     if (h) delete h;
+    return -1;
+}
+
+extern "C" int comm_abandon_after_device_reset(CommHandle h) try {
+    if (!h) return -1;
+    // Device reset owns every physical object below. Null all stale device
+    // identities before deleting their host records so no cleanup path can
+    // issue an ACL or HCCL call against the retired execution generation.
+    h->stream = nullptr;
+    h->hccl_comm = nullptr;
+    h->device_ctx = nullptr;
+    h->owns_device_ctx = false;
+    h->derived_contexts.clear();
+    for (auto &entry : h->domain_allocations) {
+        auto &alloc = *entry.second;
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+        if (alloc.urma_workspace) alloc.urma_workspace->AbandonAfterDeviceReset();
+#endif
+        alloc.local_buf = nullptr;
+        alloc.own_handle = nullptr;
+        alloc.peer_windows.clear();
+        alloc.device_ctx = nullptr;
+        reset_domain_urma_workspace(alloc);
+    }
+    h->domain_allocations.clear();
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    if (h->urma_workspace) h->urma_workspace->AbandonAfterDeviceReset();
+#endif
+    reset_base_urma_workspace(h);
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+    if (h->sdma_workspace) h->sdma_workspace->AbandonAfterDeviceReset();
+    h->sdma_workspace.reset();
+#endif
+    delete h;
+    return 0;
+} catch (...) {
+    delete h;
+    return -1;
+}
+
+extern "C" int comm_retire_after_peer_reset(CommHandle h) try {
+    if (!h) return -1;
+    // No barrier is legal here: one peer's old generation no longer exists.
+    // HCCL retirement is the gate: if it cannot retire locally, preserve the
+    // complete wrapper and all ownership so the caller cannot start a mixed
+    // communication generation.
+    if (h->hccl_comm != nullptr) {
+        HcclResult hret = hccl_comm_destroy(h->hccl_comm);
+        if (hret != HCCL_SUCCESS) {
+            LOG_ERROR("[comm rank %d] peer-reset HcclCommDestroy failed: %d", h->rank, static_cast<int>(hret));
+            return -1;
+        }
+        h->hccl_comm = nullptr;
+    }
+
+    // From this point cleanup is strictly local to the healthy endpoint. Keep
+    // the wrapper and every not-yet-released identity on any failure.
+    if (h->owns_device_ctx && h->device_ctx != nullptr) {
+        if (aclrtFree(h->device_ctx) != ACL_SUCCESS) return -1;
+        h->device_ctx = nullptr;
+        h->owns_device_ctx = false;
+    }
+    for (CommContext *&ctx : h->derived_contexts) {
+        if (ctx != nullptr && aclrtFree(ctx) != ACL_SUCCESS) return -1;
+        ctx = nullptr;
+    }
+    h->derived_contexts.clear();
+    for (auto it = h->domain_allocations.begin(); it != h->domain_allocations.end();) {
+        auto &alloc = *it->second;
+        if (alloc.device_ctx != nullptr) {
+            if (aclrtFree(alloc.device_ctx) != ACL_SUCCESS) return -1;
+            alloc.device_ctx = nullptr;
+        }
+        reset_domain_urma_workspace(alloc);
+        if (release_domain_peer_windows_checked(alloc) != 0) return -1;
+        if (release_own_vmm_window_checked(alloc.local_buf, alloc.own_handle) != 0) return -1;
+        it = h->domain_allocations.erase(it);
+    }
+    reset_base_urma_workspace(h);
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+    h->sdma_workspace.reset();
+#endif
+    delete h;
+    return 0;
+} catch (...) {
+    // Preserve h and all remaining ownership for diagnostics/retry. Deleting
+    // here would make a partial retirement indistinguishable from success.
     return -1;
 }

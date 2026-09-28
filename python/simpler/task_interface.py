@@ -1818,6 +1818,10 @@ class ChipWorker:
         """Destroy all communicators owned by this worker."""
         self._impl.comm_destroy_all()
 
+    def comm_retire_after_peer_reset(self) -> None:
+        """Retire local communication resources without waiting for old peers."""
+        self._impl.comm_retire_after_peer_reset()
+
     @property
     def device_id(self):
         """ACL device ordinal this worker is bound to."""

@@ -212,6 +212,7 @@ void Worker::init() {
     cfg.on_global_recovery_freeze_cb = [this](bool frozen) {
         orchestrator_.set_global_recovery_freeze(frozen);
     };
+    cfg.local_comm_recovery_manager = &local_comm_recovery_manager_;
     cfg.reservation_stall_sink = report_reservation_stall;
 
     scheduler_.start(cfg);
@@ -225,6 +226,7 @@ void Worker::close() {
     scheduler_.request_stop();
     scheduler_.stop();
     manager_.stop();
+    local_comm_recovery_manager_.reset();
     allocator_.shutdown();
     initialized_ = false;
 }

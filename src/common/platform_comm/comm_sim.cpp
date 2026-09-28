@@ -984,3 +984,7 @@ extern "C" int comm_destroy(CommHandle h) try {
     std::fprintf(stderr, "[comm_sim] comm_destroy: unknown exception\n");
     return -1;
 }
+
+extern "C" int comm_abandon_after_device_reset(CommHandle) { return -1; }
+
+extern "C" int comm_retire_after_peer_reset(CommHandle) { return -1; }

@@ -6008,11 +6008,13 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 patch.object(worker_mod, "_comm_base_handle", lambda _cw: 1),
                 pytest.raises(ValueError, match="overflows window_size"),
             ):
-                worker_mod._handle_ctrl_alloc_domain(cw, mailbox)
+                store = worker_mod._L2LocalCommStore()
+                worker_mod._handle_ctrl_alloc_domain(cw, mailbox, store)
 
             assert worker_mod._domain_reply_committed(reply), (
                 "the window was allocated and the chip did not say so before failing"
             )
+            assert store.domain_specs[7].buffer_nbytes == (4096,)
         finally:
             for shm in (request, reply):
                 shm.close()
@@ -6045,13 +6047,176 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 patch.object(worker_mod, "_comm_base_handle", lambda _cw: 1),
                 pytest.raises(MemoryError, match="tuple conversion failed"),
             ):
-                worker_mod._handle_ctrl_alloc_domain(cw, mailbox)
+                store = worker_mod._L2LocalCommStore()
+                worker_mod._handle_ctrl_alloc_domain(cw, mailbox, store)
 
             assert worker_mod._domain_reply_committed(reply)
+            assert store.domain_specs[7].allocation_id == 7
         finally:
             for shm in (request, reply):
                 shm.close()
                 shm.unlink()
+
+    def test_child_comm_specs_survive_worker_replacement_and_rebuild_in_allocation_order(self):
+        calls: list[tuple[str, int]] = []
+
+        def allocate(_handle, allocation_id, _rank_ids, _domain_rank, _window_size, commit_address):
+            calls.append(("domain", allocation_id))
+            ctypes.c_uint64.from_address(commit_address).value = 1
+            return 0xC000 + allocation_id, 0xB000 + allocation_id
+
+        replacement = cast(
+            Any,
+            SimpleNamespace(
+                _impl=SimpleNamespace(comm_alloc_domain_windows=allocate),
+                comm_init=lambda *_args: calls.append(("base", 0)) or 99,
+                comm_retire_after_peer_reset=lambda: calls.append(("retire", 0)),
+            ),
+        )
+        store = worker_mod._L2LocalCommStore(
+            base_spec=worker_mod._L2CommBaseSpec(0, 2, "/tmp/root"),
+            domain_specs={
+                20: worker_mod._L2CommDomainSpec(20, (0, 1), 0, 64, (32,)),
+                10: worker_mod._L2CommDomainSpec(10, (0, 1), 0, 64, (16,)),
+            },
+            generation=1,
+        )
+
+        generation = worker_mod._rebuild_local_comm_state(
+            replacement,
+            store,
+            recovery_id=7,
+            expected_local_comm_generation=1,
+        )
+
+        assert generation == 2
+        assert calls == [("base", 0), ("domain", 10), ("domain", 20)]
+        assert tuple(store.physical_bindings) == (10, 20)
+
+    def test_child_records_base_spec_and_removes_domain_only_after_release_success(self):
+        root = b"/tmp/root\x00"
+        request = SharedMemory(create=True, size=worker_mod._COMM_INIT_HEADER.size + len(root))
+        mailbox = memoryview(bytearray(MAILBOX_SIZE))
+        try:
+            request_buf = cast(Any, request.buf)
+            worker_mod._COMM_INIT_HEADER.pack_into(request_buf, 0, 0, 2)
+            request_buf[worker_mod._COMM_INIT_HEADER.size :] = root
+            encoded = request.name.encode("utf-8")
+            mailbox[worker_mod._OFF_ARGS : worker_mod._OFF_ARGS + len(encoded)] = encoded
+            cw = cast(Any, SimpleNamespace(comm_init=lambda *_args: 77))
+            store = worker_mod._L2LocalCommStore()
+            worker_mod._handle_ctrl_comm_init(cw, mailbox, store)
+            assert store.base_spec == worker_mod._L2CommBaseSpec(0, 2, "/tmp/root")
+            assert store.generation == 1
+        finally:
+            request_buf.release()
+            request.close()
+            request.unlink()
+
+        release = SharedMemory(create=True, size=worker_mod._DOMAIN_REQ_HEADER.size)
+        try:
+            release_buf = cast(Any, release.buf)
+            worker_mod._DOMAIN_REQ_HEADER.pack_into(release_buf, 0, 9, 2, 0, 64, 0)
+            mailbox[:] = b"\x00" * len(mailbox)
+            encoded = release.name.encode("utf-8")
+            mailbox[worker_mod._OFF_ARGS : worker_mod._OFF_ARGS + len(encoded)] = encoded
+            spec = worker_mod._L2CommDomainSpec(9, (0, 1), 0, 64, ())
+            store.domain_specs[9] = spec
+            store.physical_bindings[9] = (1, 2)
+            cw._comm_base_handle_cached = 77
+            cw._impl = SimpleNamespace(
+                comm_release_domain_windows=lambda *_args: (_ for _ in ()).throw(RuntimeError("release failed"))
+            )
+            with pytest.raises(RuntimeError, match="release failed"):
+                worker_mod._handle_ctrl_release_domain(cw, mailbox, store)
+            assert store.domain_specs[9] == spec
+
+            cw._impl.comm_release_domain_windows = lambda *_args: None
+            worker_mod._handle_ctrl_release_domain(cw, mailbox, store)
+            assert 9 not in store.domain_specs
+            assert 9 not in store.physical_bindings
+        finally:
+            release_buf.release()
+            release.close()
+            release.unlink()
+
+    def test_child_comm_rebuild_rejects_stale_generation_and_missing_base_spec(self):
+        cw = cast(Any, SimpleNamespace())
+        stale = worker_mod._L2LocalCommStore(
+            base_spec=worker_mod._L2CommBaseSpec(0, 1, "/tmp/root"), generation=2
+        )
+        with pytest.raises(RuntimeError, match="stale local communication recovery generation"):
+            worker_mod._rebuild_local_comm_state(
+                cw, stale, recovery_id=7, expected_local_comm_generation=1
+            )
+
+        with pytest.raises(RuntimeError, match="retained base communication spec"):
+            worker_mod._rebuild_local_comm_state(
+                cw, worker_mod._L2LocalCommStore(generation=1), recovery_id=7,
+                expected_local_comm_generation=1
+            )
+
+    def test_child_comm_generation_does_not_advance_after_partial_rebuild(self):
+        def allocate(_handle, allocation_id, _rank_ids, _domain_rank, _window_size, commit_address):
+            if allocation_id == 20:
+                raise RuntimeError("domain 20 failed")
+            ctypes.c_uint64.from_address(commit_address).value = 1
+            return 1, 2
+
+        cw = cast(
+            Any,
+            SimpleNamespace(
+                _impl=SimpleNamespace(comm_alloc_domain_windows=allocate),
+                comm_init=lambda *_args: 99,
+            ),
+        )
+        store = worker_mod._L2LocalCommStore(
+            base_spec=worker_mod._L2CommBaseSpec(0, 2, "/tmp/root"),
+            domain_specs={
+                10: worker_mod._L2CommDomainSpec(10, (0, 1), 0, 64, ()),
+                20: worker_mod._L2CommDomainSpec(20, (0, 1), 0, 64, ()),
+            },
+            generation=1,
+        )
+
+        with pytest.raises(RuntimeError, match="domain 20 failed"):
+            worker_mod._rebuild_local_comm_state(
+                cw, store, recovery_id=7, expected_local_comm_generation=1
+            )
+
+        assert store.generation == 1
+        assert store.recovery_id == 7
+
+    def test_child_peer_retirement_failure_preserves_generation_and_blocks_reinit(self):
+        calls: list[str] = []
+
+        def retire():
+            calls.append("retire")
+            raise RuntimeError("old communication retirement failed")
+
+        cw = cast(
+            Any,
+            SimpleNamespace(
+                _comm_base_handle_cached=77,
+                comm_retire_after_peer_reset=retire,
+                comm_init=lambda *_args: calls.append("comm_init") or 99,
+            ),
+        )
+        store = worker_mod._L2LocalCommStore(
+            base_spec=worker_mod._L2CommBaseSpec(0, 2, "/tmp/root"),
+            generation=1,
+            physical_bindings={10: (0x1000, 0x2000)},
+        )
+
+        with pytest.raises(RuntimeError, match="old communication retirement failed"):
+            worker_mod._rebuild_local_comm_state(
+                cw, store, recovery_id=7, expected_local_comm_generation=1
+            )
+
+        assert calls == ["retire"]
+        assert cw._comm_base_handle_cached == 77
+        assert store.generation == 1
+        assert store.recovery_id == 7
 
     def test_a_fully_failed_domain_allocation_owes_nothing(self, monkeypatch):
         worker = self._worker()
@@ -6408,9 +6573,14 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         worker._config = {"device_ids": [0, 1]}
         monkeypatch.setattr(worker, "_comm_plan_rootinfo_path", lambda: "/tmp/comm-rootinfo")
         calls: list[int] = []
+        commits: list[bool] = []
         worker._worker = cast(
             Any,
-            SimpleNamespace(control_comm_init=lambda chip_idx, _request_name: calls.append(chip_idx)),
+            SimpleNamespace(
+                local_comm_state=lambda: (worker_mod._LocalCommState.UNINITIALIZED, 0),
+                control_comm_init=lambda chip_idx, _request_name: calls.append(chip_idx),
+                commit_initial_local_comm_ready=lambda: commits.append(True),
+            ),
         )
         real_thread = threading.Thread
 
@@ -6429,13 +6599,20 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             worker._ensure_comm_base()
 
         assert sorted(calls) == [0, 1]
-        assert not worker._comm_base_ready
+        assert commits == []
 
     def test_comm_init_preserves_the_first_interrupt_through_shm_cleanup(self, monkeypatch):
         worker = self._worker()
         worker._config = {"device_ids": [0]}
         monkeypatch.setattr(worker, "_comm_plan_rootinfo_path", lambda: "/tmp/comm-rootinfo")
-        worker._worker = cast(Any, SimpleNamespace(control_comm_init=lambda _chip_idx, _request_name: None))
+        worker._worker = cast(
+            Any,
+            SimpleNamespace(
+                local_comm_state=lambda: (worker_mod._LocalCommState.UNINITIALIZED, 0),
+                control_comm_init=lambda _chip_idx, _request_name: None,
+                commit_initial_local_comm_ready=lambda: None,
+            ),
+        )
 
         created: list[SharedMemory] = []
         created_fds: list[int] = []
@@ -6484,6 +6661,91 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                     shm.unlink()
                 except FileNotFoundError:
                     pass
+
+    def test_comm_ready_fast_path_observes_native_recovery_generation(self):
+        worker = self._worker()
+        calls: list[int] = []
+        worker._worker = cast(
+            Any,
+            SimpleNamespace(
+                local_comm_state=lambda: (worker_mod._LocalCommState.READY, 2),
+                control_comm_init=lambda *_args: calls.append(1),
+            ),
+        )
+
+        worker._ensure_comm_base()
+
+        assert calls == []
+
+    def test_comm_initial_generation_commits_only_after_all_ranks_succeed(self, monkeypatch):
+        worker = self._worker()
+        worker._config = {"device_ids": [0, 1]}
+        monkeypatch.setattr(worker, "_comm_plan_rootinfo_path", lambda: "/tmp/comm-rootinfo")
+        state = [worker_mod._LocalCommState.UNINITIALIZED, 0]
+        calls: list[int] = []
+
+        def commit():
+            state[:] = [worker_mod._LocalCommState.READY, 1]
+
+        worker._worker = cast(
+            Any,
+            SimpleNamespace(
+                local_comm_state=lambda: tuple(state),
+                control_comm_init=lambda chip_idx, _request_name: calls.append(chip_idx),
+                commit_initial_local_comm_ready=commit,
+            ),
+        )
+
+        worker._ensure_comm_base()
+
+        assert sorted(calls) == [0, 1]
+        assert state == [worker_mod._LocalCommState.READY, 1]
+
+    def test_comm_partial_init_failure_does_not_commit_and_can_retry(self, monkeypatch):
+        worker = self._worker()
+        worker._config = {"device_ids": [0, 1]}
+        monkeypatch.setattr(worker, "_comm_plan_rootinfo_path", lambda: "/tmp/comm-rootinfo")
+        state = [worker_mod._LocalCommState.UNINITIALIZED, 0]
+        fail_rank_one = [True]
+
+        def initialize(chip_idx, _request_name):
+            if chip_idx == 1 and fail_rank_one[0]:
+                raise RuntimeError("rank 1 init failed")
+
+        def commit():
+            state[:] = [worker_mod._LocalCommState.READY, 1]
+
+        worker._worker = cast(
+            Any,
+            SimpleNamespace(
+                local_comm_state=lambda: tuple(state),
+                control_comm_init=initialize,
+                commit_initial_local_comm_ready=commit,
+            ),
+        )
+        with pytest.raises(RuntimeError, match="rank 1 init failed"):
+            worker._ensure_comm_base()
+        assert state == [worker_mod._LocalCommState.UNINITIALIZED, 0]
+
+        fail_rank_one[0] = False
+        worker._ensure_comm_base()
+        assert state == [worker_mod._LocalCommState.READY, 1]
+
+    def test_comm_broken_state_fails_without_ordinary_init(self):
+        worker = self._worker()
+        calls: list[int] = []
+        worker._worker = cast(
+            Any,
+            SimpleNamespace(
+                local_comm_state=lambda: (worker_mod._LocalCommState.BROKEN, 1),
+                control_comm_init=lambda *_args: calls.append(1),
+            ),
+        )
+
+        with pytest.raises(RuntimeError, match="state=BROKEN, generation=1"):
+            worker._ensure_comm_base()
+
+        assert calls == []
 
     def test_shm_cleanup_drains_later_owners_after_a_traversal_interrupt(self, monkeypatch):
         owner = worker_mod._SharedMemoryOwner(2)
@@ -6558,7 +6820,14 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         real_ensure_comm_base = worker._ensure_comm_base
 
         if operation == "comm_init":
-            worker._worker = cast(Any, SimpleNamespace(control_comm_init=lambda *_args: None))
+            worker._worker = cast(
+                Any,
+                SimpleNamespace(
+                    local_comm_state=lambda: (worker_mod._LocalCommState.UNINITIALIZED, 0),
+                    control_comm_init=lambda *_args: None,
+                    commit_initial_local_comm_ready=lambda: None,
+                ),
+            )
         elif operation == "domain_alloc":
             monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
 
@@ -6654,7 +6923,14 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             assert interrupt_observed.wait(5.0)
 
         if operation == "comm_init":
-            worker._worker = cast(Any, SimpleNamespace(control_comm_init=lambda *_args: interrupt_main()))
+            worker._worker = cast(
+                Any,
+                SimpleNamespace(
+                    local_comm_state=lambda: (worker_mod._LocalCommState.UNINITIALIZED, 0),
+                    control_comm_init=lambda *_args: interrupt_main(),
+                    commit_initial_local_comm_ready=lambda: None,
+                ),
+            )
         elif operation == "domain_alloc":
             monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
 
@@ -6898,6 +7174,15 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         resources = worker_mod._RunResources()
         worker._building_run_resources = resources
         monkeypatch.setattr(worker, "_comm_plan_rootinfo_path", lambda: "/tmp/comm-rootinfo")
+        if operation == "comm_init":
+            worker._worker = cast(
+                Any,
+                SimpleNamespace(
+                    local_comm_state=lambda: (worker_mod._LocalCommState.UNINITIALIZED, 0),
+                    control_comm_init=lambda *_args: None,
+                    commit_initial_local_comm_ready=lambda: None,
+                ),
+            )
         if operation == "domain_alloc":
             monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
 

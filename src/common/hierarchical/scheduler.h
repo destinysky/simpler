@@ -108,6 +108,7 @@ public:
         std::function<std::optional<uint32_t>(TaskSlot, uint64_t)> begin_task_recovery_cb;
         std::function<void(TaskSlot, uint64_t)> finish_task_recovery_cb;
         std::function<void(bool)> on_global_recovery_freeze_cb;
+        LocalCommRecoveryManager *local_comm_recovery_manager{nullptr};
         // Production leaves eligibility unset until distributed replay safety
         // is available. Tests may authorize endpoint rebuilding without replay.
         RecoveryCoordinator::EligibilityDecision recovery_eligibility_cb;

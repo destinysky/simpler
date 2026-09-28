@@ -321,6 +321,20 @@ void Scheduler::on_recovery_resolution(RecoveryResolution resolution) {
     const EndpointRecoveryRequest request{
         resolution.request.worker_id, ticket.recovery_id, ticket.expected_endpoint_generation};
     if (resolution.kind == RecoveryResolutionKind::REBUILD_ENDPOINT) {
+        if (cfg_.local_comm_recovery_manager != nullptr) {
+            try {
+                std::optional<uint64_t> generation =
+                    cfg_.local_comm_recovery_manager->mark_stale(ticket.recovery_id);
+                resolution.request.ticket.local_comm_rebuild_required = generation.has_value();
+                resolution.request.ticket.expected_local_comm_generation = generation.value_or(0);
+            } catch (const std::exception &e) {
+                EndpointRecoveryResult result{
+                    request.worker_id, request.recovery_id, false, request.expected_endpoint_generation, e.what()};
+                recovery_coordinator_.submit_endpoint_result(std::move(resolution.request), std::move(result));
+                notify_ready();
+                return;
+            }
+        }
         EndpointRecoveryResult result;
         try {
             result = cfg_.manager->rebuild_endpoint(request);
@@ -330,6 +344,21 @@ void Scheduler::on_recovery_resolution(RecoveryResolution resolution) {
         // The coordinator, not a side-channel callback, owns the action result
         // and the ENDPOINT_REBUILD -> ENDPOINT_READY/GIVE_UP transition.
         recovery_coordinator_.submit_endpoint_result(std::move(resolution.request), std::move(result));
+        notify_ready();
+        return;
+    }
+    if (resolution.kind == RecoveryResolutionKind::REBUILD_LOCAL_COMM) {
+        LocalCommRecoveryResult result{
+            ticket.recovery_id, false, ticket.expected_local_comm_generation,
+            "local communication recovery manager is unavailable"};
+        if (cfg_.local_comm_recovery_manager != nullptr) {
+            result = cfg_.local_comm_recovery_manager->rebuild(
+                {ticket.recovery_id, ticket.expected_local_comm_generation}, *cfg_.manager
+            );
+        }
+        recovery_coordinator_.submit_local_comm_result(
+            std::move(resolution.request), std::move(resolution.endpoint_result), std::move(result)
+        );
         notify_ready();
         return;
     }
@@ -344,6 +373,20 @@ void Scheduler::on_recovery_resolution(RecoveryResolution resolution) {
                                               std::to_string(result.endpoint_generation) +
                                               "; replay pipeline not implemented]"
                                         : "[endpoint rebuild failed: " + result.error_message + "]";
+    }
+    const bool local_comm_ready = resolution.local_comm_result.has_value() && resolution.local_comm_result->ok;
+    if (resolution.local_comm_result.has_value()) {
+        const LocalCommRecoveryResult &result = *resolution.local_comm_result;
+        if (!completion.error_message.empty()) completion.error_message.push_back(' ');
+        completion.error_message += result.ok
+                                        ? "[local communication rebuild succeeded; COMM_READY generation=" +
+                                              std::to_string(result.local_comm_generation) + "]"
+                                        : "[local communication rebuild failed: " + result.error_message + "]";
+    }
+    if (ticket.local_comm_rebuild_required && !local_comm_ready && cfg_.local_comm_recovery_manager != nullptr) {
+        cfg_.local_comm_recovery_manager->fail_stale_episode(
+            ticket.recovery_id, ticket.expected_local_comm_generation
+        );
     }
 
     // A successful rebuild already cleared the old hold and committed the new
@@ -363,8 +406,13 @@ void Scheduler::on_recovery_resolution(RecoveryResolution resolution) {
         " expected_endpoint_generation=" + std::to_string(ticket.expected_endpoint_generation) +
         " trace=DETECTED->ELIGIBILITY_CHECK->" +
         (resolution.endpoint_result.has_value()
-             ? (endpoint_ready ? "ENDPOINT_REBUILD->ENDPOINT_READY->GIVE_UP]"
-                               : "ENDPOINT_REBUILD->GIVE_UP]")
+             ? (endpoint_ready
+                    ? (resolution.local_comm_result.has_value()
+                           ? (local_comm_ready
+                                  ? "ENDPOINT_REBUILD->ENDPOINT_READY->COMM_REBUILD->COMM_READY->GIVE_UP]"
+                                  : "ENDPOINT_REBUILD->ENDPOINT_READY->COMM_REBUILD->GIVE_UP]")
+                           : "ENDPOINT_REBUILD->ENDPOINT_READY->GIVE_UP]")
+                    : "ENDPOINT_REBUILD->GIVE_UP]")
              : "GIVE_UP(recovery-not-authorized)]");
 
     // Preserve the old fatal ordering after GIVE_UP: publish the run's first

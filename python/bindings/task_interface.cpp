@@ -3685,6 +3685,10 @@ NB_MODULE(_task_interface, m) {
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
         )
         .def(
+            "comm_retire_after_peer_reset", &ChipWorker::comm_retire_after_peer_reset,
+            "Retire this endpoint's old local communication generation without a peer rendezvous."
+        )
+        .def(
             "comm_global_domain_prepare",
             [](ChipWorker &self, uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size,
                uint32_t profile) {

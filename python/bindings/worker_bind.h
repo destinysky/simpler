@@ -25,6 +25,7 @@
 #pragma once
 
 #include <nanobind/nanobind.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
@@ -435,6 +436,8 @@ inline void bind_worker(nb::module_ &m) {
             "configure_operator_recovery", &Worker::configure_operator_recovery, nb::arg("enabled") = false,
             "Enable or disable L3 operator recovery before init (default false)."
         )
+        .def("local_comm_state", &Worker::local_comm_state)
+        .def("commit_initial_local_comm_ready", &Worker::commit_initial_local_comm_ready)
         .def(
             "add_sub_worker",
             [](Worker &self, uint64_t mailbox_ptr, int child_pid) {

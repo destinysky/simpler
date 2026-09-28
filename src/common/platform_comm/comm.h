@@ -337,6 +337,18 @@ int comm_barrier(CommHandle h);
  */
 int comm_destroy(CommHandle h);
 
+/**
+ * Drop host ownership after the associated device generation was reset.
+ * This path must not dereference or destroy stale device resources.
+ */
+int comm_abandon_after_device_reset(CommHandle h);
+
+/**
+ * Retire one healthy endpoint's local resources after a peer reset.
+ * This path performs no cross-rank rendezvous.
+ */
+int comm_retire_after_peer_reset(CommHandle h);
+
 #ifdef __cplusplus
 }
 #endif

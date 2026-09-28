@@ -160,6 +160,7 @@ ChipWorker::RuntimeStorage &ChipWorker::RuntimeStorage::operator=(RuntimeStorage
     return *this;
 }
 
+ChipWorker::ChipWorker() = default;
 ChipWorker::~ChipWorker() { finalize(); }
 
 void ChipWorker::init(
@@ -260,6 +261,10 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = load_symbol<CommGlobalDomainReleaseFn>(handle, "comm_global_domain_release");
         comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
         comm_destroy_fn_ = load_symbol<CommDestroyFn>(handle, "comm_destroy");
+        comm_abandon_after_device_reset_fn_ =
+            load_symbol<CommRecoveryRetireFn>(handle, "comm_abandon_after_device_reset");
+        comm_retire_after_peer_reset_fn_ =
+            load_symbol<CommRecoveryRetireFn>(handle, "comm_retire_after_peer_reset");
         kernel_supported_fn = load_symbol<KernelSupportedFn>(handle, "simpler_kernel_mode_supported");
         kernel_init_fn = load_symbol<KernelInitFn>(handle, "simpler_kernel_mode_init");
         kernel_prepare_callable_fn =
@@ -394,6 +399,8 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
+        comm_abandon_after_device_reset_fn_ = nullptr;
+        comm_retire_after_peer_reset_fn_ = nullptr;
         kernel_supported_fn_ = nullptr;
         kernel_init_fn_ = nullptr;
         kernel_prepare_callable_fn_ = nullptr;
@@ -458,6 +465,8 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = nullptr;
         comm_barrier_fn_ = nullptr;
         comm_destroy_fn_ = nullptr;
+        comm_abandon_after_device_reset_fn_ = nullptr;
+        comm_retire_after_peer_reset_fn_ = nullptr;
         kernel_supported_fn_ = nullptr;
         kernel_init_fn_ = nullptr;
         kernel_prepare_callable_fn_ = nullptr;
@@ -510,13 +519,10 @@ void ChipWorker::finalize_impl(bool recovery) {
     }
     global_domain_ids_.clear();
 
-    // Defensive: if the user never called comm_destroy, reclaim all owned
-    // communicator handles and streams before tearing down the device context.
-    if (recovery) {
-        comm_sessions_.clear();
-        comm_session_index_.clear();
-        base_comm_handle_ = 0;
-    } else {
+    // Healthy finalization destroys communication before the device context.
+    // Recovery retains host ownership until reset has quarantined the old
+    // generation, then abandons device-facing fields without touching them.
+    if (!recovery) {
         clear_comm_sessions();
     }
 
@@ -527,6 +533,20 @@ void ChipWorker::finalize_impl(bool recovery) {
         } else {
             finalize_device_fn_(device_ctx_);
         }
+    }
+    if (recovery) {
+        for (auto &session : comm_sessions_) {
+            if (session.handle != nullptr && comm_abandon_after_device_reset_fn_ != nullptr) {
+                (void)comm_abandon_after_device_reset_fn_(session.handle);
+            }
+            session.handle = nullptr;
+            // The stream belongs to the reset execution generation and must
+            // not be passed to a runtime destroy API after reset.
+            session.stream = nullptr;
+        }
+        comm_sessions_.clear();
+        comm_session_index_.clear();
+        base_comm_handle_ = 0;
     }
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
         destroy_device_context_fn_(device_ctx_);
@@ -577,6 +597,8 @@ void ChipWorker::finalize_impl(bool recovery) {
     comm_global_domain_release_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
+    comm_abandon_after_device_reset_fn_ = nullptr;
+    comm_retire_after_peer_reset_fn_ = nullptr;
     kernel_supported_fn_ = nullptr;
     kernel_init_fn_ = nullptr;
     kernel_prepare_callable_fn_ = nullptr;
@@ -1394,4 +1416,33 @@ void ChipWorker::comm_destroy_all() {
     if (first_rc != 0) {
         throw std::runtime_error("comm_destroy_all failed with code " + std::to_string(first_rc));
     }
+}
+
+void ChipWorker::comm_retire_after_peer_reset() {
+    if (comm_retire_after_peer_reset_fn_ == nullptr) {
+        throw std::runtime_error("communication retirement after peer reset is unsupported");
+    }
+    for (auto it = comm_sessions_.rbegin(); it != comm_sessions_.rend(); ++it) {
+        if (it->handle != nullptr) {
+            int rc = comm_retire_after_peer_reset_fn_(it->handle);
+            if (rc != 0) {
+                // The backend contract retains the wrapper and its remaining
+                // ownership on failure. Keep the session/index intact too so
+                // recovery cannot proceed to comm_init over mixed generations.
+                throw std::runtime_error("communication retirement after peer reset failed with code " +
+                                         std::to_string(rc));
+            }
+            it->handle = nullptr;
+        }
+        int stream_rc = 0;
+        destroy_comm_stream_best_effort(it->stream, &stream_rc);
+        if (stream_rc != 0) {
+            throw std::runtime_error("communication stream retirement after peer reset failed with code " +
+                                     std::to_string(stream_rc));
+        }
+        it->stream = nullptr;
+    }
+    comm_sessions_.clear();
+    comm_session_index_.clear();
+    base_comm_handle_ = 0;
 }

@@ -241,6 +241,7 @@ static constexpr uint64_t CTRL_DEVICE_MEMORY_INFO = 25;
 // endpoint generation to CTRL_OFF_RESULT after a successful rebuild.
 static constexpr uint64_t CTRL_REBUILD_ENDPOINT = 27;
 static constexpr uint64_t CTRL_RELEASE_FAULTED_ENDPOINT = 28;
+static constexpr uint64_t CTRL_REBUILD_COMM_STATE = 29;
 // 26 is reserved by the Python delegated-region control. It carries the DRCT
 // envelope on control_payload at every hop of the recursive single-owner
 // region protocol, so no C++ endpoint method claims it.
@@ -254,12 +255,15 @@ static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
 // Recovery-control envelope:
 //   offset 16: uint64 recovery_id
 //   offset 24: uint64 expected_endpoint_generation
+//   offset 32: uint64 expected_local_comm_generation
 static constexpr ptrdiff_t CTRL_OFF_RECOVERY_ID = CTRL_OFF_ARG0;
 static constexpr ptrdiff_t CTRL_OFF_EXPECTED_ENDPOINT_GENERATION =
     CTRL_OFF_RECOVERY_ID + static_cast<ptrdiff_t>(sizeof(uint64_t));
+static constexpr ptrdiff_t CTRL_OFF_EXPECTED_LOCAL_COMM_GENERATION =
+    CTRL_OFF_EXPECTED_ENDPOINT_GENERATION + static_cast<ptrdiff_t>(sizeof(uint64_t));
 
 static_assert(
-    CTRL_OFF_EXPECTED_ENDPOINT_GENERATION +
+    CTRL_OFF_EXPECTED_LOCAL_COMM_GENERATION +
             static_cast<ptrdiff_t>(sizeof(uint64_t)) <=
         CTRL_OFF_RESULT,
     "recovery control arguments overlap control result"
@@ -415,6 +419,7 @@ public:
     virtual void shutdown_child() {}
     virtual EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request);
     virtual void release_faulted_endpoint(const EndpointRecoveryRequest &request);
+    virtual LocalCommEndpointResult rebuild_local_comm(const LocalCommEndpointRequest &request);
     virtual uint64_t endpoint_generation() const { return 0; }
     virtual uint64_t control_malloc(size_t size);
     virtual uint64_t control_committed_device_memory();
@@ -481,6 +486,7 @@ public:
     void shutdown_child() override;
     EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request) override;
     void release_faulted_endpoint(const EndpointRecoveryRequest &request) override;
+    LocalCommEndpointResult rebuild_local_comm(const LocalCommEndpointRequest &request) override;
     uint64_t endpoint_generation() const override { return endpoint_generation_.load(std::memory_order_acquire); }
     uint64_t control_malloc(size_t size) override;
     uint64_t control_committed_device_memory() override;
@@ -634,6 +640,7 @@ public:
     void shutdown_child();
     EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request);
     void release_faulted_endpoint(const EndpointRecoveryRequest &request);
+    LocalCommEndpointResult rebuild_local_comm(const LocalCommEndpointRequest &request);
     uint64_t endpoint_generation() const { return endpoint_ ? endpoint_->endpoint_generation() : 0; }
 
     // Memory control — callable from the orch thread while the Scheduler thread
@@ -790,6 +797,7 @@ public:
     bool activate_prepared_run(RunId run_id);
     EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request);
     void release_faulted_endpoint(const EndpointRecoveryRequest &request);
+    LocalCommRecoveryResult rebuild_local_comm(const LocalCommRecoveryRequest &request);
 
     // Forward CTRL_PREPARE to a specific NEXT_LEVEL worker. Thin wrapper
     // over WorkerThread::control_prepare; exposed at manager level so the

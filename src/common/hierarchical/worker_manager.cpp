@@ -140,6 +140,10 @@ EndpointRecoveryResult WorkerEndpoint::rebuild_endpoint(const EndpointRecoveryRe
 void WorkerEndpoint::release_faulted_endpoint(const EndpointRecoveryRequest &) {
     throw_unsupported_control("release_faulted_endpoint");
 }
+LocalCommEndpointResult WorkerEndpoint::rebuild_local_comm(const LocalCommEndpointRequest &request) {
+    return {request.worker_id, request.recovery_id, false, request.expected_local_comm_generation,
+            "local communication rebuild is unsupported"};
+}
 uint64_t WorkerEndpoint::control_committed_device_memory() {
     throw_unsupported_control("control_committed_device_memory");
 }
@@ -383,6 +387,44 @@ void LocalMailboxEndpoint::release_faulted_endpoint(const EndpointRecoveryReques
         sizeof(request.expected_endpoint_generation)
     );
     run_control_command("release_faulted_endpoint");
+}
+
+LocalCommEndpointResult LocalMailboxEndpoint::rebuild_local_comm(const LocalCommEndpointRequest &request) {
+    std::lock_guard<std::mutex> lk(mailbox_mu_);
+    const uint64_t current_endpoint_generation = endpoint_generation_.load(std::memory_order_acquire);
+    LocalCommEndpointResult result{
+        request.worker_id, request.recovery_id, false, request.expected_local_comm_generation, {}};
+    if (caps_.kind != WorkerEndpointKind::LOCAL_MAILBOX || request.worker_id != caps_.worker_id ||
+        request.recovery_id == 0 || request.expected_local_comm_generation == UINT64_MAX ||
+        request.expected_endpoint_generation != current_endpoint_generation) {
+        result.error_message = "stale or invalid local communication recovery request";
+        return result;
+    }
+    try {
+        const uint64_t sub_cmd = CTRL_REBUILD_COMM_STATE;
+        std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(sub_cmd));
+        std::memcpy(mbox() + CTRL_OFF_RECOVERY_ID, &request.recovery_id, sizeof(request.recovery_id));
+        std::memcpy(
+            mbox() + CTRL_OFF_EXPECTED_ENDPOINT_GENERATION, &request.expected_endpoint_generation,
+            sizeof(request.expected_endpoint_generation)
+        );
+        std::memcpy(
+            mbox() + CTRL_OFF_EXPECTED_LOCAL_COMM_GENERATION, &request.expected_local_comm_generation,
+            sizeof(request.expected_local_comm_generation)
+        );
+        run_control_command("rebuild_local_comm");
+        uint64_t rebuilt_generation = 0;
+        std::memcpy(&rebuilt_generation, mbox() + CTRL_OFF_RESULT, sizeof(rebuilt_generation));
+        if (rebuilt_generation != request.expected_local_comm_generation + 1) {
+            result.error_message = "child returned an invalid local communication generation";
+            return result;
+        }
+        result.ok = true;
+        result.local_comm_generation = rebuilt_generation;
+    } catch (const std::exception &e) {
+        result.error_message = e.what();
+    }
+    return result;
 }
 
 char *LocalMailboxEndpoint::task_frame(size_t index) const {
@@ -636,6 +678,14 @@ void WorkerThread::release_faulted_endpoint(const EndpointRecoveryRequest &reque
         throw std::runtime_error("faulted endpoint release target does not match endpoint");
     }
     endpoint_->release_faulted_endpoint(request);
+}
+
+LocalCommEndpointResult WorkerThread::rebuild_local_comm(const LocalCommEndpointRequest &request) {
+    if (!endpoint_ || request.worker_id != worker_id()) {
+        return {request.worker_id, request.recovery_id, false, request.expected_local_comm_generation,
+                "local communication recovery target does not match endpoint"};
+    }
+    return endpoint_->rebuild_local_comm(request);
 }
 
 const WorkerEndpointCaps &WorkerThread::caps() const {
@@ -1748,6 +1798,69 @@ void WorkerManager::release_faulted_endpoint(const EndpointRecoveryRequest &requ
     WorkerThread *worker = get_worker_by_id(WorkerType::NEXT_LEVEL, request.worker_id);
     if (worker == nullptr) throw std::runtime_error("unknown faulted endpoint release target");
     worker->release_faulted_endpoint(request);
+}
+
+LocalCommRecoveryResult WorkerManager::rebuild_local_comm(const LocalCommRecoveryRequest &request) {
+    LocalCommRecoveryResult group_result{
+        request.recovery_id, false, request.expected_local_comm_generation, {}};
+    std::vector<WorkerThread *> workers;
+    workers.reserve(next_level_threads_.size());
+    for (const auto &owned : next_level_threads_) {
+        WorkerThread *worker = owned.get();
+        if (worker->caps().kind != WorkerEndpointKind::LOCAL_MAILBOX) {
+            group_result.error_message = "local communication recovery requires local mailbox endpoints";
+            return group_result;
+        }
+        if (worker->busy()) {
+            group_result.error_message =
+                "local communication recovery requires every local endpoint to be quiescent";
+            return group_result;
+        }
+        workers.push_back(worker);
+    }
+    if (workers.empty()) {
+        group_result.error_message = "local communication recovery has no local endpoints";
+        return group_result;
+    }
+
+    std::vector<LocalCommEndpointResult> results(workers.size());
+    std::vector<uint64_t> endpoint_generations;
+    endpoint_generations.reserve(workers.size());
+    for (WorkerThread *worker : workers) endpoint_generations.push_back(worker->endpoint_generation());
+    std::vector<std::thread> threads;
+    threads.reserve(workers.size());
+    for (size_t index = 0; index < workers.size(); ++index) {
+        threads.emplace_back([&, index] {
+            WorkerThread *worker = workers[index];
+            const LocalCommEndpointRequest endpoint_request{
+                worker->worker_id(), request.recovery_id, endpoint_generations[index],
+                request.expected_local_comm_generation};
+            try {
+                results[index] = worker->rebuild_local_comm(endpoint_request);
+            } catch (const std::exception &e) {
+                results[index] = {worker->worker_id(), request.recovery_id, false,
+                                  request.expected_local_comm_generation, e.what()};
+            } catch (...) {
+                results[index] = {worker->worker_id(), request.recovery_id, false,
+                                  request.expected_local_comm_generation,
+                                  "unknown local communication endpoint failure"};
+            }
+        });
+    }
+    for (auto &thread : threads) thread.join();
+
+    for (const auto &result : results) {
+        if (!result.ok || result.recovery_id != request.recovery_id ||
+            result.local_comm_generation != request.expected_local_comm_generation + 1) {
+            group_result.error_message = result.error_message.empty()
+                                             ? "local communication endpoint result mismatch"
+                                             : result.error_message;
+            return group_result;
+        }
+    }
+    group_result.ok = true;
+    group_result.local_comm_generation = request.expected_local_comm_generation + 1;
+    return group_result;
 }
 
 // =============================================================================

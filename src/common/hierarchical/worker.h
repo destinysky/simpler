@@ -44,8 +44,10 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "local_comm_recovery_manager.h"
 #include "ring.h"
 #include "orchestrator.h"
 #include "scheduler.h"
@@ -130,6 +132,14 @@ public:
     }
     void control_comm_init(int worker_id, const std::string &request_shm_name) {
         manager_.control_comm_init(worker_id, request_shm_name.c_str());
+    }
+    std::pair<uint8_t, uint64_t> local_comm_state() const {
+        LocalCommGroupState state = local_comm_recovery_manager_.state();
+        return {static_cast<uint8_t>(state.state), state.generation};
+    }
+    std::pair<uint8_t, uint64_t> commit_initial_local_comm_ready() {
+        LocalCommGroupState state = local_comm_recovery_manager_.commit_initial_ready();
+        return {static_cast<uint8_t>(state.state), state.generation};
     }
 
     ControlResult
@@ -262,4 +272,5 @@ private:
     Orchestrator orchestrator_;
     Scheduler scheduler_;
     WorkerManager manager_;
+    LocalCommRecoveryManager local_comm_recovery_manager_;
 };

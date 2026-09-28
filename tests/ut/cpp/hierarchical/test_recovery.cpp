@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "call_config.h"
+#include "chip_worker.h"
 #include "orchestrator.h"
 #include "recovery_coordinator.h"
 #include "ring.h"
@@ -31,7 +32,129 @@
 #include "worker_manager.h"
 #include "task_args.h"
 
+class ChipWorkerRecoveryTestPeer {
+public:
+    static void seed(ChipWorker &worker, std::vector<std::string> &events, int retire_rc = 0) {
+        event_sink() = &events;
+        active_worker() = &worker;
+        retire_result() = retire_rc;
+        worker.initialized_ = true;
+        worker.finalized_ = false;
+        worker.device_ctx_ = reinterpret_cast<void *>(0x10);
+        worker.finalize_device_fn_ = &healthy_finalize;
+        worker.recovery_finalize_device_fn_ = &recovery_finalize;
+        worker.destroy_comm_stream_fn_ = &destroy_stream;
+        worker.comm_destroy_fn_ = &normal_destroy;
+        worker.comm_abandon_after_device_reset_fn_ = &abandon_after_reset;
+        worker.comm_retire_after_peer_reset_fn_ = &retire_after_peer_reset;
+        auto *session = worker.create_comm_session(
+            reinterpret_cast<void *>(0x20), reinterpret_cast<void *>(0x30), true
+        );
+        ASSERT_NE(session, nullptr);
+        worker.base_comm_handle_ = reinterpret_cast<uint64_t>(session->handle);
+    }
+
+    static void discard(ChipWorker &worker) {
+        worker.comm_sessions_.clear();
+        worker.comm_session_index_.clear();
+        worker.base_comm_handle_ = 0;
+        worker.device_ctx_ = nullptr;
+        worker.initialized_ = false;
+        worker.finalized_ = true;
+        event_sink() = nullptr;
+        active_worker() = nullptr;
+    }
+
+    static size_t session_count(const ChipWorker &worker) { return worker.comm_sessions_.size(); }
+    static void *session_handle(const ChipWorker &worker) { return worker.comm_sessions_.at(0).handle; }
+    static uint64_t base_handle(const ChipWorker &worker) { return worker.base_comm_handle_; }
+
+private:
+    static std::vector<std::string> *&event_sink() {
+        static std::vector<std::string> *value = nullptr;
+        return value;
+    }
+    static ChipWorker *&active_worker() {
+        static ChipWorker *value = nullptr;
+        return value;
+    }
+    static int &retire_result() {
+        static int value = 0;
+        return value;
+    }
+    static void record(const char *event) {
+        if (event_sink() != nullptr) event_sink()->emplace_back(event);
+    }
+    static int healthy_finalize(void *) {
+        record("healthy-finalize");
+        return 0;
+    }
+    static int recovery_finalize(void *) {
+        ChipWorker *worker = active_worker();
+        record(worker != nullptr && !worker->comm_sessions_.empty() &&
+                       worker->comm_sessions_.front().handle != nullptr
+                   ? "reset-with-owned-handle"
+                   : "reset-without-owned-handle");
+        return 0;
+    }
+    static int abandon_after_reset(void *) {
+        record("abandon-after-reset");
+        return 0;
+    }
+    static int retire_after_peer_reset(void *) {
+        record("retire-after-peer-reset");
+        return retire_result();
+    }
+    static int normal_destroy(void *) {
+        record("normal-destroy");
+        return 0;
+    }
+    static int destroy_stream(void *, void *) {
+        record("destroy-stream");
+        return 0;
+    }
+};
+
 namespace {
+
+TEST(ChipWorkerCommRecoveryTest, FaultedEndpointResetsBeforeHostOnlyAbandon) {
+    ChipWorker worker;
+    std::vector<std::string> events;
+    ChipWorkerRecoveryTestPeer::seed(worker, events);
+
+    worker.recovery_finalize();
+
+    EXPECT_EQ(events, (std::vector<std::string>{"reset-with-owned-handle", "abandon-after-reset"}));
+    EXPECT_EQ(ChipWorkerRecoveryTestPeer::session_count(worker), 0u);
+    EXPECT_EQ(ChipWorkerRecoveryTestPeer::base_handle(worker), 0u);
+}
+
+TEST(ChipWorkerCommRecoveryTest, HealthyPeerRetirementFailurePreservesOwnershipAndStops) {
+    ChipWorker worker;
+    std::vector<std::string> events;
+    ChipWorkerRecoveryTestPeer::seed(worker, events, -17);
+
+    EXPECT_THROW(worker.comm_retire_after_peer_reset(), std::runtime_error);
+
+    EXPECT_EQ(events, (std::vector<std::string>{"retire-after-peer-reset"}));
+    EXPECT_EQ(ChipWorkerRecoveryTestPeer::session_count(worker), 1u);
+    EXPECT_EQ(ChipWorkerRecoveryTestPeer::session_handle(worker), reinterpret_cast<void *>(0x20));
+    EXPECT_EQ(ChipWorkerRecoveryTestPeer::base_handle(worker), 0x20u);
+    ChipWorkerRecoveryTestPeer::discard(worker);
+}
+
+TEST(ChipWorkerCommRecoveryTest, HealthyPeerRetirementConsumesOwnershipOnlyAfterSuccess) {
+    ChipWorker worker;
+    std::vector<std::string> events;
+    ChipWorkerRecoveryTestPeer::seed(worker, events);
+
+    worker.comm_retire_after_peer_reset();
+
+    EXPECT_EQ(events, (std::vector<std::string>{"retire-after-peer-reset", "destroy-stream"}));
+    EXPECT_EQ(ChipWorkerRecoveryTestPeer::session_count(worker), 0u);
+    EXPECT_EQ(ChipWorkerRecoveryTestPeer::base_handle(worker), 0u);
+    ChipWorkerRecoveryTestPeer::discard(worker);
+}
 
 TEST(RecoveryConfigTest, SchedulerConfigDefaultsOperatorRecoveryOff) {
     Scheduler::Config config{};
@@ -77,6 +200,14 @@ CallableIdentity non_local_chip_callable(uint8_t seed) {
     return callable;
 }
 
+struct ConcurrentCommProbe {
+    std::mutex mu;
+    std::condition_variable cv;
+    uint32_t entered{0};
+    uint32_t expected{0};
+    bool observed{false};
+};
+
 class RecoveryEndpoint final : public WorkerEndpoint {
 public:
     explicit RecoveryEndpoint(int32_t worker_id = 0) {
@@ -121,6 +252,23 @@ public:
         return {request.worker_id, request.recovery_id, true, current + 1, {}};
     }
 
+    LocalCommEndpointResult rebuild_local_comm(const LocalCommEndpointRequest &request) override {
+        comm_recovery_calls_.fetch_add(1, std::memory_order_relaxed);
+        if (comm_probe_ != nullptr) {
+            std::unique_lock<std::mutex> lk(comm_probe_->mu);
+            ++comm_probe_->entered;
+            comm_probe_->cv.notify_all();
+            comm_probe_->observed = comm_probe_->cv.wait_for(lk, std::chrono::seconds(1), [this] {
+                return comm_probe_->entered == comm_probe_->expected;
+            });
+        }
+        if (fail_comm_recovery_) {
+            return {request.worker_id, request.recovery_id, false, request.expected_local_comm_generation,
+                    "injected communication rebuild failure"};
+        }
+        return {request.worker_id, request.recovery_id, true, request.expected_local_comm_generation + 1, {}};
+    }
+
     void release_faulted_endpoint(const EndpointRecoveryRequest &request) override {
         if (request.recovery_id == 0 || request.expected_endpoint_generation != endpoint_generation()) {
             throw std::runtime_error("stale release transaction");
@@ -128,7 +276,10 @@ public:
         releases_.fetch_add(1, std::memory_order_relaxed);
     }
     void set_recovery_failure(bool fail) { fail_recovery_ = fail; }
+    void set_comm_recovery_failure(bool fail) { fail_comm_recovery_ = fail; }
+    void set_comm_probe(ConcurrentCommProbe *probe) { comm_probe_ = probe; }
     uint32_t recovery_calls() const { return recovery_calls_.load(std::memory_order_relaxed); }
+    uint32_t comm_recovery_calls() const { return comm_recovery_calls_.load(std::memory_order_relaxed); }
     uint32_t releases() const { return releases_.load(std::memory_order_relaxed); }
 
     void request_progress_stop() noexcept override {
@@ -183,9 +334,116 @@ private:
     std::deque<WorkerEndpointProgress> events_;
     std::atomic<uint64_t> generation_{1};
     std::atomic<uint32_t> recovery_calls_{0};
+    std::atomic<uint32_t> comm_recovery_calls_{0};
     std::atomic<uint32_t> releases_{0};
     bool fail_recovery_{false};
+    bool fail_comm_recovery_{false};
+    ConcurrentCommProbe *comm_probe_{nullptr};
 };
+
+TEST(LocalCommRecoveryManagerTest, InitialCommitAndInvalidationPreserveGeneration) {
+    LocalCommRecoveryManager manager;
+    EXPECT_EQ(manager.state().state, LocalCommState::UNINITIALIZED);
+    EXPECT_EQ(manager.state().generation, 0u);
+    EXPECT_EQ(manager.commit_initial_ready().state, LocalCommState::READY);
+    EXPECT_EQ(manager.state().generation, 1u);
+    ASSERT_EQ(manager.mark_stale(17), std::optional<uint64_t>(1));
+    EXPECT_EQ(manager.state().state, LocalCommState::STALE);
+    EXPECT_EQ(manager.state().generation, 1u);
+    manager.fail_stale_episode(17, 1);
+    EXPECT_EQ(manager.state().state, LocalCommState::BROKEN);
+    EXPECT_EQ(manager.state().generation, 1u);
+}
+
+TEST(LocalCommRecoveryManagerTest, StaleRequestDoesNotMutateTheHeldEpisode) {
+    LocalCommRecoveryManager manager;
+    manager.commit_initial_ready();
+    ASSERT_TRUE(manager.mark_stale(17).has_value());
+    WorkerManager workers;
+    EXPECT_FALSE(manager.rebuild({18, 1}, workers).ok);
+    EXPECT_EQ(manager.state().state, LocalCommState::STALE);
+    EXPECT_FALSE(manager.rebuild({17, 2}, workers).ok);
+    EXPECT_EQ(manager.state().state, LocalCommState::STALE);
+    EXPECT_EQ(manager.state().generation, 1u);
+}
+
+TEST(LocalCommRecoveryManagerTest, FanoutIsConcurrentAndCommitsOnlyAfterEveryEndpoint) {
+    Ring ring;
+    ring.init(1ULL << 20);
+    WorkerManager workers;
+    ConcurrentCommProbe probe;
+    probe.expected = 2;
+    auto first = std::make_unique<RecoveryEndpoint>(0);
+    auto second = std::make_unique<RecoveryEndpoint>(1);
+    RecoveryEndpoint *first_ptr = first.get();
+    RecoveryEndpoint *second_ptr = second.get();
+    first_ptr->set_comm_probe(&probe);
+    second_ptr->set_comm_probe(&probe);
+    workers.add_next_level_endpoint(std::move(first));
+    workers.add_next_level_endpoint(std::move(second));
+    workers.start(&ring, [](WorkerCompletion) {}, [](WorkerDispatch) {});
+
+    LocalCommRecoveryManager manager;
+    manager.commit_initial_ready();
+    ASSERT_TRUE(manager.mark_stale(19).has_value());
+    LocalCommRecoveryResult result = manager.rebuild({19, 1}, workers);
+    EXPECT_TRUE(result.ok);
+    EXPECT_TRUE(probe.observed);
+    EXPECT_EQ(first_ptr->comm_recovery_calls(), 1u);
+    EXPECT_EQ(second_ptr->comm_recovery_calls(), 1u);
+    EXPECT_EQ(manager.state().generation, 2u);
+
+    workers.stop_workers();
+    workers.stop();
+    ring.shutdown();
+}
+
+TEST(LocalCommRecoveryManagerTest, PartialEndpointSuccessDoesNotCommitGroupGeneration) {
+    Ring ring;
+    ring.init(1ULL << 20);
+    WorkerManager workers;
+    auto first = std::make_unique<RecoveryEndpoint>(0);
+    auto second = std::make_unique<RecoveryEndpoint>(1);
+    second->set_comm_recovery_failure(true);
+    workers.add_next_level_endpoint(std::move(first));
+    workers.add_next_level_endpoint(std::move(second));
+    workers.start(&ring, [](WorkerCompletion) {}, [](WorkerDispatch) {});
+
+    LocalCommRecoveryManager manager;
+    manager.commit_initial_ready();
+    ASSERT_TRUE(manager.mark_stale(21).has_value());
+    LocalCommRecoveryResult result = manager.rebuild({21, 1}, workers);
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(manager.state().state, LocalCommState::BROKEN);
+    EXPECT_EQ(manager.state().generation, 1u);
+
+    workers.stop_workers();
+    workers.stop();
+    ring.shutdown();
+}
+
+TEST(LocalCommRecoveryManagerTest, BusyHealthyPeerDeclinesDestructiveFanout) {
+    Ring ring;
+    ring.init(1ULL << 20);
+    WorkerManager workers;
+    workers.add_next_level_endpoint(std::make_unique<RecoveryEndpoint>(0));
+    workers.start(&ring, [](WorkerCompletion) {}, [](WorkerDispatch) {});
+    WorkerThread *worker = workers.get_worker_by_id(WorkerType::NEXT_LEVEL, 0);
+    ASSERT_NE(worker, nullptr);
+    worker->dispatch(WorkerDispatch{});
+
+    LocalCommRecoveryManager manager;
+    manager.commit_initial_ready();
+    ASSERT_TRUE(manager.mark_stale(23).has_value());
+    LocalCommRecoveryResult result = manager.rebuild({23, 1}, workers);
+    EXPECT_FALSE(result.ok);
+    EXPECT_EQ(manager.state().state, LocalCommState::BROKEN);
+    EXPECT_EQ(manager.state().generation, 1u);
+
+    workers.stop_workers();
+    workers.stop();
+    ring.shutdown();
+}
 
 TEST(RecoveryCoordinatorTest, RequestResolutionIsAsynchronousAndEndsInGiveUp) {
     RecoveryCoordinator coordinator;
@@ -251,6 +509,11 @@ TEST(EndpointRecoveryCommandTest, StaleGenerationDoesNotPublishResetCommand) {
     EXPECT_THROW(endpoint.release_faulted_endpoint({4, 91, 0}), std::runtime_error);
     std::memcpy(&command, mailbox.data() + MAILBOX_OFF_CALLABLE, sizeof(command));
     EXPECT_NE(command, CTRL_RELEASE_FAULTED_ENDPOINT);
+
+    const LocalCommEndpointResult comm_result = endpoint.rebuild_local_comm({4, 91, 0, 1});
+    EXPECT_FALSE(comm_result.ok);
+    std::memcpy(&command, mailbox.data() + MAILBOX_OFF_CALLABLE, sizeof(command));
+    EXPECT_NE(command, CTRL_REBUILD_COMM_STATE);
 }
 
 TEST(OrchestratorRecoveryTest, GlobalFreezeBlocksNewRunAdmissionUntilThaw) {
@@ -340,6 +603,7 @@ protected:
     NextLevelReadyQueues ready_next;
     Orchestrator orch;
     WorkerManager manager;
+    LocalCommRecoveryManager local_comm_manager;
     Scheduler scheduler;
     RecoveryEndpoint *endpoint{nullptr};
     std::atomic<uint32_t> recovery_begin_calls{0};
@@ -384,6 +648,7 @@ protected:
         config.on_global_recovery_freeze_cb = [this](bool frozen) {
             orch.set_global_recovery_freeze(frozen);
         };
+        config.local_comm_recovery_manager = &local_comm_manager;
         scheduler.start(config);
         orch.set_scheduler_loop_mutex(&scheduler.loop_mutex());
     }
@@ -445,6 +710,22 @@ protected:
     bool fail_endpoint_recovery() const override { return true; }
 };
 
+class SchedulerCommRebuildTest : public SchedulerEndpointRebuildTest {
+protected:
+    void SetUp() override {
+        SchedulerEndpointRebuildTest::SetUp();
+        local_comm_manager.commit_initial_ready();
+    }
+};
+
+class SchedulerCommRebuildFailureTest : public SchedulerCommRebuildTest {
+protected:
+    void SetUp() override {
+        SchedulerCommRebuildTest::SetUp();
+        endpoint->set_comm_recovery_failure(true);
+    }
+};
+
 TEST_F(SchedulerEndpointRebuildTest, RebuildCommitsGenerationAndStillFailsOriginalTask) {
     NativeExecutionFault fault{};
     fault.raw_rc = 507018;
@@ -466,6 +747,27 @@ TEST_F(SchedulerEndpointRebuildFailureTest, FailedResetKeepsGenerationAndRelease
     EXPECT_EQ(endpoint->endpoint_generation(), 1u);
     EXPECT_NE(message.find("injected reset/probe failure"), std::string::npos);
     EXPECT_NE(message.find("ENDPOINT_REBUILD->GIVE_UP"), std::string::npos);
+}
+
+TEST_F(SchedulerCommRebuildTest, CommGenerationCommitsOnlyAfterEndpointFanoutSucceeds) {
+    NativeExecutionFault fault{};
+    fault.raw_rc = 507018;
+    const std::string message = run_fault(fault, /*launch_accepted=*/true);
+    EXPECT_EQ(endpoint->comm_recovery_calls(), 1u);
+    EXPECT_EQ(local_comm_manager.state().state, LocalCommState::READY);
+    EXPECT_EQ(local_comm_manager.state().generation, 2u);
+    EXPECT_NE(message.find("COMM_READY generation=2"), std::string::npos);
+    EXPECT_NE(message.find("ENDPOINT_READY->COMM_REBUILD->COMM_READY->GIVE_UP"), std::string::npos);
+}
+
+TEST_F(SchedulerCommRebuildFailureTest, PartialCommFailureLeavesOldGenerationBroken) {
+    NativeExecutionFault fault{};
+    fault.runtime_status = -9;
+    const std::string message = run_fault(fault, /*launch_accepted=*/true);
+    EXPECT_EQ(local_comm_manager.state().state, LocalCommState::BROKEN);
+    EXPECT_EQ(local_comm_manager.state().generation, 1u);
+    EXPECT_NE(message.find("injected communication rebuild failure"), std::string::npos);
+    EXPECT_EQ(message.find("COMM_READY"), std::string::npos);
 }
 
 TEST_F(SchedulerRecoveryTest, SemanticOnlyFaultWithUnacceptedLaunchStillUsesRecoveryPath) {

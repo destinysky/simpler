@@ -45,6 +45,7 @@ struct ChipWorkerNativeRun {
 
 class ChipRun;
 class ChipRunLane;
+class ChipWorkerRecoveryTestPeer;
 struct ChipRunLaneState;
 
 class UnsupportedRuntimeOperation : public std::runtime_error {
@@ -54,7 +55,7 @@ public:
 
 class ChipWorker {
 public:
-    ChipWorker() = default;
+    ChipWorker();
     ~ChipWorker();
 
     ChipWorker(const ChipWorker &) = delete;
@@ -234,6 +235,7 @@ public:
     void comm_barrier(uint64_t comm_handle);
     void comm_destroy(uint64_t comm_handle);
     void comm_destroy_all();
+    void comm_retire_after_peer_reset();
 
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }
@@ -257,6 +259,8 @@ public:
     DeviceMemoryInfo device_memory_info() const;
 
 private:
+    friend class ChipWorkerRecoveryTestPeer;
+
     void finalize_impl(bool recovery);
     using CreateDeviceContextFn = void *(*)();
     using DestroyDeviceContextFn = void (*)(void *);
@@ -301,6 +305,7 @@ private:
     using CommGlobalDomainReleaseFn = int (*)(uint64_t);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
+    using CommRecoveryRetireFn = int (*)(void *);
     using KernelSupportedFn = decltype(&simpler_kernel_mode_supported);
     using KernelInitFn = decltype(&simpler_kernel_mode_init);
     using KernelPrepareCallableFn = decltype(&simpler_kernel_mode_prepare_callable);
@@ -366,6 +371,8 @@ private:
     CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
+    CommRecoveryRetireFn comm_abandon_after_device_reset_fn_ = nullptr;
+    CommRecoveryRetireFn comm_retire_after_peer_reset_fn_ = nullptr;
     KernelSupportedFn kernel_supported_fn_ = nullptr;
     KernelInitFn kernel_init_fn_ = nullptr;
     KernelPrepareCallableFn kernel_prepare_callable_fn_ = nullptr;

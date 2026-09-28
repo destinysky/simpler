@@ -186,19 +186,22 @@ backend allocations into the next run.
 
 ---
 
-## 3. Lazy base communicator (created once, cached)
+## 3. Lazy base communicator (generation tracked)
 
 `Worker.init()` does **no** comm work. The first `allocate_domain(...)` lazily
 fires `CTRL_COMM_INIT` to every chip in parallel, which runs the base HCCL
 `comm_init` (RootInfo handshake + membership). This base communicator is
-**cached** (`_comm_base_ready`), and `ChipWorker.comm_init` itself caches the
-handle.
+tracked by the native L3 local-communication state and generation, and
+`ChipWorker.comm_init` itself caches the physical handle. Endpoint recovery
+marks the old generation stale before reset and rebuilds the base communicator
+plus live dynamic domains before committing the next generation.
 
 Consequently, when a `Worker` runs multiple times, or `allocate_domain` is
 called many times:
 
-- the **base communicator is created once** and reused — it is *not* rebuilt
-  per `run` or per domain;
+- the **base communicator is reused within one healthy generation** — it is
+  not rebuilt per `run` or per domain, but endpoint recovery creates a new
+  physical communication generation;
 - only the **per-domain windows** are allocated (and freed after the run fence) on each
   `allocate_domain` / `run`. Each allocation gets a fresh `allocation_id` so
   concurrent or sequential domains never collide on IPC handshake / barrier

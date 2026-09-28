@@ -14,6 +14,7 @@
 #include <string>
 #include <utility>
 
+#include "local_comm_recovery_manager.h"
 #include "types.h"
 
 // Recovery policy and transaction state belong to L3. The endpoint action is
@@ -24,11 +25,14 @@ enum class RecoveryStage : int32_t {
     GIVE_UP = 2,
     ENDPOINT_REBUILD = 3,
     ENDPOINT_READY = 4,
+    COMM_REBUILD = 5,
+    COMM_READY = 6,
 };
 
 enum class RecoveryResolutionKind : int32_t {
     GIVE_UP = 0,
     REBUILD_ENDPOINT = 1,
+    REBUILD_LOCAL_COMM = 2,
 };
 
 struct EndpointRecoveryRequest {
@@ -55,6 +59,8 @@ struct RecoveryTicket {
     // Snapshotted when L3 first intercepts the native fault. Every destructive
     // command in this episode is fenced by this immutable generation.
     uint64_t expected_endpoint_generation{0};
+    uint64_t expected_local_comm_generation{0};
+    bool local_comm_rebuild_required{false};
 };
 
 struct RecoveryRequest {
@@ -70,6 +76,7 @@ struct RecoveryResolution {
     RecoveryRequest request{};
     RecoveryResolutionKind kind{RecoveryResolutionKind::GIVE_UP};
     std::optional<EndpointRecoveryResult> endpoint_result;
+    std::optional<LocalCommRecoveryResult> local_comm_result;
 };
 
 class RecoveryCoordinator {
@@ -109,6 +116,27 @@ public:
         pending_.push_back(PendingTransition{std::move(request), std::move(result)});
     }
 
+    void submit_local_comm_result(
+        RecoveryRequest request, std::optional<EndpointRecoveryResult> endpoint_result,
+        LocalCommRecoveryResult result
+    ) {
+        std::lock_guard<std::mutex> lk(mu_);
+        const bool identity_matches = result.recovery_id == request.ticket.recovery_id;
+        const bool committed_generation_matches =
+            !result.ok ||
+            (request.ticket.expected_local_comm_generation != UINT64_MAX &&
+             result.local_comm_generation == request.ticket.expected_local_comm_generation + 1);
+        if (!identity_matches || !committed_generation_matches) {
+            result.ok = false;
+            result.local_comm_generation = request.ticket.expected_local_comm_generation;
+            result.error_message = "local communication result identity or committed generation mismatch";
+        }
+        request.stage = result.ok ? RecoveryStage::COMM_READY : RecoveryStage::GIVE_UP;
+        pending_.push_back(
+            PendingTransition{std::move(request), std::move(endpoint_result), std::move(result)}
+        );
+    }
+
     // A missing eligibility decision gives up. An allowed request asks L3 to
     // rebuild its endpoint; replay remains a separate later decision.
     void progress() {
@@ -118,20 +146,33 @@ public:
             pending_.pop_front();
             RecoveryRequest &request = transition.request;
             if (request.stage == RecoveryStage::ENDPOINT_READY) {
-                // Step 4 establishes only the endpoint execution environment.
-                // Domain/binding recovery and replay authorization are later
-                // stages, so ENDPOINT_READY currently terminates as GIVE_UP.
+                if (request.ticket.local_comm_rebuild_required) {
+                    request.stage = RecoveryStage::COMM_REBUILD;
+                    ready_.push_back(RecoveryResolution{
+                        std::move(request), RecoveryResolutionKind::REBUILD_LOCAL_COMM,
+                        std::move(transition.endpoint_result), std::nullopt,
+                    });
+                    continue;
+                }
                 request.stage = RecoveryStage::GIVE_UP;
                 ready_.push_back(
                     RecoveryResolution{std::move(request), RecoveryResolutionKind::GIVE_UP,
-                                       std::move(transition.endpoint_result)}
+                                       std::move(transition.endpoint_result), std::nullopt}
+                );
+                continue;
+            }
+            if (request.stage == RecoveryStage::COMM_READY) {
+                request.stage = RecoveryStage::GIVE_UP;
+                ready_.push_back(
+                    RecoveryResolution{std::move(request), RecoveryResolutionKind::GIVE_UP,
+                                       std::move(transition.endpoint_result), std::move(transition.local_comm_result)}
                 );
                 continue;
             }
             if (request.stage == RecoveryStage::GIVE_UP) {
                 ready_.push_back(
                     RecoveryResolution{std::move(request), RecoveryResolutionKind::GIVE_UP,
-                                       std::move(transition.endpoint_result)}
+                                       std::move(transition.endpoint_result), std::move(transition.local_comm_result)}
                 );
                 continue;
             }
@@ -147,6 +188,7 @@ public:
             ready_.push_back(RecoveryResolution{
                 std::move(request),
                 allowed ? RecoveryResolutionKind::REBUILD_ENDPOINT : RecoveryResolutionKind::GIVE_UP,
+                std::nullopt,
                 std::nullopt,
             });
         }
@@ -169,11 +211,18 @@ private:
     struct PendingTransition {
         RecoveryRequest request{};
         std::optional<EndpointRecoveryResult> endpoint_result;
+        std::optional<LocalCommRecoveryResult> local_comm_result;
 
         PendingTransition() = default;
         PendingTransition(RecoveryRequest value) : request(std::move(value)) {}
         PendingTransition(RecoveryRequest value, EndpointRecoveryResult result)
             : request(std::move(value)), endpoint_result(std::move(result)) {}
+        PendingTransition(
+            RecoveryRequest value, std::optional<EndpointRecoveryResult> endpoint,
+            LocalCommRecoveryResult result
+        )
+            : request(std::move(value)), endpoint_result(std::move(endpoint)),
+              local_comm_result(std::move(result)) {}
     };
 
     mutable std::mutex mu_;
