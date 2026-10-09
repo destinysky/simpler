@@ -65,6 +65,27 @@ extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
 
 namespace {
 
+bool experiment5_dual_context_enabled() {
+    const char *value = std::getenv("SIMPLER_EXPERIMENT5_DUAL_CONTEXT");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+// Context lifecycle is intentionally done through the Runtime layer here.
+// simpler_init reaches this point before the communication path has called
+// aclInit(), so using aclrtCreateContext would add an unrelated ACL-lifecycle
+// variable to this feasibility experiment. These legacy Runtime entry points
+// map directly to the Context object whose STOP/failure latch we are probing.
+// Keep the deprecation suppression local to this EXPERIMENT ONLY shim.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+int experiment5_rt_ctx_create(rtContext_t *ctx, int device_id) {
+    return rtCtxCreate(ctx, 0, device_id);
+}
+int experiment5_rt_ctx_destroy(rtContext_t ctx) { return rtCtxDestroy(ctx); }
+int experiment5_rt_ctx_set_current(rtContext_t ctx) { return rtCtxSetCurrent(ctx); }
+int experiment5_rt_ctx_get_current(rtContext_t *ctx) { return rtCtxGetCurrent(ctx); }
+#pragma GCC diagnostic pop
+
 HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
     RuntimeTimeoutConfig order_defaults{
         PLATFORM_OP_EXECUTE_TIMEOUT_US, PLATFORM_STREAM_SYNC_TIMEOUT_MS, PLATFORM_SCHEDULER_TIMEOUT_MS
@@ -551,7 +572,79 @@ int DeviceRunnerBase::bind_current_thread(int device_id) {
         ACL_LOG_ERROR_DETAIL(rc);
         return rc;
     }
+
+    // EXPERIMENT 5 ONLY. rtSetDevice selects the device's primary/default
+    // Context. Execution entry points must then re-select the separate Context
+    // E so stream submission and execution-owned allocations stay out of the
+    // communication Context C.
+    if (experiment5_execution_rt_context_ != nullptr) {
+        rc = experiment5_rt_ctx_set_current(experiment5_execution_rt_context_);
+        if (rc != 0) {
+            LOG_ERROR("[PTO_RECOVERY_EXP5] rtCtxSetCurrent(execution) failed: %d", rc);
+            return rc;
+        }
+        rtContext_t current = nullptr;
+        rc = experiment5_rt_ctx_get_current(&current);
+        if (rc != 0 || current != experiment5_execution_rt_context_) {
+            LOG_ERROR(
+                "[PTO_RECOVERY_EXP5] execution Context bind verification failed rc=%d current=%p expected=%p", rc,
+                current, experiment5_execution_rt_context_
+            );
+            return rc != 0 ? rc : PTO_RUNTIME_ERR_INTERNAL;
+        }
+        LOG_INFO(
+            "[PTO_RECOVERY_EXP5] EXECUTION_CONTEXT_BOUND device=%d context=%p", device_id,
+            experiment5_execution_rt_context_
+        );
+    }
     return 0;
+}
+
+int DeviceRunnerBase::experiment5_bind_default_context(const char *stage) {
+    if (experiment5_execution_rt_context_ == nullptr) return 0;
+    if (experiment5_default_rt_context_ == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+
+    int rc = experiment5_rt_ctx_set_current(experiment5_default_rt_context_);
+    if (rc != 0) {
+        LOG_ERROR("[PTO_RECOVERY_EXP5] rtCtxSetCurrent(default) failed at %s: %d", stage, rc);
+        return rc;
+    }
+    rtContext_t current = nullptr;
+    rc = experiment5_rt_ctx_get_current(&current);
+    if (rc != 0 || current != experiment5_default_rt_context_) {
+        LOG_ERROR(
+            "[PTO_RECOVERY_EXP5] default Context bind verification failed stage=%s rc=%d current=%p expected=%p",
+            stage, rc, current, experiment5_default_rt_context_
+        );
+        return rc != 0 ? rc : PTO_RUNTIME_ERR_INTERNAL;
+    }
+    LOG_INFO(
+        "[PTO_RECOVERY_EXP5] DEFAULT_CONTEXT_BOUND stage=%s default=%p execution=%p", stage,
+        experiment5_default_rt_context_, experiment5_execution_rt_context_
+    );
+    return 0;
+}
+
+int DeviceRunnerBase::experiment5_destroy_execution_context() {
+    if (experiment5_execution_rt_context_ == nullptr) return 0;
+    rtContext_t execution = experiment5_execution_rt_context_;
+    int rc = experiment5_bind_default_context("finalize");
+    if (rc == 0) {
+        rc = experiment5_rt_ctx_destroy(execution);
+        if (rc != 0) {
+            LOG_ERROR("[PTO_RECOVERY_EXP5] rtCtxDestroy(execution=%p) failed: %d", execution, rc);
+        } else {
+            LOG_WARN(
+                "[PTO_RECOVERY_EXP5] EXECUTION_CONTEXT_DESTROYED default=%p execution=%p",
+                experiment5_default_rt_context_, execution
+            );
+        }
+    }
+    // A failed destroy is still followed by device reset/finalize; never let a
+    // stale experimental handle be reused after that device-generation boundary.
+    experiment5_execution_rt_context_ = nullptr;
+    experiment5_default_rt_context_ = nullptr;
+    return rc;
 }
 
 int DeviceRunnerBase::attach_current_thread(int device_id) {
@@ -633,6 +726,53 @@ int DeviceRunnerBase::ensure_device_initialized() {
         return rc;
     }
 
+    // EXPERIMENT 5 ONLY: split failure domains before creating any PTO
+    // execution stream. The primary/default Context remains alive for the
+    // later HCCL/CommDomain/SDMA path; the newly-created user Context owns PTO
+    // execution. No failure mode is changed here.
+    if (experiment5_dual_context_enabled() && experiment5_execution_rt_context_ == nullptr) {
+        rtContext_t default_context = nullptr;
+        rc = experiment5_rt_ctx_get_current(&default_context);
+        if (rc != 0 || default_context == nullptr) {
+            LOG_ERROR(
+                "[PTO_RECOVERY_EXP5] failed to capture default Runtime Context rc=%d context=%p", rc,
+                default_context
+            );
+            return rc != 0 ? rc : PTO_RUNTIME_ERR_INTERNAL;
+        }
+
+        rtContext_t execution_context = nullptr;
+        rc = experiment5_rt_ctx_create(&execution_context, device_id_);
+        if (rc != 0 || execution_context == nullptr) {
+            LOG_ERROR(
+                "[PTO_RECOVERY_EXP5] rtCtxCreate(execution) failed rc=%d context=%p", rc, execution_context
+            );
+            return rc != 0 ? rc : PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (execution_context == default_context) {
+            LOG_ERROR("[PTO_RECOVERY_EXP5] execution Context unexpectedly aliases default Context %p", default_context);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+
+        experiment5_default_rt_context_ = default_context;
+        experiment5_execution_rt_context_ = execution_context;
+        rc = experiment5_rt_ctx_set_current(execution_context);
+        if (rc != 0) return rc;
+        rtContext_t current = nullptr;
+        rc = experiment5_rt_ctx_get_current(&current);
+        if (rc != 0 || current != execution_context) {
+            LOG_ERROR(
+                "[PTO_RECOVERY_EXP5] new execution Context is not current rc=%d current=%p execution=%p", rc,
+                current, execution_context
+            );
+            return rc != 0 ? rc : PTO_RUNTIME_ERR_INTERNAL;
+        }
+        LOG_WARN(
+            "[PTO_RECOVERY_EXP5] DUAL_CONTEXT_CREATED device=%d default=%p execution=%p", device_id_,
+            default_context, execution_context
+        );
+    }
+
     bool aicpu_created_here = false;
     bool aicore_created_here = false;
     if (stream_aicpu_ == nullptr) {
@@ -661,6 +801,23 @@ int DeviceRunnerBase::ensure_device_initialized() {
     }
     if (aicpu_created_here || aicore_created_here) {
         LOG_INFO("DeviceRunner: device=%d set, streams created", device_id_);
+    }
+
+    if (experiment5_execution_rt_context_ != nullptr) {
+        rtContext_t current = nullptr;
+        rc = experiment5_rt_ctx_get_current(&current);
+        if (rc != 0 || current != experiment5_execution_rt_context_) {
+            LOG_ERROR(
+                "[PTO_RECOVERY_EXP5] execution streams were not created under Context E rc=%d current=%p E=%p", rc,
+                current, experiment5_execution_rt_context_
+            );
+            return rc != 0 ? rc : PTO_RUNTIME_ERR_INTERNAL;
+        }
+        LOG_WARN(
+            "[PTO_RECOVERY_EXP5] EXECUTION_STREAMS context=%p aicpu=%p aicore=%p",
+            experiment5_execution_rt_context_, reinterpret_cast<void *>(stream_aicpu_),
+            reinterpret_cast<void *>(stream_aicore_)
+        );
     }
 
     // Latch the AICore stream's block_dim ceiling. resolve_block_dim() is then

@@ -156,6 +156,12 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
         return static_cast<int>(aRet);
     }
 
+    // EXPERIMENT 5 ONLY. aclrtSetDevice selects the device, but the feasibility
+    // experiment requires every communication bootstrap operation to be
+    // explicitly back on Context C after simpler_init left this thread on E.
+    int context_rc = experiment5_bind_default_context("ensure_acl_ready");
+    if (context_rc != 0) return context_rc;
+
     // Record that we are responsible for aclFinalize at teardown.
     acl_ready_ = true;
     if (device_id_ < 0) device_id_ = device_id;
@@ -1019,6 +1025,12 @@ int DeviceRunner::finalize_healthy() {
     // chip-callable buffer pool, the three arenas, device_wall,
     // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
+
+    // EXPERIMENT 5 ONLY. All execution-owned streams/binaries/allocations are
+    // gone now, so retire Context E while Context C is still alive for the
+    // normal device-reset / ACL-finalize sequence below.
+    int context_rc = experiment5_destroy_execution_context();
+    if (context_rc != 0 && rc == 0) rc = context_rc;
 
     // Reset device and finalize ACL AFTER all device memory is freed. When the
     // ACL layer was brought up (comm path), aclrtResetDevice supersedes

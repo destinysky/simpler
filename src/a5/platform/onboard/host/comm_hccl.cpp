@@ -138,6 +138,10 @@ struct CommHandle_ {
     aclrtStream stream = nullptr;
     HcclComm hccl_comm = nullptr;
 
+    // EXPERIMENT 5 ONLY: Context C captured at comm_init. HCCL may change the
+    // calling thread's current Context, so every experiment-side comm entry
+    // rebinds this Context before touching HCCL/VMM/SDMA state.
+    aclrtContext experiment5_runtime_context = nullptr;
     CommContext host_ctx{};
     CommContext *device_ctx = nullptr;
     bool owns_device_ctx = false;
@@ -158,6 +162,41 @@ struct CommHandle_ {
 namespace {
 
 static constexpr uint64_t ROOTINFO_MAGIC = 0x50544f5f4843434cULL;  // "PTO_HCCL"
+
+static bool experiment5_dual_context_enabled() {
+    const char *value = std::getenv("SIMPLER_EXPERIMENT5_DUAL_CONTEXT");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+static int experiment5_bind_comm_context(CommHandle h, const char *stage) {
+    if (!experiment5_dual_context_enabled()) return 0;
+    if (h == nullptr || h->experiment5_runtime_context == nullptr) {
+        LOG_ERROR("[PTO_RECOVERY_EXP5] missing communication Context at stage=%s", stage);
+        return -1;
+    }
+    aclError aRet = aclrtSetCurrentContext(h->experiment5_runtime_context);
+    if (aRet != ACL_SUCCESS) {
+        LOG_ERROR(
+            "[PTO_RECOVERY_EXP5] aclrtSetCurrentContext(comm) failed stage=%s rank=%d rc=%d", stage, h->rank,
+            static_cast<int>(aRet)
+        );
+        return static_cast<int>(aRet);
+    }
+    aclrtContext current = nullptr;
+    aRet = aclrtGetCurrentContext(&current);
+    if (aRet != ACL_SUCCESS || current != h->experiment5_runtime_context) {
+        LOG_ERROR(
+            "[PTO_RECOVERY_EXP5] comm Context bind verification failed stage=%s rank=%d rc=%d current=%p expected=%p",
+            stage, h->rank, static_cast<int>(aRet), current, h->experiment5_runtime_context
+        );
+        return aRet != ACL_SUCCESS ? static_cast<int>(aRet) : -1;
+    }
+    LOG_INFO(
+        "[PTO_RECOVERY_EXP5] COMM_CONTEXT_BOUND stage=%s rank=%d context=%p", stage, h->rank,
+        h->experiment5_runtime_context
+    );
+    return 0;
+}
 
 struct RootInfoFileHeader {
     uint64_t magic = ROOTINFO_MAGIC;
@@ -321,6 +360,23 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     h->rootinfo_path = rootinfo_path;
     h->stream = static_cast<aclrtStream>(stream);
 
+    if (experiment5_dual_context_enabled()) {
+        aclrtContext current = nullptr;
+        aclError aRet = aclrtGetCurrentContext(&current);
+        if (aRet != ACL_SUCCESS || current == nullptr) {
+            LOG_ERROR(
+                "[PTO_RECOVERY_EXP5] comm_init could not capture Context C rank=%d rc=%d context=%p", rank,
+                static_cast<int>(aRet), current
+            );
+            delete h;
+            return nullptr;
+        }
+        h->experiment5_runtime_context = current;
+        LOG_WARN(
+            "[PTO_RECOVERY_EXP5] COMM_CONTEXT_CAPTURED rank=%d context=%p stream=%p", rank, current, stream
+        );
+    }
+
     // NOTE: aclInit / aclrtSetDevice / stream creation are intentionally NOT
     // performed here — the caller (DeviceRunner::ensure_acl_ready + a stream
     // it owns) is responsible for them.  This keeps ACL lifecycle ownership
@@ -372,6 +428,11 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
         return nullptr;
     }
 
+    if (experiment5_bind_comm_context(h, "comm_init_return") != 0) {
+        (void)hccl_comm_destroy(h->hccl_comm);
+        delete h;
+        return nullptr;
+    }
     return h;
 } catch (const std::exception &e) {
     LOG_ERROR("[comm rank %d] comm_init: exception: %s", rank, e.what());
@@ -1314,6 +1375,7 @@ extern "C" int comm_derive_context(
 
 extern "C" int comm_barrier(CommHandle h) {
     if (!h) return -1;
+    if (experiment5_bind_comm_context(h, "comm_barrier") != 0) return -1;
     // HcclBarrier is synchronous — it blocks until all ranks arrive.
     // Do NOT call aclrtSynchronizeStream after it: HcclBarrier internally
     // switches the thread's ACL context, which invalidates the caller-owned
@@ -1331,6 +1393,7 @@ extern "C" int comm_alloc_domain_windows(
     size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
 ) try {
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out) return -1;
+    if (experiment5_bind_comm_context(h, "alloc_domain") != 0) return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         LOG_ERROR(
             "[comm rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)", h->rank,
@@ -1380,6 +1443,7 @@ extern "C" int comm_alloc_domain_windows(
 extern "C" int
 comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) try {
     if (!h) return -1;
+    if (experiment5_bind_comm_context(h, "release_domain") != 0) return -1;
     auto it = h->domain_allocations.find(allocation_id);
     if (it == h->domain_allocations.end()) {
         LOG_ERROR(
@@ -1436,6 +1500,7 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
 extern "C" int
 comm_recovery_probe_snapshot(CommHandle h, uint64_t allocation_id, CommRecoveryProbeSnapshot *snapshot_out) try {
     if (!h || !snapshot_out) return -1;
+    if (experiment5_bind_comm_context(h, "recovery_probe") != 0) return -1;
 
     CommRecoveryProbeSnapshot snapshot{};
     snapshot.version = COMM_RECOVERY_PROBE_VERSION;
@@ -1700,6 +1765,7 @@ extern "C" int comm_global_domain_release(uint64_t) {
 
 extern "C" int comm_destroy(CommHandle h) try {
     if (!h) return -1;
+    if (experiment5_bind_comm_context(h, "comm_destroy_begin") != 0) return -1;
 
     // Final barrier is best-effort: if a peer already crashed we still need to
     // release the local resources we own, so timeout just logs and proceeds.
@@ -1765,6 +1831,13 @@ extern "C" int comm_destroy(CommHandle h) try {
             );
             rc = -1;
         }
+    }
+
+    // HcclCommDestroy is allowed to change the caller's current ACL Context.
+    // Rebind C before deleting the handle because its SDMA workspace manager
+    // destructor destroys the C-owned STARS/query resources.
+    if (experiment5_bind_comm_context(h, "comm_destroy_delete") != 0) {
+        if (rc == 0) rc = -1;
     }
 
     delete h;

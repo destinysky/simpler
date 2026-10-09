@@ -291,6 +291,9 @@ public:
     /**
      * One-shot device initialization. Performs, in order:
      *   1. attach_current_thread on device_id_
+     *   1a. EXPERIMENT 5 only: capture the default Runtime Context and create
+     *       a distinct execution Context. The new Context becomes current
+     *       before the persistent execution streams are created.
      *   2. rtStreamCreate for AICPU + AICore streams (persistent, freed
      *      by the subclass `finalize()`).
      *   3. Bootstrap the dispatcher + register the inner AICPU SO via
@@ -911,6 +914,20 @@ protected:
     void configure_aicore_op_timeout();
 
     /**
+     * Experiment 5 only: restore the default Runtime Context captured before
+     * the separate PTO execution Context was created. No-op when the
+     * experiment is disabled/inactive.
+     */
+    int experiment5_bind_default_context(const char *stage);
+
+    /**
+     * Experiment 5 only: after all execution-owned RTS resources have been
+     * released, switch back to the default Context and destroy the separate
+     * execution Context. No-op when the experiment is disabled/inactive.
+     */
+    int experiment5_destroy_execution_context();
+
+    /**
      * Load AICPU SO and initialize device args. Called from
      * `ensure_device_initialized()` after the persistent streams are
      * created. Reads `aicpu_so_binary_` / `dispatcher_so_binary_` off
@@ -1284,6 +1301,15 @@ protected:
     // guarded on the still-unset value, so repeated same-value writes from
     // later-attaching threads cannot race.
     int device_id_{-1};
+
+    // EXPERIMENT 5 ONLY. `experiment5_default_rt_context_` is the primary
+    // Runtime Context made current by rtSetDevice before the experiment starts;
+    // communication/HCCL/SDMA remains there. `experiment5_execution_rt_context_`
+    // is a user Context that owns only PTO execution-side resources. These are
+    // intentionally not part of the production ownership model yet.
+    rtContext_t experiment5_default_rt_context_{nullptr};
+    rtContext_t experiment5_execution_rt_context_{nullptr};
+
     // This context's execution identity. Write-once: the first init entry to
     // run latches it, and it never changes afterwards.
     ExecutionModeLatch execution_mode_latch_;
