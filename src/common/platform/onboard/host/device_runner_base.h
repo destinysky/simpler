@@ -291,9 +291,9 @@ public:
     /**
      * One-shot device initialization. Performs, in order:
      *   1. attach_current_thread on device_id_
-     *   1a. EXPERIMENT 5 only: capture the default Runtime Context and create
-     *       a distinct execution Context. The new Context becomes current
-     *       before the persistent execution streams are created.
+     *   1a. On backends that isolate execution from communication, capture the
+     *       default Runtime Context and create a distinct execution Context.
+     *       The execution Context becomes current before streams are created.
      *   2. rtStreamCreate for AICPU + AICore streams (persistent, freed
      *      by the subclass `finalize()`).
      *   3. Bootstrap the dispatcher + register the inner AICPU SO via
@@ -914,18 +914,31 @@ protected:
     void configure_aicore_op_timeout();
 
     /**
-     * Experiment 5 only: restore the default Runtime Context captured before
-     * the separate PTO execution Context was created. No-op when the
-     * experiment is disabled/inactive.
+     * Whether this backend keeps PTO execution in a user Runtime Context that
+     * is distinct from the device's default/communication Context. The common
+     * implementation is opt-in so unvalidated backends retain their existing
+     * single-Context behavior.
      */
-    int experiment5_bind_default_context(const char *stage);
+    virtual bool use_separate_execution_context() const { return false; }
 
     /**
-     * Experiment 5 only: after all execution-owned RTS resources have been
-     * released, switch back to the default Context and destroy the separate
-     * execution Context. No-op when the experiment is disabled/inactive.
+     * Restore the default Runtime Context captured before the separate PTO
+     * execution Context was created. No-op on backends that do not use a
+     * separate execution Context.
      */
-    int experiment5_destroy_execution_context();
+    int bind_default_runtime_context();
+
+    /**
+     * After all execution-owned RTS resources have been released, switch back
+     * to the default Context and destroy the separate execution Context.
+     */
+    int destroy_execution_context();
+
+    /**
+     * A force reset invalidates Runtime Context handles as a group. Forget the
+     * cached handles without issuing another device call on the failure path.
+     */
+    void abandon_runtime_contexts_after_device_failure();
 
     /**
      * Load AICPU SO and initialize device args. Called from
@@ -1302,13 +1315,12 @@ protected:
     // later-attaching threads cannot race.
     int device_id_{-1};
 
-    // EXPERIMENT 5 ONLY. `experiment5_default_rt_context_` is the primary
-    // Runtime Context made current by rtSetDevice before the experiment starts;
-    // communication/HCCL/SDMA remains there. `experiment5_execution_rt_context_`
-    // is a user Context that owns only PTO execution-side resources. These are
-    // intentionally not part of the production ownership model yet.
-    rtContext_t experiment5_default_rt_context_{nullptr};
-    rtContext_t experiment5_execution_rt_context_{nullptr};
+    // Backends that opt into split failure domains keep long-lived
+    // communication/HCCL/SDMA state on the device's default Context and PTO
+    // execution streams/resources on a user Context. Current-Context state is
+    // per host thread, so every execution attach re-selects the latter.
+    rtContext_t default_rt_context_{nullptr};
+    rtContext_t execution_rt_context_{nullptr};
 
     // This context's execution identity. Write-once: the first init entry to
     // run latches it, and it never changes afterwards.

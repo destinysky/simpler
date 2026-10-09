@@ -163,6 +163,11 @@ public:
     int destroy_comm_stream(void *stream);
 
 private:
+    // A5 communication may install context-wide failure policy while PTO
+    // execution remains retryable, so keep those lifetimes in distinct Runtime
+    // Contexts. Other onboard backends retain the base single-Context policy.
+    bool use_separate_execution_context() const override { return true; }
+
     enum class TeardownReason : uint8_t {
         FatalDeviceFailure,
         OperatorRecovery,

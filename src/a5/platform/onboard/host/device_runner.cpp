@@ -156,10 +156,8 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
         return static_cast<int>(aRet);
     }
 
-    // EXPERIMENT 5 ONLY. aclrtSetDevice selects the device, but the feasibility
-    // experiment requires every communication bootstrap operation to be
-    // explicitly back on Context C after simpler_init left this thread on E.
-    int context_rc = experiment5_bind_default_context("ensure_acl_ready");
+    // Communication/HCCL/SDMA state belongs to the default Context.
+    int context_rc = bind_default_runtime_context();
     if (context_rc != 0) return context_rc;
 
     // Record that we are responsible for aclFinalize at teardown.
@@ -169,6 +167,11 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
 }
 
 void *DeviceRunner::create_comm_stream() {
+    int context_rc = bind_default_runtime_context();
+    if (context_rc != 0) {
+        LOG_ERROR("create_comm_stream: failed to bind default Runtime Context: %d", context_rc);
+        return nullptr;
+    }
     aclrtStream stream = nullptr;
     aclError aRet = aclrtCreateStream(&stream);
     if (aRet != ACL_SUCCESS) {
@@ -181,6 +184,12 @@ void *DeviceRunner::create_comm_stream() {
 
 int DeviceRunner::destroy_comm_stream(void *stream) {
     if (stream == nullptr) return 0;
+
+    int context_rc = bind_default_runtime_context();
+    if (context_rc != 0) {
+        LOG_ERROR("destroy_comm_stream: failed to bind default Runtime Context: %d; leaking stream", context_rc);
+        return 0;
+    }
 
     // Best-effort teardown.  HcclBarrier submits async work on the stream;
     // if the caller never blocked for completion (or hit the HCCL 507018
@@ -982,6 +991,7 @@ int DeviceRunner::retire_execution_generation(TeardownReason reason) {
     }
 
     int abandon_rc = abandon_common_after_device_failure();
+    abandon_runtime_contexts_after_device_failure();
     if (acl_ready_) {
         if (reset_confirmed) {
             int finalize_rc = aclFinalize();
@@ -1026,10 +1036,9 @@ int DeviceRunner::finalize_healthy() {
     // mem_alloc_.finalize(), and cached arena sizes.
     rc = finalize_common();
 
-    // EXPERIMENT 5 ONLY. All execution-owned streams/binaries/allocations are
-    // gone now, so retire Context E while Context C is still alive for the
-    // normal device-reset / ACL-finalize sequence below.
-    int context_rc = experiment5_destroy_execution_context();
+    // Execution-owned resources are gone; retire the execution Context while
+    // the default communication Context is still alive for reset/finalize.
+    int context_rc = destroy_execution_context();
     if (context_rc != 0 && rc == 0) rc = context_rc;
 
     // Reset device and finalize ACL AFTER all device memory is freed. When the
