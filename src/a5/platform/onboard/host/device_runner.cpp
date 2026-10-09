@@ -28,6 +28,7 @@
 #include "aicpu_loader/host/load_aicpu_op.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cstddef>
 #include <cstring>
 #include <iostream>
@@ -47,6 +48,19 @@
 
 namespace {
 constexpr const char *kAicpuTopologyQueryName = "simpler_aicpu_query_topology";
+
+bool experiment2_env_enabled(const char *name) {
+    const char *value = std::getenv(name);
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+bool experiment2_probe_enabled() {
+    return experiment2_env_enabled("SIMPLER_EXPERIMENT2_PROBE");
+}
+
+bool experiment2_soft_rearm_enabled() {
+    return experiment2_env_enabled("SIMPLER_EXPERIMENT2_SOFT_REARM");
+}
 }
 
 // dep_gen has two shapes, one per orchestration site, and each runtime provides
@@ -317,6 +331,14 @@ int DeviceRunner::prepare_execution(
         LOG_ERROR("ensure_device_initialized failed: %d", rc);
         return rc;
     }
+    if (experiment2_probe_enabled()) {
+        LOG_INFO(
+            "[PTO_RECOVERY_EXP2] EXECUTION_STREAMS stage=prepare run_epoch=%llu generation=%llu slot=%u "
+            "aicpu=%p aicore=%p",
+            static_cast<unsigned long long>(identity.run_epoch), static_cast<unsigned long long>(identity.generation),
+            pipeline_slot, reinterpret_cast<void *>(stream_aicpu_), reinterpret_cast<void *>(stream_aicore_)
+        );
+    }
 
     ensure_device_wall_buffer(execution->kernel_args);
 
@@ -584,13 +606,50 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         cleanup_execution(prepared, /*launched=*/true);
     });
 
+    LOG_INFO(
+        "[PTO_RECOVERY_PROBE] HOST_STREAM_PAIR_DRAIN_BEGIN slot=%u run_epoch=%llu generation=%llu dispatch_id=%llu",
+        pipeline_slot, static_cast<unsigned long long>(prepared.identity.run_epoch),
+        static_cast<unsigned long long>(prepared.identity.generation),
+        static_cast<unsigned long long>(prepared.identity.dispatch_id)
+    );
     int rc = sync_run_streams();
+    LOG_INFO(
+        "[PTO_RECOVERY_PROBE] HOST_STREAM_PAIR_DRAIN_END slot=%u run_epoch=%llu generation=%llu dispatch_id=%llu "
+        "rc=%d",
+        pipeline_slot, static_cast<unsigned long long>(prepared.identity.run_epoch),
+        static_cast<unsigned long long>(prepared.identity.generation),
+        static_cast<unsigned long long>(prepared.identity.dispatch_id), rc
+    );
     if (rc != 0) {
         // sync_run_streams surfaces the AICore op-timeout (STARS-reaped op ->
         // 507000/507018/507046 at AICPU/AICore stream sync). The op-timeout
         // leaves the context poisoned, so recovery remains the drain owner's
         // responsibility and its error remains authoritative over cleanup.
-        recover_device_or_mark_unusable(rc);
+        if (experiment2_soft_rearm_enabled()) {
+            // Experiment 2/3 only. The PTO-side cooperative shutdown is the
+            // execution-stop proof for this probe. A device-wide synchronize is
+            // deliberately diagnostic-only here: CANN may replay the failed
+            // AICPU task status (for example 507018) even after every PTO AICPU
+            // thread and initialized AIC/AIV core has exited. Requiring
+            // ACL_SUCCESS here would therefore re-poison an already-stopped
+            // execution generation and would conflate task completion status
+            // with device liveness.
+            // Do not even invoke device-wide synchronize in this experiment:
+            // on communication-active processes the failed synchronize itself
+            // can leave an RTS sticky error that rejects the next kernel launch.
+            //
+            // Safety for the experiment still comes from the two-stage gate:
+            // this branch is enabled only around the known explicit-fatal run,
+            // and the host lane remains poisoned until the test observes the
+            // runtime-classified EXPLICIT_ORCH_FATAL and explicitly rearms it.
+            LOG_WARN(
+                "[PTO_RECOVERY_EXP2] KEEP_RUNNER_AFTER_DRAIN_ERROR rc=%d device_sync_skipped=1 "
+                "aicpu=%p aicore=%p",
+                rc, reinterpret_cast<void *>(stream_aicpu_), reinterpret_cast<void *>(stream_aicore_)
+            );
+        } else {
+            recover_device_or_mark_unusable(rc);
+        }
         // Emergency shutdown may already have flushed diagnostics. Export the
         // manifest on the error path exactly once.
         if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {

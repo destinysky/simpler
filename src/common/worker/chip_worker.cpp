@@ -832,6 +832,27 @@ void ChipWorker::close_chip_run_lane() {
     if (run_lane_ != nullptr) run_lane_->close();
 }
 
+void ChipWorker::experiment2_rearm_run_lane_for_test() {
+    if (!initialized_) {
+        throw std::runtime_error("experiment2 rearm requires an initialized ChipWorker");
+    }
+    {
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        for (size_t slot_id = 0; slot_id < native_run_states_.size(); ++slot_id) {
+            if (native_run_states_[slot_id].phase != NativeRunPhase::EMPTY) {
+                throw std::runtime_error(
+                    "experiment2 rearm requires every native-run slot to be EMPTY; slot=" +
+                    std::to_string(slot_id)
+                );
+            }
+        }
+    }
+    if (run_lane_ == nullptr) {
+        throw std::runtime_error("experiment2 rearm requires an initialized chip run lane");
+    }
+    run_lane_->experiment2_rearm_for_test();
+}
+
 void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run) {
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
@@ -1282,6 +1303,32 @@ void ChipWorker::comm_release_domain_windows(
     if (rc != 0) {
         throw std::runtime_error("comm_release_domain_windows failed with code " + std::to_string(rc));
     }
+}
+
+CommRecoveryProbeSnapshot
+ChipWorker::experiment3_comm_recovery_probe(uint64_t comm_handle, uint64_t allocation_id) {
+    if (!initialized_ || lib_handle_ == nullptr) {
+        throw std::runtime_error("experiment3 comm probe requires an initialized ChipWorker");
+    }
+    using ProbeFn = int (*)(void *, uint64_t, CommRecoveryProbeSnapshot *);
+    dlerror();
+    auto probe_fn = reinterpret_cast<ProbeFn>(dlsym(lib_handle_, "comm_recovery_probe_snapshot"));
+    const char *symbol_error = dlerror();
+    if (symbol_error != nullptr || probe_fn == nullptr) {
+        throw UnsupportedRuntimeOperation(
+            "experiment3 communication recovery probe is not exported by this platform runtime"
+        );
+    }
+
+    CommRecoveryProbeSnapshot snapshot{};
+    int rc = probe_fn(reinterpret_cast<void *>(comm_handle), allocation_id, &snapshot);
+    if (rc != 0) {
+        throw std::runtime_error("experiment3 communication recovery probe failed with code " + std::to_string(rc));
+    }
+    if (snapshot.version != COMM_RECOVERY_PROBE_VERSION) {
+        throw std::runtime_error("experiment3 communication recovery probe returned an unsupported version");
+    }
+    return snapshot;
 }
 
 std::tuple<std::vector<uint8_t>, uint64_t, size_t> ChipWorker::comm_global_domain_prepare(

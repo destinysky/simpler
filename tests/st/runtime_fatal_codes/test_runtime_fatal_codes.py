@@ -28,7 +28,10 @@ Two host behaviours are exercised, because they genuinely differ:
   on the host log rather than the masked exception code.
 """
 
+import ctypes
+import multiprocessing as mp
 import os
+import queue
 import time
 
 import pytest
@@ -380,6 +383,262 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
         _assert_annotated(log, case)
     finally:
         worker.close()
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime(RUNTIME)
+@pytest.mark.timeout(90)
+def test_a5_explicit_fatal_quiescence_probe(st_platform, st_device_ids, monkeypatch):
+    """Manual Experiment 1: emit INFO-level PTO shutdown markers for one cooperative fatal run."""
+    configure_logging("info")
+    worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), "explicit_fatal", monkeypatch)
+    try:
+        with pytest.raises(RuntimeError):
+            worker.run(handle, None, config)
+        _flush_host_log(2000)
+    finally:
+        worker.close()
+        _flush_host_log(2000)
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime(RUNTIME)
+@pytest.mark.timeout(90)
+def test_a5_explicit_fatal_same_stream_reuse_probe(st_platform, st_device_ids, monkeypatch, capfd):
+    """Experiment 2: healthy -> explicit fatal -> healthy on one Worker and one stream pair."""
+    configure_logging("info")
+    monkeypatch.setenv("SIMPLER_EXPERIMENT2_PROBE", "1")
+
+    healthy_callable = _build_chip_callable(
+        st_platform,
+        {
+            "orch": "async_error_orch.cpp",
+            "kernel": "aiv/kernel_noop.cpp",
+        },
+    )
+    fatal_callable = _build_chip_callable(st_platform, CASES["explicit_fatal"])
+
+    worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
+    healthy_handle = worker.register(healthy_callable)
+    fatal_handle = worker.register(fatal_callable)
+    worker.init()
+
+    config = CallConfig()
+    config.aicpu_thread_num = 2
+    try:
+        print("[PTO_RECOVERY_EXP2] RUN1_HEALTHY_BEGIN", flush=True)
+        worker.run(healthy_handle, None, config)
+        print("[PTO_RECOVERY_EXP2] RUN1_HEALTHY_END", flush=True)
+
+        dropped_before = _host_log_dropped_records()
+        print("[PTO_RECOVERY_EXP2] RUN2_EXPLICIT_FATAL_BEGIN", flush=True)
+        monkeypatch.setenv("SIMPLER_EXPERIMENT2_SOFT_REARM", "1")
+        try:
+            with pytest.raises(RuntimeError):
+                worker.run(fatal_handle, None, config)
+            _wait_for_host_log(
+                capfd,
+                (
+                    "[PTO_RECOVERY_EXP2] KEEP_RUNNER_AFTER_DRAIN_ERROR",
+                    CASES["explicit_fatal"]["marker"],
+                    CASES["explicit_fatal"]["explain"],
+                ),
+                dropped_before,
+            )
+            assert worker._chip_worker is not None
+            worker._chip_worker._impl._experiment2_rearm_run_lane_for_test()
+        finally:
+            monkeypatch.delenv("SIMPLER_EXPERIMENT2_SOFT_REARM", raising=False)
+        print("[PTO_RECOVERY_EXP2] RUN2_EXPLICIT_FATAL_END", flush=True)
+
+        # No Worker, DeviceRunner or execution stream is recreated here. The
+        # explicit test hook only clears lane poison after the host log proves
+        # this was the expected explicit-fatal run and native finalization left
+        # every ChipWorker native-run slot EMPTY.
+        print("[PTO_RECOVERY_EXP2] RUN3_HEALTHY_SAME_STREAM_BEGIN", flush=True)
+        worker.run(healthy_handle, None, config)
+        print("[PTO_RECOVERY_EXP2] RUN3_HEALTHY_SAME_STREAM_END", flush=True)
+
+        _flush_host_log(2000)
+    finally:
+        worker.close()
+        _flush_host_log(2000)
+
+
+def _exp3_plain_snapshot(native_worker, comm_handle: int, allocation_id: int) -> dict[str, int]:
+    raw = native_worker._impl._experiment3_comm_recovery_probe(int(comm_handle), int(allocation_id))
+    return {str(key): int(value) for key, value in dict(raw).items()}
+
+
+def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_queue) -> None:
+    """One isolated rank: keep one dynamic CommDomain live across an execution-generation fault."""
+    worker = None
+    comm_handle = None
+    allocation_live = False
+    try:
+        configure_logging("info")
+        os.environ["SIMPLER_EXPERIMENT2_PROBE"] = "1"
+        healthy_callable = _build_chip_callable(
+            "a5",
+            {
+                "orch": "async_error_orch.cpp",
+                "kernel": "aiv/kernel_noop.cpp",
+            },
+        )
+        fatal_callable = _build_chip_callable("a5", CASES["explicit_fatal"])
+
+        worker = Worker(level=2, platform="a5", runtime=RUNTIME, device_id=int(device_id))
+        healthy_handle = worker.register(healthy_callable)
+        fatal_handle = worker.register(fatal_callable)
+        worker.init()
+        native_worker = worker._chip_worker
+        if native_worker is None:
+            raise RuntimeError("Experiment 3 lost the L2 ChipWorker")
+
+        comm_handle = native_worker.comm_init(rank, 2, rootinfo_path)
+        allocation_id = 0xE3000001
+        commit_flag = ctypes.c_uint64(0)
+        native_worker._impl.comm_alloc_domain_windows(
+            int(comm_handle), allocation_id, [0, 1], rank, 4 * 1024 * 1024, ctypes.addressof(commit_flag)
+        )
+        if commit_flag.value != 1:
+            raise RuntimeError("Experiment 3 dynamic domain did not publish its commit flag")
+        allocation_live = True
+
+        config = CallConfig()
+        config.aicpu_thread_num = 2
+        worker.run(healthy_handle, None, config)
+        before = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
+
+        os.environ["SIMPLER_EXPERIMENT2_SOFT_REARM"] = "1"
+        try:
+            try:
+                worker.run(fatal_handle, None, config)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("Experiment 3 explicit-fatal run unexpectedly succeeded")
+            after_fault = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
+            native_worker._impl._experiment2_rearm_run_lane_for_test()
+        finally:
+            os.environ.pop("SIMPLER_EXPERIMENT2_SOFT_REARM", None)
+
+        worker.run(healthy_handle, None, config)
+        after_retry = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
+
+        # Release is intentionally part of the experiment: a dynamic allocation
+        # that survives recovery but cannot be collectively reclaimed is not a
+        # usable recovery outcome.
+        native_worker._impl.comm_release_domain_windows(int(comm_handle), allocation_id, 2, rank)
+        allocation_live = False
+        after_release = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
+        native_worker.comm_destroy(int(comm_handle))
+        comm_handle = None
+        worker.close()
+        worker = None
+
+        result_queue.put(
+            {
+                "ok": True,
+                "rank": rank,
+                "device_id": device_id,
+                "before": before,
+                "after_fault": after_fault,
+                "after_retry": after_retry,
+                "after_release": after_release,
+            }
+        )
+    except BaseException as exc:  # noqa: BLE001 -- child must return the first failure to the parent
+        result_queue.put({"ok": False, "rank": rank, "device_id": device_id, "error": repr(exc)})
+        # Best effort only. A peer may already have failed a collective; avoid
+        # turning the diagnostic exception itself into an unbounded cleanup loop.
+        try:
+            if allocation_live and worker is not None and worker._chip_worker is not None and comm_handle is not None:
+                worker._chip_worker._impl.comm_release_domain_windows(int(comm_handle), 0xE3000001, 2, rank)
+        except BaseException:
+            pass
+        try:
+            if worker is not None:
+                worker.close()
+        except BaseException:
+            pass
+        raise
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.device_count(2)
+@pytest.mark.runtime(RUNTIME)
+@pytest.mark.timeout(240)
+def test_a5_explicit_fatal_preserves_comm_domain(st_device_ids, tmp_path):
+    """Experiment 3: communication ownership/queue view survives execution-only soft recovery."""
+    assert len(st_device_ids) == 2
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+    rootinfo_path = str(tmp_path / "exp3_hccl_rootinfo.bin")
+    processes = [
+        ctx.Process(
+            target=_exp3_rank_process,
+            args=(int(st_device_ids[rank]), rank, rootinfo_path, result_queue),
+            name=f"pto-exp3-rank-{rank}",
+        )
+        for rank in range(2)
+    ]
+    for process in processes:
+        process.start()
+    join_deadline = time.monotonic() + 190.0
+    for process in processes:
+        process.join(timeout=max(0.0, join_deadline - time.monotonic()))
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+
+    results = []
+    while len(results) < 2:
+        try:
+            results.append(result_queue.get(timeout=5))
+        except queue.Empty:
+            break
+    assert len(results) == 2, f"Experiment 3 returned only {len(results)} rank result(s)"
+    results.sort(key=lambda item: item["rank"])
+    assert all(item["ok"] for item in results), results
+    assert all(process.exitcode == 0 for process in processes), [process.exitcode for process in processes]
+
+    stable_identity_fields = (
+        "workspace_kind",
+        "comm_handle_identity",
+        "hccl_comm_identity",
+        "comm_stream_identity",
+        "local_window_base",
+        "device_ctx",
+        "workspace_addr",
+        "workspace_size",
+        "binding_signature",
+        "queue_signature",
+    )
+    for result in results:
+        snapshots = [result["before"], result["after_fault"], result["after_retry"]]
+        for snapshot in snapshots:
+            assert snapshot["version"] == 1
+            assert snapshot["workspace_kind"] in (1, 2), snapshot
+            assert snapshot["domain_allocation_count"] == 1, snapshot
+            assert snapshot["allocation_present"] == 1, snapshot
+            assert snapshot["peer_window_count"] == 1, snapshot
+            assert snapshot["active_queue_count"] > 0, snapshot
+            assert snapshot["queue_read_errors"] == 0, snapshot
+            assert snapshot["all_queues_empty"] == 1, snapshot
+            assert snapshot["hccl_comm_identity"] != 0, snapshot
+            assert snapshot["comm_stream_identity"] != 0, snapshot
+            assert snapshot["workspace_addr"] != 0, snapshot
+        for field in stable_identity_fields:
+            assert snapshots[0][field] == snapshots[1][field] == snapshots[2][field], (
+                result["rank"], field, [snapshot[field] for snapshot in snapshots]
+            )
+        released = result["after_release"]
+        assert released["domain_allocation_count"] == 0, released
+        assert released["allocation_present"] == 0, released
 
 
 # The orchestrator fatals before any task completes, so this case leaves the

@@ -883,10 +883,22 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     }
 
     LOG_INFO("Thread %d: Completed", thread_idx);
+    LOG_INFO(
+        "[PTO_RECOVERY_PROBE] AICPU_THREAD_RUN_EXIT thread=%d shutdown_rc=%d run_rc=%d", thread_idx, shutdown_rc,
+        run_rc
+    );
 
     // Check if this is the last thread to finish
     int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
+    LOG_INFO(
+        "[PTO_RECOVERY_PROBE] AICPU_FINISH_COUNT thread=%d finished=%d target=%d", thread_idx, prev_finished + 1,
+        aicpu_thread_num_
+    );
     if (prev_finished + 1 == aicpu_thread_num_) {
+        LOG_INFO(
+            "[PTO_RECOVERY_PROBE] ALL_AICPU_RUN_THREADS_EXITED count=%d callable_id=%d", aicpu_thread_num_,
+            runtime->get_active_callable_id()
+        );
         aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
         finished_.store(true, std::memory_order_release);
         // Destroy the runtime context. sm_handle / rt are recreated every run so we
@@ -903,8 +915,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     bind(nullptr);
                 }
             }
+            LOG_INFO(
+                "[PTO_RECOVERY_PROBE] RUNTIME_CONTEXT_DESTROY_BEGIN callable_id=%d", runtime->get_active_callable_id()
+            );
             runtime_destroy(rt, runtime_arena_);
             rt = nullptr;
+            LOG_INFO(
+                "[PTO_RECOVERY_PROBE] RUNTIME_CONTEXT_DESTROY_END callable_id=%d", runtime->get_active_callable_id()
+            );
         }
     }
 
@@ -912,6 +930,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 }
 
 void AicpuExecutor::deinit(Runtime * /*runtime*/) {
+    LOG_INFO(
+        "[PTO_RECOVERY_PROBE] AICPU_EXECUTOR_DEINIT_BEGIN aicpu_threads=%d sched_threads=%d finished_count=%d",
+        aicpu_thread_num_, sched_thread_num_, finished_count_.load(std::memory_order_acquire)
+    );
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
 
@@ -944,6 +966,7 @@ void AicpuExecutor::deinit(Runtime * /*runtime*/) {
     finished_.store(false, std::memory_order_release);
 
     LOG_INFO("DeInit: AicpuExecutor reset complete");
+    LOG_INFO("[PTO_RECOVERY_PROBE] AICPU_EXECUTOR_DEINIT_END");
 }
 
 // ===== Public Entry Point =====

@@ -3490,6 +3490,11 @@ NB_MODULE(_task_interface, m) {
             "Drain active native ownership, abandon unlaunched work, and close the chip run lane."
         )
         .def(
+            "_experiment2_rearm_run_lane_for_test", &ChipWorker::experiment2_rearm_run_lane_for_test,
+            nb::call_guard<nb::gil_scoped_release>(),
+            "Experiment-only: clear lane poison after a verified terminal explicit-fatal run."
+        )
+        .def(
             "_submit_chip_run_direct",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config) {
                 return self.submit_chip_run(callable_id, args, config);
@@ -3683,6 +3688,37 @@ NB_MODULE(_task_interface, m) {
             "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),
             nb::arg("allocation_id"), nb::arg("rank_count"), nb::arg("domain_rank"),
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
+        )
+        .def(
+            "_experiment3_comm_recovery_probe",
+            [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id) {
+                const CommRecoveryProbeSnapshot snapshot =
+                    self.experiment3_comm_recovery_probe(comm_handle, allocation_id);
+                nb::dict out;
+                out["version"] = snapshot.version;
+                out["workspace_kind"] = snapshot.workspace_kind;
+                out["rank"] = snapshot.rank;
+                out["nranks"] = snapshot.nranks;
+                out["domain_allocation_count"] = snapshot.domain_allocation_count;
+                out["allocation_present"] = snapshot.allocation_present;
+                out["peer_window_count"] = snapshot.peer_window_count;
+                out["active_queue_count"] = snapshot.active_queue_count;
+                out["queue_read_errors"] = snapshot.queue_read_errors;
+                out["all_queues_empty"] = snapshot.all_queues_empty;
+                out["allocation_id"] = snapshot.allocation_id;
+                out["comm_handle_identity"] = snapshot.comm_handle_identity;
+                out["hccl_comm_identity"] = snapshot.hccl_comm_identity;
+                out["comm_stream_identity"] = snapshot.comm_stream_identity;
+                out["local_window_base"] = snapshot.local_window_base;
+                out["device_ctx"] = snapshot.device_ctx;
+                out["workspace_addr"] = snapshot.workspace_addr;
+                out["workspace_size"] = snapshot.workspace_size;
+                out["binding_signature"] = snapshot.binding_signature;
+                out["queue_signature"] = snapshot.queue_signature;
+                return out;
+            },
+            nb::arg("comm_handle"), nb::arg("allocation_id"),
+            "Experiment-only: read a non-mutating communication recovery snapshot."
         )
         .def(
             "comm_global_domain_prepare",

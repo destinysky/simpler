@@ -62,6 +62,45 @@ static inline HcclResult hccl_comm_init_root_info(uint32_t n, const HcclRootInfo
 static inline HcclResult hccl_barrier(HcclComm c, aclrtStream s) { return HcclBarrier(c, s); }
 static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(c); }
 
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+
+// Host-only ABI mirrors used by the Experiment-3 read-only probe.
+//
+// Do not include pto/comm/async/sdma/sdma_types.hpp here: that header is
+// device-side and pulls CCE-only address-space/function annotations into the
+// ordinary host g++ translation unit.
+//
+// These layouts mirror pto::comm::sdma::{BatchWriteFlagInfo,
+// BatchWriteChannelInfo} from the pinned PTO-ISA revision.  The probe only
+// copies the device workspace to host memory and reads these fields; it never
+// writes the workspace.
+struct RecoveryProbeSdmaFlagInfo {
+    uint32_t flag;
+    uint32_t total_queue_num;
+    uint8_t reserved[56];
+};
+
+struct RecoveryProbeSdmaChannelInfo {
+    uint32_t sq_head;
+    uint32_t sq_tail;
+    uint64_t sq_base;
+    uint64_t sq_reg_base;
+    uint32_t sq_depth;
+    uint32_t sq_id;
+    uint32_t cq_id;
+    uint32_t logic_cq_id;
+    uint64_t cqe_addr;
+    uint32_t report_cqe_num;
+    uint32_t stream_id;
+    uint32_t dev_id;
+    uint8_t reserved[4];
+};
+
+static_assert(sizeof(RecoveryProbeSdmaFlagInfo) == 64, "SDMA flag-info ABI drift");
+static_assert(sizeof(RecoveryProbeSdmaChannelInfo) == 64, "SDMA channel-info ABI drift");
+
+#endif
+
 // ============================================================================
 // Internal state
 // ============================================================================
@@ -1391,6 +1430,255 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     return -1;
 } catch (...) {
     LOG_ERROR("[comm] release_domain: unknown exception");
+    return -1;
+}
+
+extern "C" int
+comm_recovery_probe_snapshot(CommHandle h, uint64_t allocation_id, CommRecoveryProbeSnapshot *snapshot_out) try {
+    if (!h || !snapshot_out) return -1;
+
+    CommRecoveryProbeSnapshot snapshot{};
+    snapshot.version = COMM_RECOVERY_PROBE_VERSION;
+    snapshot.rank = static_cast<uint32_t>(h->rank);
+    snapshot.nranks = static_cast<uint32_t>(h->nranks);
+    snapshot.domain_allocation_count = static_cast<uint32_t>(h->domain_allocations.size());
+    snapshot.allocation_id = allocation_id;
+    snapshot.comm_handle_identity = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h));
+    snapshot.hccl_comm_identity = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h->hccl_comm));
+    snapshot.comm_stream_identity = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h->stream));
+
+    // Signatures are deliberately process-local identities, not persistence
+    // formats.  They let one Experiment-3 process compare three snapshots
+    // without teaching the test every backend-private field.
+    uint64_t binding_hash = 0xcbf29ce484222325ULL;
+    uint64_t queue_hash = 0xcbf29ce484222325ULL;
+    auto mix = [](uint64_t &hash, uint64_t value) {
+        hash ^= value;
+        hash *= 0x100000001b3ULL;
+        hash ^= value >> 32U;
+        hash *= 0x100000001b3ULL;
+    };
+    mix(binding_hash, snapshot.comm_handle_identity);
+    mix(binding_hash, snapshot.hccl_comm_identity);
+    mix(binding_hash, snapshot.comm_stream_identity);
+
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) {
+        snapshot.binding_signature = binding_hash;
+        snapshot.queue_signature = queue_hash;
+        *snapshot_out = snapshot;
+        LOG_INFO(
+            "[PTO_RECOVERY_EXP3] COMM_SNAPSHOT rank=%d allocation_id=%llu present=0 live_allocations=%u",
+            h->rank, static_cast<unsigned long long>(allocation_id), snapshot.domain_allocation_count
+        );
+        return 0;
+    }
+
+    DomainAllocation &alloc = *it->second;
+    snapshot.allocation_present = 1;
+    snapshot.peer_window_count = static_cast<uint32_t>(alloc.peer_windows.size());
+    snapshot.local_window_base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(alloc.local_buf));
+    snapshot.device_ctx = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(alloc.device_ctx));
+    mix(binding_hash, snapshot.allocation_id);
+    mix(binding_hash, snapshot.local_window_base);
+    mix(binding_hash, snapshot.device_ctx);
+    mix(binding_hash, snapshot.peer_window_count);
+
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    if (alloc.urma_workspace && alloc.urma_workspace->GetWorkspaceAddr() != nullptr) {
+        using namespace pto::comm::urma;
+        snapshot.workspace_kind = COMM_RECOVERY_PROBE_WORKSPACE_URMA;
+        snapshot.workspace_addr =
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(alloc.urma_workspace->GetWorkspaceAddr()));
+        snapshot.workspace_size = urma_workspace_bytes(static_cast<uint32_t>(alloc.nranks));
+        mix(binding_hash, snapshot.workspace_addr);
+        mix(binding_hash, snapshot.workspace_size);
+
+        UrmaInfo info{};
+        aclError rc = aclrtMemcpy(
+            &info, sizeof(info), reinterpret_cast<void *>(static_cast<uintptr_t>(snapshot.workspace_addr)),
+            sizeof(info), ACL_MEMCPY_DEVICE_TO_HOST
+        );
+        if (rc != ACL_SUCCESS || info.rankCount != static_cast<uint32_t>(alloc.nranks) || info.sqPtr == 0 ||
+            info.scqPtr == 0 || info.memPtr == 0) {
+            ++snapshot.queue_read_errors;
+            snapshot.all_queues_empty = 0;
+        } else {
+            const uint32_t rank_count = info.rankCount;
+            std::vector<UrmaWQCtx> sq(rank_count);
+            std::vector<UrmaCqCtx> cq(rank_count);
+            std::vector<UrmaMemInfo> mem(rank_count);
+            const bool tables_ok =
+                aclrtMemcpy(
+                    sq.data(), sq.size() * sizeof(UrmaWQCtx),
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(info.sqPtr)), sq.size() * sizeof(UrmaWQCtx),
+                    ACL_MEMCPY_DEVICE_TO_HOST
+                ) == ACL_SUCCESS &&
+                aclrtMemcpy(
+                    cq.data(), cq.size() * sizeof(UrmaCqCtx),
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(info.scqPtr)), cq.size() * sizeof(UrmaCqCtx),
+                    ACL_MEMCPY_DEVICE_TO_HOST
+                ) == ACL_SUCCESS &&
+                aclrtMemcpy(
+                    mem.data(), mem.size() * sizeof(UrmaMemInfo),
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(info.memPtr)), mem.size() * sizeof(UrmaMemInfo),
+                    ACL_MEMCPY_DEVICE_TO_HOST
+                ) == ACL_SUCCESS;
+            if (!tables_ok) {
+                ++snapshot.queue_read_errors;
+                snapshot.all_queues_empty = 0;
+            } else {
+                snapshot.all_queues_empty = 1;
+                mix(binding_hash, info.qpNum);
+                mix(binding_hash, info.localTokenId);
+                mix(binding_hash, info.notifyPoolTokenId);
+                mix(binding_hash, info.rankCount);
+                for (uint32_t peer = 0; peer < rank_count; ++peer) {
+                    if (peer == static_cast<uint32_t>(alloc.rank)) continue;
+                    ++snapshot.active_queue_count;
+                    const UrmaWQCtx &wq = sq[peer];
+                    const UrmaCqCtx &scq = cq[peer];
+                    const UrmaMemInfo &mr = mem[peer];
+                    mix(binding_hash, wq.wqn);
+                    mix(binding_hash, wq.bufAddr);
+                    mix(binding_hash, wq.depth);
+                    mix(binding_hash, wq.headAddr);
+                    mix(binding_hash, wq.tailAddr);
+                    mix(binding_hash, wq.dbAddr);
+                    mix(binding_hash, scq.cqn);
+                    mix(binding_hash, scq.bufAddr);
+                    mix(binding_hash, scq.tailAddr);
+                    mix(binding_hash, mr.tpn);
+                    mix(binding_hash, mr.tid);
+                    mix(binding_hash, mr.rmtTokenValue);
+                    mix(binding_hash, mr.addr);
+                    mix(binding_hash, mr.eidAddr);
+
+                    uint32_t sq_head = 0;
+                    uint32_t sq_tail = 0;
+                    uint32_t cq_tail = 0;
+                    const bool live_ok = wq.headAddr != 0 && wq.tailAddr != 0 && scq.tailAddr != 0 &&
+                                         aclrtMemcpy(
+                                             &sq_head, sizeof(sq_head),
+                                             reinterpret_cast<void *>(static_cast<uintptr_t>(wq.headAddr)),
+                                             sizeof(sq_head), ACL_MEMCPY_DEVICE_TO_HOST
+                                         ) == ACL_SUCCESS &&
+                                         aclrtMemcpy(
+                                             &sq_tail, sizeof(sq_tail),
+                                             reinterpret_cast<void *>(static_cast<uintptr_t>(wq.tailAddr)),
+                                             sizeof(sq_tail), ACL_MEMCPY_DEVICE_TO_HOST
+                                         ) == ACL_SUCCESS &&
+                                         aclrtMemcpy(
+                                             &cq_tail, sizeof(cq_tail),
+                                             reinterpret_cast<void *>(static_cast<uintptr_t>(scq.tailAddr)),
+                                             sizeof(cq_tail), ACL_MEMCPY_DEVICE_TO_HOST
+                                         ) == ACL_SUCCESS;
+                    if (!live_ok) {
+                        ++snapshot.queue_read_errors;
+                        snapshot.all_queues_empty = 0;
+                    } else {
+                        if (sq_head != sq_tail) snapshot.all_queues_empty = 0;
+                        mix(queue_hash, sq_head);
+                        mix(queue_hash, sq_tail);
+                        mix(queue_hash, cq_tail);
+                        mix(queue_hash, wq.submittedWqeCount);
+                    }
+                    LOG_INFO(
+                        "[PTO_RECOVERY_EXP3] URMA_PEER rank=%d peer=%u wqn=%u cqn=%u sq_head=%u sq_tail=%u "
+                        "cq_tail=%u submitted=%u tpn=%u tid=%u rmt_addr=0x%llx eid_addr=0x%llx read_ok=%d",
+                        h->rank, peer, wq.wqn, scq.cqn, sq_head, sq_tail, cq_tail, wq.submittedWqeCount, mr.tpn,
+                        mr.tid, static_cast<unsigned long long>(mr.addr), static_cast<unsigned long long>(mr.eidAddr),
+                        static_cast<int>(live_ok)
+                    );
+                }
+            }
+        }
+    }
+#endif
+
+#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
+    if (snapshot.workspace_kind == COMM_RECOVERY_PROBE_WORKSPACE_NONE && h->sdma_workspace &&
+        h->sdma_workspace->GetWorkspaceAddr() != nullptr) {
+        using namespace pto::comm::sdma;
+        snapshot.workspace_kind = COMM_RECOVERY_PROBE_WORKSPACE_SDMA;
+        snapshot.workspace_addr =
+            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h->sdma_workspace->GetWorkspaceAddr()));
+        snapshot.workspace_size = kSdmaWorkspaceBytes;
+        mix(binding_hash, snapshot.workspace_addr);
+        mix(binding_hash, snapshot.workspace_size);
+
+        std::vector<RecoveryProbeSdmaChannelInfo> channels(kSdmaMaxChannelGroups);
+        const uint64_t channel_addr =
+            snapshot.workspace_addr + sizeof(RecoveryProbeSdmaFlagInfo);
+
+        const aclError rc = aclrtMemcpy(
+            channels.data(),
+            channels.size() * sizeof(RecoveryProbeSdmaChannelInfo),
+            reinterpret_cast<void *>(static_cast<uintptr_t>(channel_addr)),
+            channels.size() * sizeof(RecoveryProbeSdmaChannelInfo),
+            ACL_MEMCPY_DEVICE_TO_HOST
+        );
+        if (rc != ACL_SUCCESS) {
+            ++snapshot.queue_read_errors;
+            snapshot.all_queues_empty = 0;
+        } else {
+            snapshot.all_queues_empty = 1;
+            for (uint32_t channel = 0; channel < channels.size(); ++channel) {
+                const RecoveryProbeSdmaChannelInfo &info = channels[channel];
+                if (info.sq_depth == 0 || info.sq_base == 0 || info.sq_reg_base == 0) continue;
+                ++snapshot.active_queue_count;
+                mix(binding_hash, info.sq_base);
+                mix(binding_hash, info.sq_reg_base);
+                mix(binding_hash, info.sq_depth);
+                mix(binding_hash, info.sq_id);
+                mix(binding_hash, info.cq_id);
+                mix(binding_hash, info.logic_cq_id);
+                mix(binding_hash, info.cqe_addr);
+                mix(binding_hash, info.stream_id);
+                mix(binding_hash, info.dev_id);
+                mix(queue_hash, info.sq_head);
+                mix(queue_hash, info.sq_tail);
+                mix(queue_hash, info.report_cqe_num);
+                if (info.sq_head != info.sq_tail) snapshot.all_queues_empty = 0;
+                if (channel < 4 || info.sq_head != info.sq_tail) {
+                    LOG_INFO(
+                        "[PTO_RECOVERY_EXP3] SDMA_CHANNEL rank=%d channel=%u stream_id=%u sq_id=%u cq_id=%u "
+                        "sq_head=%u sq_tail=%u depth=%u report_cqe=%u",
+                        h->rank, channel, info.stream_id, info.sq_id, info.cq_id, info.sq_head, info.sq_tail,
+                        info.sq_depth, info.report_cqe_num
+                    );
+                }
+            }
+            if (snapshot.active_queue_count == 0) snapshot.all_queues_empty = 0;
+        }
+    }
+#endif
+
+    snapshot.binding_signature = binding_hash;
+    snapshot.queue_signature = queue_hash;
+    *snapshot_out = snapshot;
+    LOG_INFO(
+        "[PTO_RECOVERY_EXP3] COMM_SNAPSHOT rank=%d allocation_id=%llu present=%u live_allocations=%u kind=%u "
+        "comm=0x%llx hccl=0x%llx stream=0x%llx workspace=0x%llx local_window=0x%llx device_ctx=0x%llx "
+        "active_queues=%u read_errors=%u empty=%u binding_sig=0x%llx queue_sig=0x%llx",
+        h->rank, static_cast<unsigned long long>(allocation_id), snapshot.allocation_present,
+        snapshot.domain_allocation_count, snapshot.workspace_kind,
+        static_cast<unsigned long long>(snapshot.comm_handle_identity),
+        static_cast<unsigned long long>(snapshot.hccl_comm_identity),
+        static_cast<unsigned long long>(snapshot.comm_stream_identity),
+        static_cast<unsigned long long>(snapshot.workspace_addr),
+        static_cast<unsigned long long>(snapshot.local_window_base),
+        static_cast<unsigned long long>(snapshot.device_ctx), snapshot.active_queue_count,
+        snapshot.queue_read_errors, snapshot.all_queues_empty,
+        static_cast<unsigned long long>(snapshot.binding_signature),
+        static_cast<unsigned long long>(snapshot.queue_signature)
+    );
+    return 0;
+} catch (const std::exception &e) {
+    LOG_ERROR("[PTO_RECOVERY_EXP3] comm snapshot exception: %s", e.what());
+    return -1;
+} catch (...) {
+    LOG_ERROR("[PTO_RECOVERY_EXP3] comm snapshot unknown exception");
     return -1;
 }
 

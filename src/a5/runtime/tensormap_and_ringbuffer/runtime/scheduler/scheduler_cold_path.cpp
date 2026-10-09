@@ -639,7 +639,13 @@ void SchedulerContext::log_chip_swimlane_summary(int32_t thread_idx, [[maybe_unu
 int32_t SchedulerContext::shutdown(int32_t thread_idx) {
     const int32_t *cores = core_trackers_[thread_idx].core_ids();
     int32_t core_num = core_trackers_[thread_idx].core_num();
-    if (core_num == 0) return 0;
+    if (core_num == 0) {
+        LOG_INFO(
+            "[PTO_RECOVERY_PROBE] AICORE_SHUTDOWN thread=%d total=0 acked=0 timed_out=0 invalid=0 rc=0",
+            thread_idx
+        );
+        return 0;
+    }
 
 #if SIMPLER_DFX
     // Restore PMU CTRL registers for this thread's cores before AICore shutdown
@@ -650,6 +656,9 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
 
     LOG_INFO("Thread %d: Shutting down %d cores", thread_idx, core_num);
     int32_t rc = 0;
+    int32_t acked_count = 0;
+    int32_t timeout_count = 0;
+    int32_t invalid_count = 0;
     for (int32_t i = 0; i < core_num; i++) {
         int32_t core_id = cores[i];
         uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
@@ -657,12 +666,20 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
             // Timeout means AICore is unresponsive. Log and continue deiniting remaining cores.
             if (platform_deinit_aicore_regs(reg_addr) != 0) {
                 LOG_ERROR("Thread %d: Core %d deinit timed out", thread_idx, core_id);
+                ++timeout_count;
                 rc = -1;
+            } else {
+                ++acked_count;
             }
         } else {
             LOG_ERROR("Thread %d: Core %d has invalid register address", thread_idx, core_id);
+            ++invalid_count;
         }
     }
+    LOG_INFO(
+        "[PTO_RECOVERY_PROBE] AICORE_SHUTDOWN thread=%d total=%d acked=%d timed_out=%d invalid=%d rc=%d",
+        thread_idx, core_num, acked_count, timeout_count, invalid_count, rc
+    );
     return rc;
 }
 
@@ -1057,6 +1074,8 @@ bool SchedulerContext::assign_cores_to_threads() {
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
     (void)runtime;  // exit is now delivered via each core's register block, not GM
     LOG_WARN("Emergency shutdown: sending exit signal to all initialized cores");
+    int32_t initialized_count = 0;
+    int32_t acked_count = 0;
     int32_t timeout_count = 0;
     for (int32_t i = 0; i < cores_total_num_; i++) {
         // platform_deinit_aicore_regs writes DATA_MAIN_BASE=EXIT, which both
@@ -1064,14 +1083,22 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
         // exit. Cores never opened (reg_addr==0) are reaped by the host device
         // reset that follows a handshake failure.
         if (core_exec_states_[i].reg_addr != 0) {
+            ++initialized_count;
             if (platform_deinit_aicore_regs(core_exec_states_[i].reg_addr) != 0) {
-                timeout_count++;
+                ++timeout_count;
+            } else {
+                ++acked_count;
             }
         }
     }
     if (timeout_count > 0) {
         LOG_ERROR("Emergency shutdown: %d cores did not acknowledge exit", timeout_count);
     }
+    LOG_INFO(
+        "[PTO_RECOVERY_PROBE] AICORE_EMERGENCY_SHUTDOWN total=%d initialized=%d acked=%d timed_out=%d "
+        "uninitialized=%d",
+        cores_total_num_, initialized_count, acked_count, timeout_count, cores_total_num_ - initialized_count
+    );
 }
 
 // =============================================================================

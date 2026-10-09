@@ -158,6 +158,7 @@ public:
         NativeExecutionFault *execution_fault_sink = nullptr
     );
     void close_chip_run_lane();
+    void experiment2_rearm_run_lane_for_test();
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
@@ -226,6 +227,8 @@ public:
     /// inside the backend's per-allocation record).
     void
     comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
+    CommRecoveryProbeSnapshot
+    experiment3_comm_recovery_probe(uint64_t comm_handle, uint64_t allocation_id);
     std::tuple<std::vector<uint8_t>, uint64_t, size_t> comm_global_domain_prepare(
         uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
     );

@@ -282,6 +282,51 @@ int comm_alloc_domain_windows(
 int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
 
 /**
+ * Experiment-3 read-only recovery snapshot.
+ *
+ * This is diagnostic surface only: it must not create/destroy communicators,
+ * acquire channels, move queue heads/tails, or otherwise mutate communication
+ * state.  The a5 HCCL backend exports it; other backends may omit the symbol.
+ * ChipWorker resolves it with optional dlsym so this does not extend the
+ * mandatory cross-platform host-runtime ABI.
+ */
+#define COMM_RECOVERY_PROBE_VERSION 1U
+
+typedef enum CommRecoveryProbeWorkspaceKind {
+    COMM_RECOVERY_PROBE_WORKSPACE_NONE = 0,
+    COMM_RECOVERY_PROBE_WORKSPACE_SDMA = 1,
+    COMM_RECOVERY_PROBE_WORKSPACE_URMA = 2,
+} CommRecoveryProbeWorkspaceKind;
+
+typedef struct CommRecoveryProbeSnapshot {
+    uint32_t version;
+    uint32_t workspace_kind;
+    uint32_t rank;
+    uint32_t nranks;
+    uint32_t domain_allocation_count;
+    uint32_t allocation_present;
+    uint32_t peer_window_count;
+    uint32_t active_queue_count;
+    uint32_t queue_read_errors;
+    uint32_t all_queues_empty;
+    uint32_t reserved0;
+    uint32_t reserved1;
+
+    uint64_t allocation_id;
+    uint64_t comm_handle_identity;
+    uint64_t hccl_comm_identity;
+    uint64_t comm_stream_identity;
+    uint64_t local_window_base;
+    uint64_t device_ctx;
+    uint64_t workspace_addr;
+    uint64_t workspace_size;
+    uint64_t binding_signature;
+    uint64_t queue_signature;
+} CommRecoveryProbeSnapshot;
+
+int comm_recovery_probe_snapshot(CommHandle h, uint64_t allocation_id, CommRecoveryProbeSnapshot *snapshot_out);
+
+/**
  * Create one local window for a Global CommDomain and export its transport
  * descriptor. This operation has no
  * HCCL or filesystem bootstrap dependency.

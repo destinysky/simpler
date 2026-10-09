@@ -12,8 +12,11 @@
 #include "chip_run_lane.h"
 
 #include "chip_worker.h"
+#include "common/unified_log.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <exception>
 #include <limits>
@@ -21,6 +24,15 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace {
+
+bool experiment2_soft_rearm_enabled() {
+    const char *value = std::getenv("SIMPLER_EXPERIMENT2_SOFT_REARM");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+}  // namespace
 
 struct ChipRunState {
     enum class Phase : uint8_t { QUEUED, PREPARED, LAUNCHED, TERMINAL };
@@ -504,6 +516,30 @@ void ChipRunLane::close() {
         state_->drain_front();
     state_->closed = true;
     if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
+}
+
+void ChipRunLane::experiment2_rearm_for_test() {
+    std::lock_guard<std::mutex> lk(state_->mu);
+    if (!experiment2_soft_rearm_enabled()) {
+        throw std::runtime_error("experiment2 rearm requested without SIMPLER_EXPERIMENT2_SOFT_REARM=1");
+    }
+    if (state_->closed) {
+        throw std::runtime_error("experiment2 rearm requested on a closed chip run lane");
+    }
+    if (!state_->fifo.empty()) {
+        throw std::runtime_error("experiment2 rearm requires an empty chip run FIFO");
+    }
+    if (state_->poison == nullptr) {
+        throw std::runtime_error("experiment2 rearm requires a poisoned chip run lane");
+    }
+
+    // Preserve every generation high-water mark. Only the sticky admission
+    // poison is cleared after the caller has independently verified that the
+    // failed native run is terminal and this probe's PTO-side explicit-fatal
+    // shutdown reached its stop proof. Device-wide synchronize status is not
+    // used as a second stop proof because it may retain the failed-task status.
+    state_->poison = nullptr;
+    LOG_WARN("[PTO_RECOVERY_EXP2] CHIP_RUN_LANE_POISON_CLEARED_EXPLICITLY");
 }
 
 bool ChipRunLane::poisoned() const {

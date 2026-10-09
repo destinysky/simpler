@@ -77,6 +77,7 @@ public:
 
     void drain();
     void close();
+    void experiment2_rearm_for_test();
     bool poisoned() const;
 
 private:
