@@ -434,34 +434,66 @@ def test_a5_explicit_fatal_same_stream_reuse_probe(st_platform, st_device_ids, m
 
         dropped_before = _host_log_dropped_records()
         print("[PTO_RECOVERY_EXP2] RUN2_EXPLICIT_FATAL_BEGIN", flush=True)
-        monkeypatch.setenv("SIMPLER_EXPERIMENT2_SOFT_REARM", "1")
-        try:
-            with pytest.raises(RuntimeError):
-                worker.run(fatal_handle, None, config)
-            _wait_for_host_log(
-                capfd,
-                (
-                    "[PTO_RECOVERY_EXP2] KEEP_RUNNER_AFTER_DRAIN_ERROR",
-                    CASES["explicit_fatal"]["marker"],
-                    CASES["explicit_fatal"]["explain"],
-                ),
-                dropped_before,
-            )
-            assert worker._chip_worker is not None
-            worker._chip_worker._impl._experiment2_rearm_run_lane_for_test()
-        finally:
-            monkeypatch.delenv("SIMPLER_EXPERIMENT2_SOFT_REARM", raising=False)
+        with pytest.raises(RuntimeError):
+            worker.run(fatal_handle, None, config)
+        _wait_for_host_log(
+            capfd,
+            (
+                "[PTO_RECOVERY] SOFT_RETRY_ARMED",
+                CASES["explicit_fatal"]["marker"],
+                CASES["explicit_fatal"]["explain"],
+            ),
+            dropped_before,
+        )
         print("[PTO_RECOVERY_EXP2] RUN2_EXPLICIT_FATAL_END", flush=True)
 
-        # No Worker, DeviceRunner or execution stream is recreated here. The
-        # explicit test hook only clears lane poison after the host log proves
-        # this was the expected explicit-fatal run and native finalization left
-        # every ChipWorker native-run slot EMPTY.
+        # No Worker, DeviceRunner or execution stream is recreated here.
+        # The next submit automatically consumes the one-shot soft-retry credit
+        # after FIFO-empty + native-slot-empty structural checks.
         print("[PTO_RECOVERY_EXP2] RUN3_HEALTHY_SAME_STREAM_BEGIN", flush=True)
         worker.run(healthy_handle, None, config)
         print("[PTO_RECOVERY_EXP2] RUN3_HEALTHY_SAME_STREAM_END", flush=True)
 
         _flush_host_log(2000)
+    finally:
+        worker.close()
+        _flush_host_log(2000)
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime(RUNTIME)
+@pytest.mark.timeout(120)
+def test_a5_soft_retry_second_failure_falls_back(st_platform, st_device_ids, monkeypatch, capfd):
+    """The retry itself may fail once; that failure must fall back to hard recovery."""
+    configure_logging("info")
+    monkeypatch.setenv("SIMPLER_EXPERIMENT2_PROBE", "1")
+
+    fatal_callable = _build_chip_callable(st_platform, CASES["explicit_fatal"])
+    worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
+    fatal_handle = worker.register(fatal_callable)
+    worker.init()
+
+    config = CallConfig()
+    config.aicpu_thread_num = 2
+    try:
+        dropped_before = _host_log_dropped_records()
+        with pytest.raises(RuntimeError):
+            worker.run(fatal_handle, None, config)
+        _wait_for_host_log(
+            capfd,
+            ("[PTO_RECOVERY] SOFT_RETRY_ARMED", CASES["explicit_fatal"]["explain"]),
+            dropped_before,
+        )
+
+        dropped_before = _host_log_dropped_records()
+        with pytest.raises(RuntimeError):
+            worker.run(fatal_handle, None, config)
+        _wait_for_host_log(
+            capfd,
+            ("[PTO_RECOVERY] SOFT_RETRY_FAILED", "fallback=hard_reset"),
+            dropped_before,
+        )
     finally:
         worker.close()
         _flush_host_log(2000)
@@ -512,18 +544,13 @@ def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_que
         worker.run(healthy_handle, None, config)
         before = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
 
-        os.environ["SIMPLER_EXPERIMENT2_SOFT_REARM"] = "1"
         try:
-            try:
-                worker.run(fatal_handle, None, config)
-            except RuntimeError:
-                pass
-            else:
-                raise AssertionError("Experiment 3 explicit-fatal run unexpectedly succeeded")
-            after_fault = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
-            native_worker._impl._experiment2_rearm_run_lane_for_test()
-        finally:
-            os.environ.pop("SIMPLER_EXPERIMENT2_SOFT_REARM", None)
+            worker.run(fatal_handle, None, config)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("Experiment 3 explicit-fatal run unexpectedly succeeded")
+        after_fault = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
 
         worker.run(healthy_handle, None, config)
         after_retry = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)

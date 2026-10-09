@@ -57,10 +57,6 @@ bool experiment2_env_enabled(const char *name) {
 bool experiment2_probe_enabled() {
     return experiment2_env_enabled("SIMPLER_EXPERIMENT2_PROBE");
 }
-
-bool experiment2_soft_rearm_enabled() {
-    return experiment2_env_enabled("SIMPLER_EXPERIMENT2_SOFT_REARM");
-}
 }
 
 // dep_gen has two shapes, one per orchestration site, and each runtime provides
@@ -314,6 +310,15 @@ int DeviceRunner::prepare_execution(
     // predecessor, so the members still describe that predecessor.
     DfxRunConfig &dfx = execution->dfx;
     execution->resources_owned = true;
+
+    const bool soft_retry_attempt = claim_soft_retry_attempt(identity.run_epoch);
+    bool prepare_succeeded = false;
+    auto soft_retry_prepare_guard = RAIIScopeGuard([this, soft_retry_attempt, &prepare_succeeded, &identity]() {
+        if (soft_retry_attempt && !prepare_succeeded) {
+            handle_execution_failure(PTO_RUNTIME_ERR_INTERNAL, "prepare", identity.run_epoch);
+        }
+    });
+
     auto prepare_rollback = RAIIScopeGuard([this, &execution]() {
         cleanup_execution(*execution, /*launched=*/false);
     });
@@ -474,6 +479,8 @@ int DeviceRunner::prepare_execution(
     execution->num_aicore = num_aicore;
     execution->launch_aicpu_num = active_aicpu_num;
     prepare_rollback.dismiss();
+    prepare_succeeded = true;
+    soft_retry_prepare_guard.dismiss();
     *prepared = std::move(execution);
     return 0;
 }
@@ -549,7 +556,6 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             int launch_rc = launch_aicore_kernel(stream_aicore_, prepared->kernel_args.device_k_args_);
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
-                recover_device_or_mark_unusable(launch_rc);
             }
             return launch_rc;
         },
@@ -572,7 +578,9 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
         }
     );
 
-    if (transaction.poisoned()) recover_device_or_mark_unusable(transaction.rc);
+    if (transaction.rc != 0) {
+        handle_execution_failure(transaction.rc, "launch", prepared->identity.run_epoch);
+    }
     outcome.rc = transaction.rc;
     outcome.progress = transaction.progress;
     outcome.receipt = std::move(transaction.receipt);
@@ -636,35 +644,10 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         static_cast<unsigned long long>(prepared.identity.dispatch_id), rc
     );
     if (rc != 0) {
-        // sync_run_streams surfaces the AICore op-timeout (STARS-reaped op ->
-        // 507000/507018/507046 at AICPU/AICore stream sync). The op-timeout
-        // leaves the context poisoned, so recovery remains the drain owner's
-        // responsibility and its error remains authoritative over cleanup.
-        if (experiment2_soft_rearm_enabled()) {
-            // Experiment 2/3 only. The PTO-side cooperative shutdown is the
-            // execution-stop proof for this probe. A device-wide synchronize is
-            // deliberately diagnostic-only here: CANN may replay the failed
-            // AICPU task status (for example 507018) even after every PTO AICPU
-            // thread and initialized AIC/AIV core has exited. Requiring
-            // ACL_SUCCESS here would therefore re-poison an already-stopped
-            // execution generation and would conflate task completion status
-            // with device liveness.
-            // Do not even invoke device-wide synchronize in this experiment:
-            // on communication-active processes the failed synchronize itself
-            // can leave an RTS sticky error that rejects the next kernel launch.
-            //
-            // Safety for the experiment still comes from the two-stage gate:
-            // this branch is enabled only around the known explicit-fatal run,
-            // and the host lane remains poisoned until the test observes the
-            // runtime-classified EXPLICIT_ORCH_FATAL and explicitly rearms it.
-            LOG_WARN(
-                "[PTO_RECOVERY_EXP2] KEEP_RUNNER_AFTER_DRAIN_ERROR rc=%d device_sync_skipped=1 "
-                "aicpu=%p aicore=%p",
-                rc, reinterpret_cast<void *>(stream_aicpu_), reinterpret_cast<void *>(stream_aicore_)
-            );
-        } else {
-            recover_device_or_mark_unusable(rc);
-        }
+        // Error-code agnostic: preserve E for exactly one subsequent execution
+        // attempt. Do not issue a device-wide synchronize here; it can replay
+        // the failed task status into otherwise reusable execution state.
+        handle_execution_failure(rc, "drain", prepared.identity.run_epoch);
         // Emergency shutdown may already have flushed diagnostics. Export the
         // manifest on the error path exactly once.
         if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
@@ -675,6 +658,7 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         return rc;
     }
 
+    complete_soft_retry_attempt(prepared.identity.run_epoch);
     read_device_wall_ns();
     if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
@@ -729,7 +713,88 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched)
 }
 
 void DeviceRunner::abandon_prepared_execution(PreparedExecution &prepared) noexcept {
+    cancel_soft_retry_attempt(prepared.identity.run_epoch);
     cleanup_execution(prepared, /*launched=*/false);
+}
+
+bool DeviceRunner::claim_soft_retry_attempt(uint64_t run_epoch) {
+    SoftRetryState expected = SoftRetryState::Pending;
+    if (!soft_retry_state_.compare_exchange_strong(
+            expected, SoftRetryState::InProgress, std::memory_order_acq_rel, std::memory_order_acquire
+        )) {
+        return false;
+    }
+    soft_retry_run_epoch_.store(run_epoch, std::memory_order_release);
+    LOG_WARN("[PTO_RECOVERY] SOFT_RETRY_BEGIN run_epoch=%llu", static_cast<unsigned long long>(run_epoch));
+    return true;
+}
+
+bool DeviceRunner::is_soft_retry_attempt(uint64_t run_epoch) const {
+    return soft_retry_state_.load(std::memory_order_acquire) == SoftRetryState::InProgress &&
+           soft_retry_run_epoch_.load(std::memory_order_acquire) == run_epoch;
+}
+
+void DeviceRunner::cancel_soft_retry_attempt(uint64_t run_epoch) noexcept {
+    if (!is_soft_retry_attempt(run_epoch)) return;
+    soft_retry_run_epoch_.store(0, std::memory_order_release);
+    soft_retry_state_.store(SoftRetryState::Pending, std::memory_order_release);
+    LOG_WARN("[PTO_RECOVERY] SOFT_RETRY_CANCELLED run_epoch=%llu", static_cast<unsigned long long>(run_epoch));
+}
+
+void DeviceRunner::complete_soft_retry_attempt(uint64_t run_epoch) noexcept {
+    if (!is_soft_retry_attempt(run_epoch)) return;
+    soft_retry_run_epoch_.store(0, std::memory_order_release);
+    soft_retry_state_.store(SoftRetryState::Idle, std::memory_order_release);
+    LOG_WARN("[PTO_RECOVERY] SOFT_RETRY_SUCCEEDED run_epoch=%llu", static_cast<unsigned long long>(run_epoch));
+}
+
+void DeviceRunner::handle_execution_failure(int rc, const char *stage, uint64_t run_epoch) {
+    if (device_unusable_.load(std::memory_order_acquire)) {
+        LOG_INFO(
+            "[PTO_RECOVERY] HARD_FALLBACK_ALREADY_ARMED stage=%s rc=%d run_epoch=%llu",
+            stage, rc, static_cast<unsigned long long>(run_epoch)
+        );
+        return;
+    }
+
+    const SoftRetryState state = soft_retry_state_.load(std::memory_order_acquire);
+    if (state == SoftRetryState::InProgress) {
+        LOG_ERROR(
+            "[PTO_RECOVERY] SOFT_RETRY_FAILED stage=%s rc=%d run_epoch=%llu fallback=hard_reset",
+            stage, rc, static_cast<unsigned long long>(run_epoch)
+        );
+        soft_retry_run_epoch_.store(0, std::memory_order_release);
+        soft_retry_state_.store(SoftRetryState::Idle, std::memory_order_release);
+        recover_device_or_mark_unusable(rc);
+        return;
+    }
+
+    SoftRetryState expected = SoftRetryState::Idle;
+    if (soft_retry_state_.compare_exchange_strong(
+            expected, SoftRetryState::Pending, std::memory_order_acq_rel, std::memory_order_acquire
+        )) {
+        LOG_WARN(
+            "[PTO_RECOVERY] SOFT_RETRY_ARMED stage=%s rc=%d run_epoch=%llu device_sync_skipped=1",
+            stage, rc, static_cast<unsigned long long>(run_epoch)
+        );
+        return;
+    }
+
+    // The same failed generation can be observed again during finalization.
+    // Pending already owns the one retry credit; duplicate reports are benign.
+    if (expected == SoftRetryState::Pending) {
+        LOG_INFO(
+            "[PTO_RECOVERY] SOFT_RETRY_ALREADY_ARMED stage=%s rc=%d run_epoch=%llu",
+            stage, rc, static_cast<unsigned long long>(run_epoch)
+        );
+        return;
+    }
+
+    LOG_ERROR(
+        "[PTO_RECOVERY] recovery-state conflict stage=%s rc=%d run_epoch=%llu; falling back",
+        stage, rc, static_cast<unsigned long long>(run_epoch)
+    );
+    recover_device_or_mark_unusable(rc);
 }
 
 void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {

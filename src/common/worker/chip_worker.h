@@ -404,6 +404,7 @@ private:
         NativeExecutionFault *execution_fault_sink, bool pipeline_leased
     );
     void cleanup_native_runs_noexcept() noexcept;
+    bool native_runs_idle_for_soft_retry() const;
 
     friend struct ChipRunLaneState;
 

@@ -217,6 +217,16 @@ private:
     // Admission and recovery execute on different host threads.
     std::atomic<bool> device_unusable_{false};
 
+    // One generic soft-retry credit for a failed PTO execution generation.
+    // Error codes are diagnostics only; retry eligibility is lifecycle-based.
+    enum class SoftRetryState : uint8_t {
+        Idle,
+        Pending,
+        InProgress,
+    };
+    std::atomic<SoftRetryState> soft_retry_state_{SoftRetryState::Idle};
+    std::atomic<uint64_t> soft_retry_run_epoch_{0};
+
     enum class RunPollState : uint8_t {
         Idle,
         Enqueuing,
@@ -234,10 +244,17 @@ private:
     // and are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool launched) noexcept;
 
-    // On an AICore launch/sync error, best-effort drain the device so a later
-    // enqueue on the same DeviceRunner can recover in place; if the drain itself
-    // errors the context is unrecoverable without a full reset, so flip
-    // device_unusable_ and let admission/enqueue fail fast.
+    // Generic one-shot soft retry. The first execution-side failure keeps
+    // Context E alive; the next execution attempt consumes the credit. Any
+    // failure of that retry falls back to the existing hard-reset path.
+    bool claim_soft_retry_attempt(uint64_t run_epoch);
+    bool is_soft_retry_attempt(uint64_t run_epoch) const;
+    void cancel_soft_retry_attempt(uint64_t run_epoch) noexcept;
+    void complete_soft_retry_attempt(uint64_t run_epoch) noexcept;
+    void handle_execution_failure(int rc, const char *stage, uint64_t run_epoch);
+
+    // Hard fallback: bounded drain + device_unusable_, followed by force reset
+    // during finalize().
     void recover_device_or_mark_unusable(int aicore_rc) override;
 
     // Force-reset the card via aclrtResetDeviceForce to clear an op-timeout

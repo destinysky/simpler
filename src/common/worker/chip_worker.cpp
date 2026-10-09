@@ -853,6 +853,14 @@ void ChipWorker::experiment2_rearm_run_lane_for_test() {
     run_lane_->experiment2_rearm_for_test();
 }
 
+bool ChipWorker::native_runs_idle_for_soft_retry() const {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    for (const NativeRunSlotState &state : native_run_states_) {
+        if (state.phase != NativeRunPhase::EMPTY) return false;
+    }
+    return true;
+}
+
 void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run) {
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
