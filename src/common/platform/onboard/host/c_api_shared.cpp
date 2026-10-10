@@ -462,6 +462,28 @@ int recovery_finalize_device(DeviceContextHandle ctx) {
     }
 }
 
+int get_execution_recovery_state_ctx(DeviceContextHandle ctx, ExecutionRecoveryResult *result) {
+    if (ctx == nullptr || result == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        *result = static_cast<DeviceRunnerBase *>(ctx)->execution_recovery_state();
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int recover_execution_ctx(
+    DeviceContextHandle ctx, uint64_t failed_run_epoch, ExecutionRecoveryScope scope, ExecutionRecoveryResult *result
+) {
+    if (ctx == nullptr || result == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        *result = static_cast<DeviceRunnerBase *>(ctx)->recover_execution(failed_run_epoch, scope);
+        return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
@@ -811,9 +833,9 @@ int simpler_prepare_run(
         LOG_ERROR("simpler_prepare_run: callable_id=%d not registered", callable_id);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (!runner->can_accept_run()) {
-        LOG_ERROR("simpler_prepare_run: runner is unusable after a prior device failure");
-        return PTO_RUNTIME_ERR_INTERNAL;
+    if (!runner->execution_admission_open()) {
+        LOG_ERROR("simpler_prepare_run: execution admission is fenced by a prior failure");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
     }
     uint64_t magic = 0;
     std::memcpy(&magic, runtime, sizeof(magic));
@@ -958,7 +980,7 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
         return 0;
     }
-    if (!state->runner->can_accept_run() || !state->runner_reserved) return PTO_RUNTIME_ERR_INTERNAL;
+    if (!state->runner->execution_admission_open() || !state->runner_reserved) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (state->prepared_execution == nullptr ||
         !state->runner->try_acquire_native_run(state, state->identity(), &state->launch_permit)) {
         LOG_ERROR("simpler_launch_run: execution claim is occupied (%s)", state->trace_attrs);
@@ -967,7 +989,7 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     state->runner_claimed = true;
     // The active predecessor may poison the device after this successor was
     // prepared but before the execution claim becomes available.
-    if (!state->runner->can_accept_run()) {
+    if (!state->runner->execution_admission_open()) {
         state->runner->release_native_run(state);
         state->runner_claimed = false;
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1111,9 +1133,7 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
             // replace or mask the execution failure already being finalized.
         }
         if (fault.raw_rc != 0 || fault.runtime_status != 0) {
-            std::memcpy(
-                state->descriptor.execution_fault_sink, &fault, sizeof(NativeExecutionFault)
-            );
+            std::memcpy(state->descriptor.execution_fault_sink, &fault, sizeof(NativeExecutionFault));
         }
     }
 

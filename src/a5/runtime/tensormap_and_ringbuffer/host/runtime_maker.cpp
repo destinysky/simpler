@@ -206,6 +206,11 @@ static bool resolve_ring_config(
     return true;
 }
 
+extern "C" void *execution_quiescence_flag(Runtime *runtime) {
+    if (runtime == nullptr || runtime->get_gm_sm_ptr() == nullptr) return nullptr;
+    return static_cast<char *>(runtime->get_gm_sm_ptr()) + offsetof(SharedMemoryHeader, execution_quiesced);
+}
+
 static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
     if (runtime == nullptr || host_header == nullptr) {
         return 0;
@@ -227,8 +232,7 @@ static int32_t read_runtime_status(Runtime *runtime, const HostApi *api, SharedM
     return runtime_status_from_error_codes(orch_error_code, sched_error_code);
 }
 
-extern "C" int
-collect_native_execution_fault_impl(Runtime *runtime, const HostApi *api, NativeExecutionFault *fault) {
+extern "C" int collect_native_execution_fault_impl(Runtime *runtime, const HostApi *api, NativeExecutionFault *fault) {
     if (runtime == nullptr || api == nullptr || fault == nullptr) {
         return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     }

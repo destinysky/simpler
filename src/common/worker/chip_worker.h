@@ -106,8 +106,7 @@ public:
     void run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config);
     void
     run(int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config,
-        volatile int32_t *accepted_state, int32_t accepted_value,
-        NativeExecutionFault *execution_fault_sink = nullptr);
+        volatile int32_t *accepted_state, int32_t accepted_value, NativeExecutionFault *execution_fault_sink = nullptr);
     void run_with_lease(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
         volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
@@ -158,7 +157,9 @@ public:
         NativeExecutionFault *execution_fault_sink = nullptr
     );
     void close_chip_run_lane();
-    void experiment2_rearm_run_lane_for_test();
+    ExecutionRecoveryResult execution_recovery_state() const;
+    ExecutionRecoveryResult
+    recover_execution(uint64_t failed_run_epoch, ExecutionRecoveryScope scope = ExecutionRecoveryScope::EXECUTION_ONLY);
 
     // Per-callable_id preparation. Requires init() first and a callable_id
     // in [0, MAX_REGISTERED_CALLABLE_IDS) (cap 64).
@@ -227,8 +228,7 @@ public:
     /// inside the backend's per-allocation record).
     void
     comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
-    CommRecoveryProbeSnapshot
-    experiment3_comm_recovery_probe(uint64_t comm_handle, uint64_t allocation_id);
+    CommRecoveryProbeSnapshot experiment3_comm_recovery_probe(uint64_t comm_handle, uint64_t allocation_id);
     std::tuple<std::vector<uint8_t>, uint64_t, size_t> comm_global_domain_prepare(
         uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
     );
@@ -354,6 +354,8 @@ private:
     GetAicpuDlopenCountFn get_run_stream_set_create_count_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
     FinalizeDeviceFn recovery_finalize_device_fn_ = nullptr;
+    decltype(&get_execution_recovery_state_ctx) execution_recovery_state_fn_ = nullptr;
+    decltype(&recover_execution_ctx) recover_execution_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;
     DestroyCommStreamFn destroy_comm_stream_fn_ = nullptr;
@@ -404,9 +406,10 @@ private:
         NativeExecutionFault *execution_fault_sink, bool pipeline_leased
     );
     void cleanup_native_runs_noexcept() noexcept;
-    bool native_runs_idle_for_soft_retry() const;
+    ExecutionRecoveryResult recover_execution_substrate(uint64_t failed_run_epoch, ExecutionRecoveryScope scope);
 
     friend struct ChipRunLaneState;
+    friend class ChipRunLane;
 
     class RuntimeStorage {
     public:

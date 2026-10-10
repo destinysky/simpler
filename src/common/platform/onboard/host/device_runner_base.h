@@ -721,6 +721,19 @@ public:
     // when the execution fault did not mark the device unusable.
     virtual int recovery_finalize() { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
+    // Admission fencing is separate from confirmed device-wide unusability.
+    virtual bool execution_admission_open() const { return can_accept_run(); }
+
+    virtual ExecutionRecoveryResult execution_recovery_state() const {
+        ExecutionRecoveryResult result;
+        result.status = ExecutionRecoveryStatus::UNSUPPORTED;
+        result.recovery_rc = PTO_RUNTIME_ERR_UNSUPPORTED;
+        return result;
+    }
+    virtual ExecutionRecoveryResult recover_execution(uint64_t, ExecutionRecoveryScope) {
+        return execution_recovery_state();
+    }
+
     /**
      * Arm or disarm this thread's host-side dep_gen capture, from the run's own
      * config, before it binds.

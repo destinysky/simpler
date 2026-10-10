@@ -97,6 +97,11 @@ public:
     int drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
     int recovery_finalize() override;
+    bool execution_admission_open() const override {
+        return can_accept_run() && !execution_recovery_required_.load(std::memory_order_acquire);
+    }
+    ExecutionRecoveryResult execution_recovery_state() const override;
+    ExecutionRecoveryResult recover_execution(uint64_t failed_run_epoch, ExecutionRecoveryScope scope) override;
 
     // `set_chip_swimlane_enabled`, `set_dump_args_enabled`,
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
@@ -217,15 +222,12 @@ private:
     // Admission and recovery execute on different host threads.
     std::atomic<bool> device_unusable_{false};
 
-    // One generic soft-retry credit for a failed PTO execution generation.
-    // Error codes are diagnostics only; retry eligibility is lifecycle-based.
-    enum class SoftRetryState : uint8_t {
-        Idle,
-        Pending,
-        InProgress,
-    };
-    std::atomic<SoftRetryState> soft_retry_state_{SoftRetryState::Idle};
-    std::atomic<uint64_t> soft_retry_run_epoch_{0};
+    // Pending failure fences admission until explicit rearm or terminal cleanup.
+    std::atomic<bool> execution_recovery_required_{false};
+    mutable std::mutex execution_recovery_mu_;
+    ExecutionRecoveryResult execution_recovery_{};
+    bool execution_quiescence_supported_{false};
+    uint64_t recovered_run_epoch_{0};
 
     enum class RunPollState : uint8_t {
         Idle,
@@ -244,14 +246,8 @@ private:
     // and are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool launched) noexcept;
 
-    // Generic one-shot soft retry. The first execution-side failure keeps
-    // Context E alive; the next execution attempt consumes the credit. Any
-    // failure of that retry falls back to the existing hard-reset path.
-    bool claim_soft_retry_attempt(uint64_t run_epoch);
-    bool is_soft_retry_attempt(uint64_t run_epoch) const;
-    void cancel_soft_retry_attempt(uint64_t run_epoch) noexcept;
-    void complete_soft_retry_attempt(uint64_t run_epoch) noexcept;
     void handle_execution_failure(int rc, const char *stage, uint64_t run_epoch);
+    void record_execution_quiescence(const ActiveExecution &active);
 
     // Hard fallback: bounded drain + device_unusable_, followed by force reset
     // during finalize().

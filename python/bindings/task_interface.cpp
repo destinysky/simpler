@@ -3385,6 +3385,34 @@ NB_MODULE(_task_interface, m) {
         );
 
     // --- ChipWorker ---
+    nb::enum_<ExecutionRecoveryStatus>(m, "ExecutionRecoveryStatus")
+        .value("RECOVERED", ExecutionRecoveryStatus::RECOVERED)
+        .value("ALREADY_RECOVERED", ExecutionRecoveryStatus::ALREADY_RECOVERED)
+        .value("RECOVERY_REQUIRED", ExecutionRecoveryStatus::RECOVERY_REQUIRED)
+        .value("INVALID_STATE", ExecutionRecoveryStatus::INVALID_STATE)
+        .value("BUSY", ExecutionRecoveryStatus::BUSY)
+        .value("STALE_FAILURE", ExecutionRecoveryStatus::STALE_FAILURE)
+        .value("QUIESCENCE_UNPROVEN", ExecutionRecoveryStatus::QUIESCENCE_UNPROVEN)
+        .value("DEVICE_UNUSABLE", ExecutionRecoveryStatus::DEVICE_UNUSABLE)
+        .value("UNSUPPORTED", ExecutionRecoveryStatus::UNSUPPORTED)
+        .value("CONTEXT_FAILURE", ExecutionRecoveryStatus::CONTEXT_FAILURE);
+    nb::enum_<ExecutionRecoveryScope>(m, "ExecutionRecoveryScope")
+        .value("EXECUTION_ONLY", ExecutionRecoveryScope::EXECUTION_ONLY)
+        .value("COMMUNICATION_AFFECTED", ExecutionRecoveryScope::COMMUNICATION_AFFECTED)
+        .value("DEVICE_AFFECTED", ExecutionRecoveryScope::DEVICE_AFFECTED);
+    nb::class_<ExecutionRecoveryResult>(m, "ExecutionRecoveryResult")
+        .def_ro("status", &ExecutionRecoveryResult::status)
+        .def_ro("scope", &ExecutionRecoveryResult::scope)
+        .def_ro("failed_run_epoch", &ExecutionRecoveryResult::failed_run_epoch)
+        .def_ro("original_rc", &ExecutionRecoveryResult::original_rc)
+        .def_ro("recovery_rc", &ExecutionRecoveryResult::recovery_rc)
+        .def_ro("quiesced", &ExecutionRecoveryResult::quiesced)
+        .def_ro("communication_preserved", &ExecutionRecoveryResult::communication_preserved)
+        .def_ro("communication_context", &ExecutionRecoveryResult::communication_context)
+        .def_ro("execution_context", &ExecutionRecoveryResult::execution_context)
+        .def_ro("aicpu_stream", &ExecutionRecoveryResult::aicpu_stream)
+        .def_ro("aicore_stream", &ExecutionRecoveryResult::aicore_stream);
+
     nb::class_<ChipWorker>(m, "_ChipWorker")
         .def(nb::init<>())
         .def(
@@ -3489,10 +3517,11 @@ NB_MODULE(_task_interface, m) {
             "_close_chip_run_lane", &ChipWorker::close_chip_run_lane, nb::call_guard<nb::gil_scoped_release>(),
             "Drain active native ownership, abandon unlaunched work, and close the chip run lane."
         )
+        .def("execution_recovery_state", &ChipWorker::execution_recovery_state)
         .def(
-            "_experiment2_rearm_run_lane_for_test", &ChipWorker::experiment2_rearm_run_lane_for_test,
-            nb::call_guard<nb::gil_scoped_release>(),
-            "Experiment-only: clear lane poison after a verified terminal explicit-fatal run."
+            "recover_execution", &ChipWorker::recover_execution, nb::arg("failed_run_epoch"),
+            nb::arg("scope") = ExecutionRecoveryScope::EXECUTION_ONLY, nb::call_guard<nb::gil_scoped_release>(),
+            "Explicitly rearm an execution-only failed generation without dispatch or device reset."
         )
         .def(
             "_submit_chip_run_direct",
@@ -3542,8 +3571,7 @@ NB_MODULE(_task_interface, m) {
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
                uint64_t accepted_state_addr, int32_t accepted_value, uint32_t pipeline_slot,
                uint64_t pipeline_generation, uint64_t execution_fault_sink_addr) {
-                auto *execution_fault_sink =
-                    reinterpret_cast<NativeExecutionFault *>(execution_fault_sink_addr);
+                auto *execution_fault_sink = reinterpret_cast<NativeExecutionFault *>(execution_fault_sink_addr);
                 if (pipeline_generation == 0) {
                     self.run(
                         callable_id, &args, config, reinterpret_cast<volatile int32_t *>(accepted_state_addr),
@@ -3552,8 +3580,7 @@ NB_MODULE(_task_interface, m) {
                 } else {
                     self.run_with_lease(
                         callable_id, &args, config, PipelineSlotLease{pipeline_slot, 0, pipeline_generation},
-                        reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value,
-                        execution_fault_sink
+                        reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, execution_fault_sink
                     );
                 }
             },
@@ -4181,9 +4208,8 @@ NB_MODULE(_task_interface, m) {
         "Make one dependency-aware cleanup pass and delete the record only after complete success."
     );
     m.def(
-        "_region_vmm_abandon_after_reset", &region_vmm_abandon_after_reset,
-        nb::arg("handle"), nb::call_guard<nb::gil_scoped_release>(),
-        "Forget a VMM owner only after confirmed whole-device recovery reset."
+        "_region_vmm_abandon_after_reset", &region_vmm_abandon_after_reset, nb::arg("handle"),
+        nb::call_guard<nb::gil_scoped_release>(), "Forget a VMM owner only after confirmed whole-device recovery reset."
     );
     m.def(
         "_region_vmm_zero_bytes",

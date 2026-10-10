@@ -53,6 +53,30 @@ size_t g_poll_count{0};
 // on the poll count instead of looping forever.
 size_t g_poll_completes_after{0};
 bool g_supports_successor{true};
+ExecutionRecoveryResult g_recovery;
+size_t g_recovery_calls{0};
+uint64_t g_last_epoch{0};
+
+int recovery_state(void *, ExecutionRecoveryResult *result) {
+    *result = g_recovery;
+    return 0;
+}
+
+int recover_execution(void *, uint64_t epoch, ExecutionRecoveryScope scope, ExecutionRecoveryResult *result) {
+    ++g_recovery_calls;
+    *result = g_recovery;
+    result->scope = scope;
+    if (epoch != g_recovery.failed_run_epoch) {
+        result->status = ExecutionRecoveryStatus::STALE_FAILURE;
+    } else if (g_recovery.status == ExecutionRecoveryStatus::RECOVERED) {
+        result->status = ExecutionRecoveryStatus::ALREADY_RECOVERED;
+    } else if (g_recovery.status == ExecutionRecoveryStatus::RECOVERY_REQUIRED) {
+        result->status = ExecutionRecoveryStatus::RECOVERED;
+        result->communication_preserved = 1;
+        g_recovery = *result;
+    }
+    return 0;
+}
 std::mutex g_wait_mu;
 std::condition_variable g_wait_cv;
 bool g_wait_entered{false};
@@ -65,6 +89,7 @@ int prepare_run(
     void *, void *runtime, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *descriptor
 ) {
     EXPECT_EQ(slot_of(runtime), descriptor->pipeline_slot);
+    g_last_epoch = descriptor->run_epoch;
     g_complete[descriptor->pipeline_slot] = false;
     g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
     ++g_prepare_count[descriptor->pipeline_slot];
@@ -124,6 +149,9 @@ void prime_worker(ChipWorker &worker) {
     g_poll_count = 0;
     g_poll_completes_after = 0;
     g_supports_successor = true;
+    g_recovery = {};
+    g_recovery_calls = 0;
+    g_last_epoch = 0;
     {
         std::lock_guard<std::mutex> lk(g_wait_mu);
         g_wait_entered = false;
@@ -137,6 +165,8 @@ void prime_worker(ChipWorker &worker) {
     for (uint32_t slot = 0; slot < worker.runtime_bufs_.size(); ++slot) {
         g_slots.emplace(worker.runtime_bufs_[slot].data(), slot);
     }
+    worker.execution_recovery_state_fn_ = recovery_state;
+    worker.recover_execution_fn_ = recover_execution;
     worker.prepare_run_fn_ = prepare_run;
     worker.launch_run_fn_ = launch_run;
     worker.poll_run_fn_ = poll_run;
@@ -628,5 +658,120 @@ TEST(ChipRunLaneTest, CloseDrainsAndRejectsNewSubmissions) {
     EXPECT_THROW(
         lane.submit(1, args, CallConfig{}, PipelineSlotLease{1, 0, 102}, 102, 102, nullptr, 0, true), std::runtime_error
     );
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, ExplicitRecoveryIsRequiredAndPreservesFencing) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipRun failed = submit(lane, 101, 0);
+    const uint64_t failed_epoch = g_last_epoch;
+    g_complete[0] = true;
+    g_finalize_rc[0] = 507018;
+    ASSERT_TRUE(failed.done());
+    ASSERT_TRUE(lane.poisoned());
+    EXPECT_THROW(submit(lane, 102, 1), std::runtime_error);
+    EXPECT_EQ(g_recovery_calls, 0u);
+    g_recovery.status = ExecutionRecoveryStatus::RECOVERY_REQUIRED;
+    g_recovery.failed_run_epoch = failed_epoch;
+    g_recovery.original_rc = 507018;
+    EXPECT_EQ(
+        lane.recover_execution(failed_epoch + 1, ExecutionRecoveryScope::EXECUTION_ONLY).status,
+        ExecutionRecoveryStatus::STALE_FAILURE
+    );
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_EQ(
+        lane.recover_execution(failed_epoch, ExecutionRecoveryScope::EXECUTION_ONLY).status,
+        ExecutionRecoveryStatus::RECOVERED
+    );
+    EXPECT_FALSE(lane.poisoned());
+    EXPECT_EQ(
+        lane.recover_execution(failed_epoch, ExecutionRecoveryScope::EXECUTION_ONLY).status,
+        ExecutionRecoveryStatus::ALREADY_RECOVERED
+    );
+    EXPECT_THROW(
+        lane.submit(1, ChipStorageTaskArgs{}, CallConfig{}, PipelineSlotLease{0, 0, 100}, 100, 100), std::runtime_error
+    );
+    EXPECT_THROW(worker.launch_native_run(ChipWorkerNativeRun{0, 101, failed_epoch, 101, 101}), std::runtime_error);
+    EXPECT_THROW(failed.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
+    g_finalize_rc[0] = 0;
+    ChipRun next = submit(lane, 102, 0);
+    g_complete[0] = true;
+    EXPECT_TRUE(next.done());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, RecoveryRefusesUnsafeFifoWithoutDrainingIt) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipRun queued = submit(lane, 101, 0, false);
+    const auto events = g_events;
+    EXPECT_EQ(lane.recover_execution(1, ExecutionRecoveryScope::EXECUTION_ONLY).status, ExecutionRecoveryStatus::BUSY);
+    EXPECT_EQ(g_events, events);
+    EXPECT_EQ(g_recovery_calls, 0u);
+    queued.abandon();
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, RecoveryRefusesOutstandingNativeSlotOutsideLane) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipStorageTaskArgs args{};
+    auto raw = worker.prepare_native_run(1, &args, CallConfig{}, PipelineSlotLease{0, 0, 101});
+    EXPECT_EQ(lane.recover_execution(1, ExecutionRecoveryScope::EXECUTION_ONLY).status, ExecutionRecoveryStatus::BUSY);
+    EXPECT_EQ(g_recovery_calls, 0u);
+    worker.finalize_native_run(raw);
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, FailedRecoveryRetainsPoisonAndBothFaults) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipRun failed = submit(lane, 101, 0);
+    g_complete[0] = true;
+    g_finalize_rc[0] = 42;
+    ASSERT_TRUE(failed.done());
+    g_recovery.failed_run_epoch = g_last_epoch;
+    g_recovery.status = ExecutionRecoveryStatus::QUIESCENCE_UNPROVEN;
+    g_recovery.original_rc = 42;
+    g_recovery.recovery_rc = 77;
+    auto result = lane.recover_execution(g_last_epoch, ExecutionRecoveryScope::EXECUTION_ONLY);
+    EXPECT_EQ(result.status, ExecutionRecoveryStatus::QUIESCENCE_UNPROVEN);
+    EXPECT_EQ(result.original_rc, 42);
+    EXPECT_EQ(result.recovery_rc, 77);
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_THROW(submit(lane, 102, 1), std::runtime_error);
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, RepeatedExternalFailuresDoNotConsumeL2RetryBudget) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    for (uint64_t generation = 101; generation < 104; ++generation) {
+        ChipRun failed = submit(lane, generation, 0);
+        g_complete[0] = true;
+        g_finalize_rc[0] = 13;
+        ASSERT_TRUE(failed.done());
+        g_recovery = {};
+        g_recovery.status = ExecutionRecoveryStatus::RECOVERY_REQUIRED;
+        g_recovery.failed_run_epoch = g_last_epoch;
+        g_recovery.original_rc = 13;
+        EXPECT_THROW(submit(lane, generation + 1000, 1), std::runtime_error);
+        EXPECT_EQ(
+            lane.recover_execution(g_last_epoch, ExecutionRecoveryScope::EXECUTION_ONLY).status,
+            ExecutionRecoveryStatus::RECOVERED
+        );
+    }
+    EXPECT_EQ(g_recovery_calls, 3u);
+    lane.close();
     worker.finalize();
 }

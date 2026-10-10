@@ -48,13 +48,13 @@ import _task_interface as _ti_module  # pyright: ignore[reportMissingImports]
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_FRAME_SIZE,
+    MAILBOX_NATIVE_EXECUTION_FAULT_SIZE,
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_OFF_NATIVE_EXECUTION_FAULT,
-    MAILBOX_NATIVE_EXECUTION_FAULT_SIZE,
     MAILBOX_PREPARATION_DISPOSITION_VALUES,
     MAILBOX_SIZE,
-    MAILBOX_TASK_PROTOCOL_VERSION,
     MAILBOX_STATE_VALUES,
+    MAILBOX_TASK_PROTOCOL_VERSION,
     MAX_REGISTERED_CALLABLE_IDS,
     MAX_TENSOR_DIMS,
     PROV_DESCRIPTOR_MISMATCH,
@@ -67,6 +67,9 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CoreCallable,
     DataType,
     DeviceMemoryInfo,
+    ExecutionRecoveryResult,
+    ExecutionRecoveryScope,
+    ExecutionRecoveryStatus,
     ProvenanceTable,
     RuntimeEnv,
     TaskArgs,
@@ -178,6 +181,9 @@ from .global_comm_domain import GlobalDomainAttachment, GlobalDomainBuffer, Glob
 __all__ = [
     "DataType",
     "DeviceMemoryInfo",
+    "ExecutionRecoveryResult",
+    "ExecutionRecoveryScope",
+    "ExecutionRecoveryStatus",
     "get_element_size",
     "get_dtype_name",
     "MAX_TENSOR_DIMS",
@@ -1492,6 +1498,27 @@ class ChipWorker:
                 self._callable_registry.clear()
                 self._identity_registry.clear()
                 self._live_handles.clear()
+
+    def execution_recovery_state(self):
+        """Read the failed native generation and original fault without rearming."""
+        return self._impl.execution_recovery_state()
+
+    def recover_execution(self, failed_run_epoch: int, scope=None):
+        """Explicitly rearm L2 execution; the caller owns replay and retry policy.
+
+        Communication preservation describes retained ownership, not a health
+        certificate for an affected communication domain. A caller that knows
+        communication or device scope is affected must pass that scope.
+        """
+        with self._lifecycle_lock:
+            if self._init_owner_thread is not threading.current_thread() or self._init_in_progress:
+                raise RuntimeError("ChipWorker.recover_execution() requires the init owner thread")
+        try:
+            if scope is None:
+                return self._impl.recover_execution(failed_run_epoch)
+            return self._impl.recover_execution(failed_run_epoch, scope)
+        finally:
+            _flush_host_log_or_warn("ChipWorker.recover_execution()")
 
     def recovery_finalize(self):
         """Retire this program-mode endpoint after a confirmed reset and probe."""

@@ -77,7 +77,7 @@ public:
 
     void drain();
     void close();
-    void experiment2_rearm_for_test();
+    ExecutionRecoveryResult recover_execution(uint64_t failed_run_epoch, ExecutionRecoveryScope scope);
     bool poisoned() const;
 
 private:

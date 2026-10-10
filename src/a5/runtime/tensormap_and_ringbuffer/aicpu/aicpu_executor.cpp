@@ -23,6 +23,7 @@
 #endif
 
 #include "aicpu/device_time.h"
+#include "aicpu/cache_maintenance.h"
 #include "aicpu/device_log.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/orch_so_file.h"
@@ -122,7 +123,7 @@ struct AicpuExecutor {
     std::atomic<int32_t> thread_idx_{0};
     std::atomic<bool> init_done_{false};
     std::atomic<bool> init_failed_{false};
-    std::atomic<bool> finished_{false};
+    std::atomic<bool> shutdown_failed_{false};
 
     // Parallel-handshake coordination (see AicpuExecutor::init). hs_setup_done_
     // is published by the leader once the shared pre-handshake setup is visible;
@@ -170,7 +171,7 @@ struct AicpuExecutor {
         int32_t callable_id, uint64_t dev_orch_so_addr, uint64_t dev_orch_so_size, const char *entry_symbol,
         const char *config_symbol, int32_t thread_idx
     );
-    int32_t run(Runtime *runtime);
+    int32_t run(Runtime *runtime, bool &last_thread);
     void deinit(Runtime *runtime);
 
     ~AicpuExecutor() {
@@ -488,7 +489,7 @@ int32_t AicpuExecutor::load_orch_so(
 /**
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
-int32_t AicpuExecutor::run(Runtime *runtime) {
+int32_t AicpuExecutor::run(Runtime *runtime, bool &last_thread) {
     // Prefer the filter gate's deterministic exec_idx so role assignment
     // (sched 0..N-2 / orch N-1) is driven by host-computed ALLOWED_CPUS,
     // not arrival order. Fall back to the legacy fetch-add counter on
@@ -878,29 +879,30 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // platform_deinit_aicore_regs is idempotent; orchestrator threads have
     // core_trackers_[thread_idx].core_num() == 0 so they skip the loop harmlessly.
     int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
+    if (shutdown_rc != 0) shutdown_failed_.store(true, std::memory_order_release);
     if (shutdown_rc != 0 && run_rc == 0) {
         run_rc = shutdown_rc;
     }
 
     LOG_INFO("Thread %d: Completed", thread_idx);
     LOG_INFO(
-        "[PTO_RECOVERY_PROBE] AICPU_THREAD_RUN_EXIT thread=%d shutdown_rc=%d run_rc=%d", thread_idx, shutdown_rc,
-        run_rc
+        "[PTO_RECOVERY_PROBE] AICPU_THREAD_RUN_EXIT thread=%d shutdown_rc=%d run_rc=%d", thread_idx, shutdown_rc, run_rc
     );
 
     // Check if this is the last thread to finish
+    const int32_t participant_count = aicpu_thread_num_;
     int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
     LOG_INFO(
         "[PTO_RECOVERY_PROBE] AICPU_FINISH_COUNT thread=%d finished=%d target=%d", thread_idx, prev_finished + 1,
-        aicpu_thread_num_
+        participant_count
     );
-    if (prev_finished + 1 == aicpu_thread_num_) {
+    if (prev_finished + 1 == participant_count) {
         LOG_INFO(
             "[PTO_RECOVERY_PROBE] ALL_AICPU_RUN_THREADS_EXITED count=%d callable_id=%d", aicpu_thread_num_,
             runtime->get_active_callable_id()
         );
         aicpu_publish_task_timing_tail_usage(aicpu_thread_num_);
-        finished_.store(true, std::memory_order_release);
+        last_thread = true;
         // Destroy the runtime context. sm_handle / rt are recreated every run so we
         // always tear them down here, but we keep the per-cid orch SO entries
         // alive — they are loaded once by register_callable and consumed by
@@ -929,7 +931,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     return run_rc;
 }
 
-void AicpuExecutor::deinit(Runtime * /*runtime*/) {
+void AicpuExecutor::deinit(Runtime *runtime) {
+    auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+    const bool stopped = !shutdown_failed_.load(std::memory_order_acquire) && header != nullptr &&
+                         header->execution_quiesced.load(std::memory_order_acquire) >= 0;
     LOG_INFO(
         "[PTO_RECOVERY_PROBE] AICPU_EXECUTOR_DEINIT_BEGIN aicpu_threads=%d sched_threads=%d finished_count=%d",
         aicpu_thread_num_, sched_thread_num_, finished_count_.load(std::memory_order_acquire)
@@ -963,9 +968,14 @@ void AicpuExecutor::deinit(Runtime * /*runtime*/) {
     hs_arrived_.store(0, std::memory_order_release);
     hs_thread_seq_.store(0, std::memory_order_release);
     thread_idx_.store(0, std::memory_order_release);
-    finished_.store(false, std::memory_order_release);
+    shutdown_failed_.store(false, std::memory_order_release);
 
     LOG_INFO("DeInit: AicpuExecutor reset complete");
+    if (header != nullptr) {
+        header->execution_quiesced.store(stopped ? 1 : -1, std::memory_order_release);
+        cache_flush_range(&header->execution_quiesced, sizeof(header->execution_quiesced));
+    }
+    LOG_INFO("[PTO_RECOVERY] PTO_GENERATION_STOPPED proved=%d", static_cast<int>(stopped));
     LOG_INFO("[PTO_RECOVERY_PROBE] AICPU_EXECUTOR_DEINIT_END");
 }
 
@@ -1033,9 +1043,10 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     }
 
     int32_t rc = 0;
+    bool last_thread = false;
     {
         AicpuPhaseScope graph_build(AicpuPhase::GraphBuild);
-        rc = g_aicpu_executor.run(runtime);
+        rc = g_aicpu_executor.run(runtime, last_thread);
     }
     if (rc != 0) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
@@ -1050,7 +1061,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     // read_runtime_status is two atomic loads every thread needs, so it stays
     // outside the scope.
     int32_t runtime_rc = read_runtime_status(runtime);
-    if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
+    if (last_thread) {
         AicpuPhaseScope post_orch(AicpuPhase::PostOrch);
         LOG_INFO("aicpu_execute: Last thread finished, cleaning up");
         g_aicpu_executor.deinit(runtime);

@@ -40,6 +40,8 @@ from simpler.task_interface import (
     CallConfig,
     ChipCallable,
     CoreCallable,
+    ExecutionRecoveryScope,
+    ExecutionRecoveryStatus,
     _flush_host_log,
     _host_log_dropped_records,
 )
@@ -407,9 +409,8 @@ def test_a5_explicit_fatal_quiescence_probe(st_platform, st_device_ids, monkeypa
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.timeout(90)
 def test_a5_explicit_fatal_same_stream_reuse_probe(st_platform, st_device_ids, monkeypatch, capfd):
-    """Experiment 2: healthy -> explicit fatal -> healthy on one Worker and one stream pair."""
+    """Explicit recovery preserves one Worker, both Contexts, and execution streams."""
     configure_logging("info")
-    monkeypatch.setenv("SIMPLER_EXPERIMENT2_PROBE", "1")
 
     healthy_callable = _build_chip_callable(
         st_platform,
@@ -428,75 +429,119 @@ def test_a5_explicit_fatal_same_stream_reuse_probe(st_platform, st_device_ids, m
     config = CallConfig()
     config.aicpu_thread_num = 2
     try:
-        print("[PTO_RECOVERY_EXP2] RUN1_HEALTHY_BEGIN", flush=True)
+        print("[PTO_RECOVERY_TEST] RUN1_HEALTHY_BEGIN", flush=True)
         worker.run(healthy_handle, None, config)
-        print("[PTO_RECOVERY_EXP2] RUN1_HEALTHY_END", flush=True)
+        print("[PTO_RECOVERY_TEST] RUN1_HEALTHY_END", flush=True)
+        native_worker = worker._chip_worker
+        before = native_worker.execution_recovery_state()
 
         dropped_before = _host_log_dropped_records()
-        print("[PTO_RECOVERY_EXP2] RUN2_EXPLICIT_FATAL_BEGIN", flush=True)
+        print("[PTO_RECOVERY_TEST] RUN2_EXPLICIT_FATAL_BEGIN", flush=True)
         with pytest.raises(RuntimeError):
             worker.run(fatal_handle, None, config)
-        _wait_for_host_log(
+        fatal_log = _wait_for_host_log(
             capfd,
             (
-                "[PTO_RECOVERY] SOFT_RETRY_ARMED",
+                "[PTO_RECOVERY] EXECUTION_RECOVERY_REQUIRED",
                 CASES["explicit_fatal"]["marker"],
                 CASES["explicit_fatal"]["explain"],
             ),
             dropped_before,
         )
-        print("[PTO_RECOVERY_EXP2] RUN2_EXPLICIT_FATAL_END", flush=True)
+        print("[PTO_RECOVERY_TEST] RUN2_EXPLICIT_FATAL_END", flush=True)
 
-        # No Worker, DeviceRunner or execution stream is recreated here.
-        # The next submit automatically consumes the one-shot soft-retry credit
-        # after FIFO-empty + native-slot-empty structural checks.
-        print("[PTO_RECOVERY_EXP2] RUN3_HEALTHY_SAME_STREAM_BEGIN", flush=True)
+        with pytest.raises(RuntimeError, match="poisoned"):
+            worker.run(healthy_handle, None, config)
+        recovered = _recover_retired_generation(native_worker)
+        _assert_execution_identities(before, recovered)
+        print("[PTO_RECOVERY_TEST] RUN3_HEALTHY_SAME_STREAM_BEGIN", flush=True)
         worker.run(healthy_handle, None, config)
-        print("[PTO_RECOVERY_EXP2] RUN3_HEALTHY_SAME_STREAM_END", flush=True)
+        print("[PTO_RECOVERY_TEST] RUN3_HEALTHY_SAME_STREAM_END", flush=True)
 
         _flush_host_log(2000)
+        captured = capfd.readouterr()
+        assert "507014" not in fatal_log + captured.out + captured.err
     finally:
         worker.close()
         _flush_host_log(2000)
+    with capfd.disabled():
+        print("[PTO_RECOVERY_TEST] SAME_CONTEXT_STREAM_RECOVERY_PASS", flush=True)
 
 
 @pytest.mark.platforms(["a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.timeout(120)
-def test_a5_soft_retry_second_failure_falls_back(st_platform, st_device_ids, monkeypatch, capfd):
-    """The retry itself may fail once; that failure must fall back to hard recovery."""
+def test_a5_persistent_failure_requires_external_dispatch(st_platform, st_device_ids, monkeypatch, capfd):
+    """L2 rearms explicitly; a second external dispatch reports an independent fault."""
     configure_logging("info")
-    monkeypatch.setenv("SIMPLER_EXPERIMENT2_PROBE", "1")
-
     fatal_callable = _build_chip_callable(st_platform, CASES["explicit_fatal"])
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
     fatal_handle = worker.register(fatal_callable)
     worker.init()
-
     config = CallConfig()
     config.aicpu_thread_num = 2
     try:
-        dropped_before = _host_log_dropped_records()
         with pytest.raises(RuntimeError):
             worker.run(fatal_handle, None, config)
-        _wait_for_host_log(
-            capfd,
-            ("[PTO_RECOVERY] SOFT_RETRY_ARMED", CASES["explicit_fatal"]["explain"]),
-            dropped_before,
-        )
-
-        dropped_before = _host_log_dropped_records()
+        native_worker = worker._chip_worker
+        first = _recover_retired_generation(native_worker)
         with pytest.raises(RuntimeError):
             worker.run(fatal_handle, None, config)
-        _wait_for_host_log(
-            capfd,
-            ("[PTO_RECOVERY] SOFT_RETRY_FAILED", "fallback=hard_reset"),
-            dropped_before,
-        )
+        second = native_worker.execution_recovery_state()
+        assert second.status == ExecutionRecoveryStatus.RECOVERY_REQUIRED
+        assert second.failed_run_epoch > first.failed_run_epoch
+        assert second.original_rc == 507018
+        assert second.quiesced == 1
+        stale = native_worker.recover_execution(first.failed_run_epoch)
+        assert stale.status == ExecutionRecoveryStatus.STALE_FAILURE
+        with pytest.raises(RuntimeError, match="poisoned"):
+            worker.run(fatal_handle, None, config)
+        print("[PTO_RECOVERY_TEST] SECOND_EXTERNAL_DISPATCH_FAILED", flush=True)
+        # The caller ends this episode. close() invokes terminal fatal cleanup.
     finally:
         worker.close()
         _flush_host_log(2000)
+    captured = capfd.readouterr()
+    log = captured.out + captured.err
+    assert "SECOND_EXTERNAL_DISPATCH_FAILED" in log
+    assert "force_reset_device: aclrtResetDeviceForce" in log
+    assert "507014" not in log
+    assert "SOFT_RETRY" not in log
+    with capfd.disabled():
+        print("[PTO_RECOVERY_TEST] PERSISTENT_EXTERNAL_DISPATCH_PASS", flush=True)
+
+
+def _assert_execution_identities(before, after):
+    for field in ("communication_context", "execution_context", "aicpu_stream", "aicore_stream"):
+        assert getattr(before, field) != 0
+        assert getattr(before, field) == getattr(after, field), field
+    assert after.communication_context != after.execution_context
+
+
+def _recover_retired_generation(native_worker):
+    failed = native_worker.execution_recovery_state()
+    assert failed.status == ExecutionRecoveryStatus.RECOVERY_REQUIRED
+    assert failed.failed_run_epoch != 0
+    assert failed.original_rc == 507018
+    assert failed.quiesced == 1
+    refused_scope = native_worker.recover_execution(
+        failed.failed_run_epoch, ExecutionRecoveryScope.COMMUNICATION_AFFECTED
+    )
+    assert refused_scope.status == ExecutionRecoveryStatus.UNSUPPORTED
+    stale = native_worker.recover_execution(failed.failed_run_epoch + 1)
+    assert stale.status == ExecutionRecoveryStatus.STALE_FAILURE
+    recovered = native_worker.recover_execution(failed.failed_run_epoch)
+    assert recovered.status == ExecutionRecoveryStatus.RECOVERED
+    assert recovered.original_rc == failed.original_rc
+    assert recovered.recovery_rc == 0
+    assert recovered.communication_preserved == 1
+    _assert_execution_identities(failed, recovered)
+    duplicate = native_worker.recover_execution(failed.failed_run_epoch)
+    assert duplicate.status == ExecutionRecoveryStatus.ALREADY_RECOVERED
+    _assert_execution_identities(recovered, duplicate)
+    print("[PTO_RECOVERY_TEST] EXPLICIT_RECOVERY_CONTRACT_PASS", flush=True)
+    return recovered
 
 
 def _exp3_plain_snapshot(native_worker, comm_handle: int, allocation_id: int) -> dict[str, int]:
@@ -511,7 +556,6 @@ def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_que
     allocation_live = False
     try:
         configure_logging("info")
-        os.environ["SIMPLER_EXPERIMENT2_PROBE"] = "1"
         healthy_callable = _build_chip_callable(
             "a5",
             {
@@ -543,6 +587,7 @@ def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_que
         config.aicpu_thread_num = 2
         worker.run(healthy_handle, None, config)
         before = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
+        execution_before = native_worker.execution_recovery_state()
 
         try:
             worker.run(fatal_handle, None, config)
@@ -551,9 +596,15 @@ def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_que
         else:
             raise AssertionError("Experiment 3 explicit-fatal run unexpectedly succeeded")
         after_fault = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
+        with pytest.raises(RuntimeError, match="poisoned"):
+            worker.run(healthy_handle, None, config)
+        recovered = _recover_retired_generation(native_worker)
+        _assert_execution_identities(execution_before, recovered)
+        after_recovery = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
 
         worker.run(healthy_handle, None, config)
         after_retry = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
+        _assert_execution_identities(recovered, native_worker.execution_recovery_state())
 
         # Release is intentionally part of the experiment: a dynamic allocation
         # that survives recovery but cannot be collectively reclaimed is not a
@@ -573,6 +624,7 @@ def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_que
                 "device_id": device_id,
                 "before": before,
                 "after_fault": after_fault,
+                "after_recovery": after_recovery,
                 "after_retry": after_retry,
                 "after_release": after_release,
             }
@@ -599,7 +651,7 @@ def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_que
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.timeout(240)
 def test_a5_explicit_fatal_preserves_comm_domain(st_device_ids, tmp_path):
-    """Experiment 3: communication ownership/queue view survives execution-only soft recovery."""
+    """Communication ownership and empty queues survive explicit execution recovery."""
     assert len(st_device_ids) == 2
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
@@ -646,26 +698,29 @@ def test_a5_explicit_fatal_preserves_comm_domain(st_device_ids, tmp_path):
         "queue_signature",
     )
     for result in results:
-        snapshots = [result["before"], result["after_fault"], result["after_retry"]]
+        snapshots = [result["before"], result["after_fault"], result["after_recovery"], result["after_retry"]]
         for snapshot in snapshots:
             assert snapshot["version"] == 1
             assert snapshot["workspace_kind"] in (1, 2), snapshot
             assert snapshot["domain_allocation_count"] == 1, snapshot
             assert snapshot["allocation_present"] == 1, snapshot
             assert snapshot["peer_window_count"] == 1, snapshot
-            assert snapshot["active_queue_count"] > 0, snapshot
+            assert snapshot["active_queue_count"] == 48, snapshot
             assert snapshot["queue_read_errors"] == 0, snapshot
             assert snapshot["all_queues_empty"] == 1, snapshot
             assert snapshot["hccl_comm_identity"] != 0, snapshot
             assert snapshot["comm_stream_identity"] != 0, snapshot
             assert snapshot["workspace_addr"] != 0, snapshot
         for field in stable_identity_fields:
-            assert snapshots[0][field] == snapshots[1][field] == snapshots[2][field], (
-                result["rank"], field, [snapshot[field] for snapshot in snapshots]
+            assert all(snapshot[field] == snapshots[0][field] for snapshot in snapshots), (
+                result["rank"],
+                field,
+                [snapshot[field] for snapshot in snapshots],
             )
         released = result["after_release"]
         assert released["domain_allocation_count"] == 0, released
         assert released["allocation_present"] == 0, released
+    print("[PTO_RECOVERY_TEST] COMMUNICATION_PRESERVATION_PASS", flush=True)
 
 
 # The orchestrator fatals before any task completes, so this case leaves the

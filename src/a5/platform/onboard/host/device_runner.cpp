@@ -54,10 +54,8 @@ bool experiment2_env_enabled(const char *name) {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
-bool experiment2_probe_enabled() {
-    return experiment2_env_enabled("SIMPLER_EXPERIMENT2_PROBE");
-}
-}
+bool experiment2_probe_enabled() { return experiment2_env_enabled("SIMPLER_EXPERIMENT2_PROBE"); }
+}  // namespace
 
 // dep_gen has two shapes, one per orchestration site, and each runtime provides
 // the strong symbols for the one it uses:
@@ -96,6 +94,10 @@ extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip
 ) noexcept {
     return true;
 }
+
+// A runtime supplies the address of its per-run cooperative-stop publication.
+// Missing publication is an unsupported recovery capability, not a stop proof.
+extern "C" __attribute__((weak, visibility("hidden"))) void *execution_quiescence_flag(Runtime *) { return nullptr; }
 
 // =============================================================================
 // DeviceRunner Implementation
@@ -311,13 +313,10 @@ int DeviceRunner::prepare_execution(
     DfxRunConfig &dfx = execution->dfx;
     execution->resources_owned = true;
 
-    const bool soft_retry_attempt = claim_soft_retry_attempt(identity.run_epoch);
-    bool prepare_succeeded = false;
-    auto soft_retry_prepare_guard = RAIIScopeGuard([this, soft_retry_attempt, &prepare_succeeded, &identity]() {
-        if (soft_retry_attempt && !prepare_succeeded) {
-            handle_execution_failure(PTO_RUNTIME_ERR_INTERNAL, "prepare", identity.run_epoch);
-        }
-    });
+    if (execution_recovery_required_.load(std::memory_order_acquire)) {
+        LOG_WARN("[PTO_RECOVERY] EXECUTION_ADMISSION_FENCED");
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
 
     auto prepare_rollback = RAIIScopeGuard([this, &execution]() {
         cleanup_execution(*execution, /*launched=*/false);
@@ -478,9 +477,14 @@ int DeviceRunner::prepare_execution(
     }
     execution->num_aicore = num_aicore;
     execution->launch_aicpu_num = active_aicpu_num;
+    // The pooled SM may still contain a prior generation's stop publication.
+    // Clearing it precedes every launch, including failed-init generations.
+    if (void *flag = execution_quiescence_flag(&runtime); flag != nullptr) {
+        const int32_t pending = 0;
+        rc = copy_to_device(flag, &pending, sizeof(pending));
+        if (rc != 0) return rc;
+    }
     prepare_rollback.dismiss();
-    prepare_succeeded = true;
-    soft_retry_prepare_guard.dismiss();
     *prepared = std::move(execution);
     return 0;
 }
@@ -489,6 +493,11 @@ DeviceRunnerBase::LaunchOutcome
 DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) {
     LaunchOutcome outcome;
     if (prepared == nullptr) return outcome;
+    if (!execution_admission_open()) {
+        outcome.rc = PTO_RUNTIME_ERR_INVALID_STATE;
+        outcome.prepared = std::move(prepared);
+        return outcome;
+    }
 
     Runtime &runtime = *prepared->runtime;
     const int num_aicore = prepared->num_aicore;
@@ -644,10 +653,10 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         static_cast<unsigned long long>(prepared.identity.dispatch_id), rc
     );
     if (rc != 0) {
-        // Error-code agnostic: preserve E for exactly one subsequent execution
-        // attempt. Do not issue a device-wide synchronize here; it can replay
-        // the failed task status into otherwise reusable execution state.
+        // Stream status is diagnostic. Cooperative-stop publication supplies
+        // the quiescence fact without a device-wide synchronization.
         handle_execution_failure(rc, "drain", prepared.identity.run_epoch);
+        record_execution_quiescence(active);
         // Emergency shutdown may already have flushed diagnostics. Export the
         // manifest on the error path exactly once.
         if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
@@ -658,7 +667,6 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         return rc;
     }
 
-    complete_soft_retry_attempt(prepared.identity.run_epoch);
     read_device_wall_ns();
     if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
@@ -713,88 +721,125 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched)
 }
 
 void DeviceRunner::abandon_prepared_execution(PreparedExecution &prepared) noexcept {
-    cancel_soft_retry_attempt(prepared.identity.run_epoch);
     cleanup_execution(prepared, /*launched=*/false);
 }
 
-bool DeviceRunner::claim_soft_retry_attempt(uint64_t run_epoch) {
-    SoftRetryState expected = SoftRetryState::Pending;
-    if (!soft_retry_state_.compare_exchange_strong(
-            expected, SoftRetryState::InProgress, std::memory_order_acq_rel, std::memory_order_acquire
-        )) {
-        return false;
-    }
-    soft_retry_run_epoch_.store(run_epoch, std::memory_order_release);
-    LOG_WARN("[PTO_RECOVERY] SOFT_RETRY_BEGIN run_epoch=%llu", static_cast<unsigned long long>(run_epoch));
-    return true;
-}
-
-bool DeviceRunner::is_soft_retry_attempt(uint64_t run_epoch) const {
-    return soft_retry_state_.load(std::memory_order_acquire) == SoftRetryState::InProgress &&
-           soft_retry_run_epoch_.load(std::memory_order_acquire) == run_epoch;
-}
-
-void DeviceRunner::cancel_soft_retry_attempt(uint64_t run_epoch) noexcept {
-    if (!is_soft_retry_attempt(run_epoch)) return;
-    soft_retry_run_epoch_.store(0, std::memory_order_release);
-    soft_retry_state_.store(SoftRetryState::Pending, std::memory_order_release);
-    LOG_WARN("[PTO_RECOVERY] SOFT_RETRY_CANCELLED run_epoch=%llu", static_cast<unsigned long long>(run_epoch));
-}
-
-void DeviceRunner::complete_soft_retry_attempt(uint64_t run_epoch) noexcept {
-    if (!is_soft_retry_attempt(run_epoch)) return;
-    soft_retry_run_epoch_.store(0, std::memory_order_release);
-    soft_retry_state_.store(SoftRetryState::Idle, std::memory_order_release);
-    LOG_WARN("[PTO_RECOVERY] SOFT_RETRY_SUCCEEDED run_epoch=%llu", static_cast<unsigned long long>(run_epoch));
-}
-
 void DeviceRunner::handle_execution_failure(int rc, const char *stage, uint64_t run_epoch) {
-    if (device_unusable_.load(std::memory_order_acquire)) {
-        LOG_INFO(
-            "[PTO_RECOVERY] HARD_FALLBACK_ALREADY_ARMED stage=%s rc=%d run_epoch=%llu",
-            stage, rc, static_cast<unsigned long long>(run_epoch)
-        );
-        return;
+    std::lock_guard<std::mutex> lk(execution_recovery_mu_);
+    if (!execution_recovery_required_.load(std::memory_order_acquire)) {
+        execution_recovery_ = ExecutionRecoveryResult{};
+        execution_recovery_.status = ExecutionRecoveryStatus::RECOVERY_REQUIRED;
+        execution_recovery_.failed_run_epoch = run_epoch;
+        execution_recovery_.original_rc = rc;
+        execution_quiescence_supported_ = false;
+        execution_recovery_required_.store(true, std::memory_order_release);
     }
-
-    const SoftRetryState state = soft_retry_state_.load(std::memory_order_acquire);
-    if (state == SoftRetryState::InProgress) {
-        LOG_ERROR(
-            "[PTO_RECOVERY] SOFT_RETRY_FAILED stage=%s rc=%d run_epoch=%llu fallback=hard_reset",
-            stage, rc, static_cast<unsigned long long>(run_epoch)
-        );
-        soft_retry_run_epoch_.store(0, std::memory_order_release);
-        soft_retry_state_.store(SoftRetryState::Idle, std::memory_order_release);
-        recover_device_or_mark_unusable(rc);
-        return;
-    }
-
-    SoftRetryState expected = SoftRetryState::Idle;
-    if (soft_retry_state_.compare_exchange_strong(
-            expected, SoftRetryState::Pending, std::memory_order_acq_rel, std::memory_order_acquire
-        )) {
-        LOG_WARN(
-            "[PTO_RECOVERY] SOFT_RETRY_ARMED stage=%s rc=%d run_epoch=%llu device_sync_skipped=1",
-            stage, rc, static_cast<unsigned long long>(run_epoch)
-        );
-        return;
-    }
-
-    // The same failed generation can be observed again during finalization.
-    // Pending already owns the one retry credit; duplicate reports are benign.
-    if (expected == SoftRetryState::Pending) {
-        LOG_INFO(
-            "[PTO_RECOVERY] SOFT_RETRY_ALREADY_ARMED stage=%s rc=%d run_epoch=%llu",
-            stage, rc, static_cast<unsigned long long>(run_epoch)
-        );
-        return;
-    }
-
-    LOG_ERROR(
-        "[PTO_RECOVERY] recovery-state conflict stage=%s rc=%d run_epoch=%llu; falling back",
-        stage, rc, static_cast<unsigned long long>(run_epoch)
+    LOG_WARN(
+        "[PTO_RECOVERY] EXECUTION_RECOVERY_REQUIRED stage=%s rc=%d run_epoch=%llu device_sync_skipped=1", stage, rc,
+        static_cast<unsigned long long>(run_epoch)
     );
-    recover_device_or_mark_unusable(rc);
+}
+
+void DeviceRunner::record_execution_quiescence(const ActiveExecution &active) {
+    const PreparedExecution &prepared = *active.prepared;
+    void *flag = execution_quiescence_flag(prepared.runtime);
+    int32_t proof = 0;
+    const int proof_rc = flag == nullptr ? PTO_RUNTIME_ERR_UNSUPPORTED : copy_from_device(&proof, flag, sizeof(proof));
+    std::lock_guard<std::mutex> lk(execution_recovery_mu_);
+    if (execution_recovery_.failed_run_epoch != prepared.identity.run_epoch) return;
+    execution_quiescence_supported_ = flag != nullptr;
+    execution_recovery_.quiesced = active.progress == LaunchProgress::Complete && proof_rc == 0 && proof == 1 ? 1 : 0;
+    execution_recovery_.recovery_rc = proof_rc;
+    LOG_WARN(
+        "[PTO_RECOVERY] EXECUTION_QUIESCENCE run_epoch=%llu proved=%u proof_rc=%d",
+        static_cast<unsigned long long>(prepared.identity.run_epoch), execution_recovery_.quiesced, proof_rc
+    );
+}
+
+ExecutionRecoveryResult DeviceRunner::execution_recovery_state() const {
+    std::lock_guard<std::mutex> lk(execution_recovery_mu_);
+    ExecutionRecoveryResult result = execution_recovery_;
+    result.communication_context = reinterpret_cast<uint64_t>(default_rt_context_);
+    result.execution_context = reinterpret_cast<uint64_t>(execution_rt_context_);
+    result.aicpu_stream = reinterpret_cast<uint64_t>(stream_aicpu_);
+    result.aicore_stream = reinterpret_cast<uint64_t>(stream_aicore_);
+    return result;
+}
+
+ExecutionRecoveryResult DeviceRunner::recover_execution(uint64_t failed_run_epoch, ExecutionRecoveryScope scope) {
+    // Reservation ownership also fences callers that bypass ChipRunLane.
+    std::lock_guard<std::mutex> native_lk(native_run_mu_);
+    std::lock_guard<std::mutex> recovery_lk(execution_recovery_mu_);
+    ExecutionRecoveryResult result = execution_recovery_;
+    result.scope = scope;
+    result.communication_context = reinterpret_cast<uint64_t>(default_rt_context_);
+    result.execution_context = reinterpret_cast<uint64_t>(execution_rt_context_);
+    result.aicpu_stream = reinterpret_cast<uint64_t>(stream_aicpu_);
+    result.aicore_stream = reinterpret_cast<uint64_t>(stream_aicore_);
+    auto reject = [&](ExecutionRecoveryStatus status, int rc) {
+        result.status = status;
+        result.recovery_rc = rc;
+        result.communication_preserved = 0;
+        LOG_WARN(
+            "[PTO_RECOVERY] EXECUTION_RECOVERY_FAILED run_epoch=%llu status=%u original_rc=%d recovery_rc=%d",
+            static_cast<unsigned long long>(failed_run_epoch), static_cast<unsigned>(status), result.original_rc, rc
+        );
+        return result;
+    };
+    if (scope != ExecutionRecoveryScope::EXECUTION_ONLY || execution_mode_latch().is_kernel()) {
+        return reject(ExecutionRecoveryStatus::UNSUPPORTED, PTO_RUNTIME_ERR_UNSUPPORTED);
+    }
+    if (device_id_ < 0 || failed_run_epoch == 0) {
+        return reject(ExecutionRecoveryStatus::INVALID_STATE, PTO_RUNTIME_ERR_INVALID_STATE);
+    }
+    if (failed_run_epoch != execution_recovery_.failed_run_epoch) {
+        return reject(ExecutionRecoveryStatus::STALE_FAILURE, PTO_RUNTIME_ERR_INVALID_STATE);
+    }
+    if (active_native_run_ != nullptr) {
+        return reject(ExecutionRecoveryStatus::BUSY, PTO_RUNTIME_ERR_INVALID_STATE);
+    }
+    for (const auto &reservation : native_run_reservations_) {
+        if (reservation.owner != nullptr) return reject(ExecutionRecoveryStatus::BUSY, PTO_RUNTIME_ERR_INVALID_STATE);
+    }
+    if (device_unusable_.load(std::memory_order_acquire)) {
+        return reject(ExecutionRecoveryStatus::DEVICE_UNUSABLE, PTO_RUNTIME_ERR_INVALID_STATE);
+    }
+    if (!execution_recovery_required_.load(std::memory_order_acquire)) {
+        if (recovered_run_epoch_ != failed_run_epoch) {
+            return reject(ExecutionRecoveryStatus::INVALID_STATE, PTO_RUNTIME_ERR_INVALID_STATE);
+        }
+        result.status = ExecutionRecoveryStatus::ALREADY_RECOVERED;
+        return result;
+    }
+    if (!execution_quiescence_supported_) {
+        return reject(ExecutionRecoveryStatus::UNSUPPORTED, PTO_RUNTIME_ERR_UNSUPPORTED);
+    }
+    if (result.quiesced == 0 || run_poll_state_.load(std::memory_order_acquire) != RunPollState::Drained) {
+        return reject(
+            ExecutionRecoveryStatus::QUIESCENCE_UNPROVEN,
+            result.recovery_rc != 0 ? result.recovery_rc : PTO_RUNTIME_ERR_INVALID_STATE
+        );
+    }
+    if (default_rt_context_ == nullptr || execution_rt_context_ == nullptr ||
+        default_rt_context_ == execution_rt_context_ || stream_aicpu_ == nullptr || stream_aicore_ == nullptr) {
+        return reject(ExecutionRecoveryStatus::INVALID_STATE, PTO_RUNTIME_ERR_INVALID_STATE);
+    }
+    const int bind_rc = attach_current_thread(device_id_);
+    if (bind_rc != 0) return reject(ExecutionRecoveryStatus::CONTEXT_FAILURE, bind_rc);
+
+    result.status = ExecutionRecoveryStatus::RECOVERED;
+    result.recovery_rc = 0;
+    result.communication_preserved = 1;
+    recovered_run_epoch_ = failed_run_epoch;
+    execution_recovery_ = result;
+    execution_recovery_required_.store(false, std::memory_order_release);
+    LOG_WARN(
+        "[PTO_RECOVERY] EXECUTION_RECOVERED run_epoch=%llu original_rc=%d communication_preserved=1 "
+        "context_c=%p context_e=%p aicpu=%p aicore=%p",
+        static_cast<unsigned long long>(failed_run_epoch), result.original_rc, default_rt_context_,
+        execution_rt_context_, stream_aicpu_, stream_aicore_
+    );
+    return result;
 }
 
 void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
@@ -940,8 +985,10 @@ int DeviceRunner::force_reset_device() {
             // here so it cannot be misattributed to a later unrelated failure.
             const char *recent = aclGetRecentErrMsg();
 
-            LOG_DEBUG("force_reset_device: best-effort pre-reset drain failed: %d%s%s", static_cast<int>(drain_rc),
-                    recent != nullptr && recent[0] != '\0' ? " recent=" : "", recent != nullptr ? recent : "");
+            LOG_DEBUG(
+                "force_reset_device: best-effort pre-reset drain failed: %d%s%s", static_cast<int>(drain_rc),
+                recent != nullptr && recent[0] != '\0' ? " recent=" : "", recent != nullptr ? recent : ""
+            );
         }
         aclError rc = aclrtResetDeviceForce(device_id_);
         if (rc != ACL_SUCCESS) {
@@ -1019,7 +1066,11 @@ int DeviceRunner::finalize() {
     if (device_id_ == -1) {
         return 0;
     }
-    if (device_unusable_.load(std::memory_order_acquire)) {
+    if (device_unusable_.load(std::memory_order_acquire) ||
+        execution_recovery_required_.load(std::memory_order_acquire)) {
+        // An unresolved operator fault reaches terminal cleanup; reset does
+        // not participate in the in-place recovery success/failure contract.
+        device_unusable_.store(true, std::memory_order_release);
         return retire_execution_generation(TeardownReason::FatalDeviceFailure);
     }
     return finalize_healthy();
@@ -1045,8 +1096,7 @@ int DeviceRunner::retire_execution_generation(TeardownReason reason) {
         sdma_provisioned ? 1 : kFatalResetAttempts
     );
     const bool reset_confirmed = reset_rc == 0;
-    const char *reason_name =
-        reason == TeardownReason::OperatorRecovery ? "Operator recovery" : "Fatal teardown";
+    const char *reason_name = reason == TeardownReason::OperatorRecovery ? "Operator recovery" : "Fatal teardown";
     if (!reset_confirmed) {
         LOG_ERROR(
             "%s: force reset of device %d did not confirm clean (rc=%d); "

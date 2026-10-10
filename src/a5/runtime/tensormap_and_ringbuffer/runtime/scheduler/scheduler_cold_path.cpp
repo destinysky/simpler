@@ -641,8 +641,7 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
     int32_t core_num = core_trackers_[thread_idx].core_num();
     if (core_num == 0) {
         LOG_INFO(
-            "[PTO_RECOVERY_PROBE] AICORE_SHUTDOWN thread=%d total=0 acked=0 timed_out=0 invalid=0 rc=0",
-            thread_idx
+            "[PTO_RECOVERY_PROBE] AICORE_SHUTDOWN thread=%d total=0 acked=0 timed_out=0 invalid=0 rc=0", thread_idx
         );
         return 0;
     }
@@ -674,11 +673,12 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
         } else {
             LOG_ERROR("Thread %d: Core %d has invalid register address", thread_idx, core_id);
             ++invalid_count;
+            rc = -1;
         }
     }
     LOG_INFO(
-        "[PTO_RECOVERY_PROBE] AICORE_SHUTDOWN thread=%d total=%d acked=%d timed_out=%d invalid=%d rc=%d",
-        thread_idx, core_num, acked_count, timeout_count, invalid_count, rc
+        "[PTO_RECOVERY_PROBE] AICORE_SHUTDOWN thread=%d total=%d acked=%d timed_out=%d invalid=%d rc=%d", thread_idx,
+        core_num, acked_count, timeout_count, invalid_count, rc
     );
     return rc;
 }
@@ -1072,7 +1072,6 @@ bool SchedulerContext::assign_cores_to_threads() {
 // deinit their AICore register blocks. Idempotent.
 // =============================================================================
 void SchedulerContext::emergency_shutdown(Runtime *runtime) {
-    (void)runtime;  // exit is now delivered via each core's register block, not GM
     LOG_WARN("Emergency shutdown: sending exit signal to all initialized cores");
     int32_t initialized_count = 0;
     int32_t acked_count = 0;
@@ -1093,6 +1092,8 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
     }
     if (timeout_count > 0) {
         LOG_ERROR("Emergency shutdown: %d cores did not acknowledge exit", timeout_count);
+        auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
+        if (header != nullptr) header->execution_quiesced.store(-1, std::memory_order_release);
     }
     LOG_INFO(
         "[PTO_RECOVERY_PROBE] AICORE_EMERGENCY_SHUTDOWN total=%d initialized=%d acked=%d timed_out=%d "

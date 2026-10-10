@@ -237,6 +237,11 @@ void ChipWorker::init(
             load_symbol<GetAicpuDlopenCountFn>(handle, "get_run_stream_set_create_count");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
         recovery_finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "recovery_finalize_device");
+        // Optional capabilities permit backends without in-place recovery.
+        execution_recovery_state_fn_ =
+            reinterpret_cast<decltype(execution_recovery_state_fn_)>(dlsym(handle, "get_execution_recovery_state_ctx"));
+        recover_execution_fn_ =
+            reinterpret_cast<decltype(recover_execution_fn_)>(dlsym(handle, "recover_execution_ctx"));
         // ACL lifecycle + comm_* + kernel mode are part of the uniform
         // host_runtime.so ABI. Every platform runtime exports all of them —
         // runtimes that do not have a real backend (today: a5 for comm, every
@@ -380,6 +385,8 @@ void ChipWorker::init(
         get_run_stream_set_create_count_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
         recovery_finalize_device_fn_ = nullptr;
+        execution_recovery_state_fn_ = nullptr;
+        recover_execution_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
         create_comm_stream_fn_ = nullptr;
         destroy_comm_stream_fn_ = nullptr;
@@ -443,6 +450,8 @@ void ChipWorker::init(
         get_run_stream_set_create_count_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
         recovery_finalize_device_fn_ = nullptr;
+        execution_recovery_state_fn_ = nullptr;
+        recover_execution_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
         create_comm_stream_fn_ = nullptr;
         destroy_comm_stream_fn_ = nullptr;
@@ -562,6 +571,8 @@ void ChipWorker::finalize_impl(bool recovery) {
     get_run_stream_set_create_count_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
     recovery_finalize_device_fn_ = nullptr;
+    execution_recovery_state_fn_ = nullptr;
+    recover_execution_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
     create_comm_stream_fn_ = nullptr;
     destroy_comm_stream_fn_ = nullptr;
@@ -614,8 +625,7 @@ void ChipWorker::run(
     int32_t accepted_value, NativeExecutionFault *execution_fault_sink
 ) {
     if (args == nullptr) throw std::runtime_error("run requires task args");
-    ChipRun run =
-        submit_chip_run(callable_id, *args, config, accepted_state, accepted_value, execution_fault_sink);
+    ChipRun run = submit_chip_run(callable_id, *args, config, accepted_state, accepted_value, execution_fault_sink);
     (void)run.wait_until(ChipRun::Deadline::max());
 }
 
@@ -757,11 +767,10 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
 
     int rc = -1;
     try {
-        const NativeRunDescriptor descriptor{slot_id,        arena_bank_for_slot(slot_id),
-                                             run_id,         generation,
-                                             dispatch_id,    run_epoch,
-                                             accepted_state, accepted_value,
-                                             execution_fault_sink};
+        const NativeRunDescriptor descriptor{
+            slot_id,        arena_bank_for_slot(slot_id), run_id, generation, dispatch_id, run_epoch, accepted_state,
+            accepted_value, execution_fault_sink
+        };
         rc = prepare_run_fn_(device_ctx_, runtime_bufs_[slot_id].data(), callable_id, args, &config, &descriptor);
     } catch (...) {
         std::lock_guard<std::mutex> lk(native_run_mu_);
@@ -832,33 +841,52 @@ void ChipWorker::close_chip_run_lane() {
     if (run_lane_ != nullptr) run_lane_->close();
 }
 
-void ChipWorker::experiment2_rearm_run_lane_for_test() {
-    if (!initialized_) {
-        throw std::runtime_error("experiment2 rearm requires an initialized ChipWorker");
+ExecutionRecoveryResult ChipWorker::execution_recovery_state() const {
+    ExecutionRecoveryResult result;
+    if (!initialized_) return result;
+    if (execution_recovery_state_fn_ == nullptr) {
+        result.status = ExecutionRecoveryStatus::UNSUPPORTED;
+        result.recovery_rc = PTO_RUNTIME_ERR_UNSUPPORTED;
+        return result;
     }
-    {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        for (size_t slot_id = 0; slot_id < native_run_states_.size(); ++slot_id) {
-            if (native_run_states_[slot_id].phase != NativeRunPhase::EMPTY) {
-                throw std::runtime_error(
-                    "experiment2 rearm requires every native-run slot to be EMPTY; slot=" +
-                    std::to_string(slot_id)
-                );
-            }
-        }
+    const int rc = execution_recovery_state_fn_(device_ctx_, &result);
+    if (rc != 0) {
+        result.status = ExecutionRecoveryStatus::INVALID_STATE;
+        result.recovery_rc = rc;
     }
-    if (run_lane_ == nullptr) {
-        throw std::runtime_error("experiment2 rearm requires an initialized chip run lane");
-    }
-    run_lane_->experiment2_rearm_for_test();
+    return result;
 }
 
-bool ChipWorker::native_runs_idle_for_soft_retry() const {
+ExecutionRecoveryResult ChipWorker::recover_execution(uint64_t failed_run_epoch, ExecutionRecoveryScope scope) {
+    if (!initialized_ || run_lane_ == nullptr) return ExecutionRecoveryResult{};
+    return run_lane_->recover_execution(failed_run_epoch, scope);
+}
+
+ExecutionRecoveryResult
+ChipWorker::recover_execution_substrate(uint64_t failed_run_epoch, ExecutionRecoveryScope scope) {
     std::lock_guard<std::mutex> lk(native_run_mu_);
+    ExecutionRecoveryResult result = execution_recovery_state();
+    result.scope = scope;
     for (const NativeRunSlotState &state : native_run_states_) {
-        if (state.phase != NativeRunPhase::EMPTY) return false;
+        if (state.phase != NativeRunPhase::EMPTY) {
+            result.status = ExecutionRecoveryStatus::BUSY;
+            result.recovery_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+            result.communication_preserved = 0;
+            return result;
+        }
     }
-    return true;
+    if (recover_execution_fn_ == nullptr) {
+        result.status = ExecutionRecoveryStatus::UNSUPPORTED;
+        result.recovery_rc = PTO_RUNTIME_ERR_UNSUPPORTED;
+        return result;
+    }
+    const int rc = recover_execution_fn_(device_ctx_, failed_run_epoch, scope, &result);
+    if (rc != 0) {
+        result.status = ExecutionRecoveryStatus::INVALID_STATE;
+        result.recovery_rc = rc;
+        result.communication_preserved = 0;
+    }
+    return result;
 }
 
 void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run) {
@@ -1313,8 +1341,7 @@ void ChipWorker::comm_release_domain_windows(
     }
 }
 
-CommRecoveryProbeSnapshot
-ChipWorker::experiment3_comm_recovery_probe(uint64_t comm_handle, uint64_t allocation_id) {
+CommRecoveryProbeSnapshot ChipWorker::experiment3_comm_recovery_probe(uint64_t comm_handle, uint64_t allocation_id) {
     if (!initialized_ || lib_handle_ == nullptr) {
         throw std::runtime_error("experiment3 comm probe requires an initialized ChipWorker");
     }

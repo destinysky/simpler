@@ -137,6 +137,45 @@ typedef struct NativeExecutionFault {
     int32_t device_unusable;
 } NativeExecutionFault;
 
+enum class ExecutionRecoveryStatus : uint32_t {
+    RECOVERED = 0,
+    ALREADY_RECOVERED = 1,
+    RECOVERY_REQUIRED = 2,
+    INVALID_STATE = 3,
+    BUSY = 4,
+    STALE_FAILURE = 5,
+    QUIESCENCE_UNPROVEN = 6,
+    DEVICE_UNUSABLE = 7,
+    UNSUPPORTED = 8,
+    CONTEXT_FAILURE = 9,
+};
+
+enum class ExecutionRecoveryScope : uint32_t {
+    EXECUTION_ONLY = 0,
+    COMMUNICATION_AFFECTED = 1,
+    DEVICE_AFFECTED = 2,
+};
+
+// The caller declares the affected failure domain. Only EXECUTION_ONLY is
+// supported here; communication/device recovery belongs to the outer layer.
+// RECOVERED means admission was rearmed after quiescence and retirement; it
+// does not dispatch an operator or certify future submissions. Identities are
+// diagnostics, never handles transferred to the caller. communication_preserved
+// records unchanged ownership, not a communication-health certification.
+struct ExecutionRecoveryResult {
+    ExecutionRecoveryStatus status{ExecutionRecoveryStatus::INVALID_STATE};
+    ExecutionRecoveryScope scope{ExecutionRecoveryScope::EXECUTION_ONLY};
+    uint64_t failed_run_epoch{0};
+    int32_t original_rc{0};
+    int32_t recovery_rc{0};
+    uint32_t quiesced{0};
+    uint32_t communication_preserved{0};
+    uint64_t communication_context{0};
+    uint64_t execution_context{0};
+    uint64_t aicpu_stream{0};
+    uint64_t aicore_stream{0};
+};
+
 enum {
     PTO_PIPELINE_CONTRACT_ABI_VERSION = 1,
     PTO_PIPELINE_MAX_RESOURCES = 8,
@@ -384,6 +423,13 @@ int finalize_device(DeviceContextHandle ctx);
 // the platform's fatal reset/retry/probe policy. A kernel-mode context is
 // rejected before any device mutation.
 int recovery_finalize_device(DeviceContextHandle ctx);
+
+// Explicit in-place execution rearm. Neither entry dispatches work or resets
+// the device. A non-execution-only scope is refused without mutation.
+int get_execution_recovery_state_ctx(DeviceContextHandle ctx, ExecutionRecoveryResult *result);
+int recover_execution_ctx(
+    DeviceContextHandle ctx, uint64_t failed_run_epoch, ExecutionRecoveryScope scope, ExecutionRecoveryResult *result
+);
 
 /* ===========================================================================
  * Per-callable_id preparation

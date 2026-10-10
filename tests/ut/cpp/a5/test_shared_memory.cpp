@@ -84,6 +84,7 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
     auto *hdr = handle->header;
     EXPECT_EQ(hdr->orchestrator_done.load(), 0);
     EXPECT_EQ(hdr->orch_error_code.load(), 0);
+    EXPECT_EQ(hdr->execution_quiesced.load(), 0);
     EXPECT_EQ(hdr->sched_error_bitmap.load(), 0);
     EXPECT_EQ(hdr->sched_error_code.load(), 0);
 
@@ -103,6 +104,14 @@ TEST_F(SharedMemoryTest, HeaderInitValues) {
         auto &fc = hdr->rings[r].fc;
         EXPECT_EQ(fc.current_task_index.load(), 0);
         EXPECT_EQ(fc.last_task_alive.load(), 0);
+    }
+}
+
+TEST_F(SharedMemoryTest, QuiescenceProofIsResetForEveryGeneration) {
+    for (int previous : {1, -1}) {
+        handle->header->execution_quiesced.store(previous);
+        ASSERT_TRUE(handle->init(handle->sm_base, handle->sm_size, CHIP_TASK_WINDOW_SIZE, CHIP_HEAP_SIZE));
+        EXPECT_EQ(handle->header->execution_quiesced.load(), 0);
     }
 }
 

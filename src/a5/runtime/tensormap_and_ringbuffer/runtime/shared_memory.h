@@ -161,6 +161,9 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
     std::atomic<int32_t> sched_stall_orch_done;    // orchestrator_done flag at timeout (0/1)
     std::atomic<int64_t> sched_stall_task_id;      // S1: stuck task_id (-1 if N/A)
     std::atomic<int32_t> sched_stall_core;         // S1: stuck core id (-1 if N/A)
+    // 0: pending, -1: a shutdown prerequisite failed, 1: all participants
+    // acknowledged and RuntimeContext/AicpuExecutor retirement completed.
+    std::atomic<int32_t> execution_quiesced;
 };
 
 static_assert(sizeof(SharedMemoryHeader) == 896, "SharedMemoryHeader layout drift");

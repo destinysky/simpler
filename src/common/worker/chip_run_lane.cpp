@@ -12,11 +12,8 @@
 #include "chip_run_lane.h"
 
 #include "chip_worker.h"
-#include "common/unified_log.h"
 
 #include <algorithm>
-#include <cstdlib>
-#include <cstring>
 #include <deque>
 #include <exception>
 #include <limits>
@@ -24,15 +21,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-namespace {
-
-bool experiment2_soft_rearm_enabled() {
-    const char *value = std::getenv("SIMPLER_EXPERIMENT2_SOFT_REARM");
-    return value != nullptr && std::strcmp(value, "1") == 0;
-}
-
-}  // namespace
 
 struct ChipRunState {
     enum class Phase : uint8_t { QUEUED, PREPARED, LAUNCHED, TERMINAL };
@@ -53,7 +41,6 @@ struct ChipRunState {
     bool activated{false};
     bool crossed_launch_fence{false};
     bool depth_one_fallback{false};
-    bool soft_retry_attempt{false};
     std::exception_ptr error;
     std::exception_ptr poison_error;
 };
@@ -73,20 +60,9 @@ struct ChipRunLaneState {
         }
     }
 
-    bool require_usable() {
+    void require_usable() const {
         if (closed) throw std::runtime_error("chip run lane is closed");
-        if (poison == nullptr) return false;
-
-        // Do not inspect the error code. A poisoned lane may consume one retry
-        // only after the failed generation is fully retired on the host.
-        if (!soft_retry_in_progress && fifo.empty() && worker->native_runs_idle_for_soft_retry()) {
-            retry_origin_poison = poison;
-            poison = nullptr;
-            soft_retry_in_progress = true;
-            LOG_WARN("[PTO_RECOVERY] CHIP_RUN_LANE_SOFT_RETRY_REARMED");
-            return true;
-        }
-        rethrow_as_poisoned(poison);
+        if (poison != nullptr) rethrow_as_poisoned(poison);
     }
 
     void rethrow_run_error(const std::shared_ptr<ChipRunState> &run) const {
@@ -121,7 +97,10 @@ struct ChipRunLaneState {
 
     void poison_with(const std::shared_ptr<ChipRunState> &run, std::exception_ptr error) {
         if (run->poison_error == nullptr) run->poison_error = error;
-        if (poison == nullptr) poison = error;
+        if (poison == nullptr) {
+            poison = error;
+            poison_epoch = run->native_run.run_epoch;
+        }
     }
 
     void finish(const std::shared_ptr<ChipRunState> &run) noexcept {
@@ -129,22 +108,37 @@ struct ChipRunLaneState {
             worker->finalize_native_run(run->native_run);
         } catch (...) {
             const std::exception_ptr finalize_error = std::current_exception();
+            std::exception_ptr terminal_error = finalize_error;
+            if (run->error != nullptr) {
+                // Report the terminal retirement fault without losing the original failure.
+                try {
+                    auto describe = [](const std::exception_ptr &error) -> std::string {
+                        try {
+                            std::rethrow_exception(error);
+                        } catch (const std::exception &e) {
+                            return e.what();
+                        } catch (...) {
+                            return "unknown native failure";
+                        }
+                    };
+                    terminal_error = std::make_exception_ptr(
+                        std::runtime_error(
+                            "original execution fault: " + describe(run->error) +
+                            "; native retirement fault: " + describe(finalize_error)
+                        )
+                    );
+                } catch (...) {}
+            }
             if (run->error == nullptr) run->error = finalize_error;
-            poison_with(run, finalize_error);
+            run->poison_error = terminal_error;
+            poison_with(run, terminal_error);
         }
         run->phase = ChipRunState::Phase::TERMINAL;
         if (!fifo.empty() && fifo.front() == run) fifo.pop_front();
-
-        if (run->soft_retry_attempt && run->error == nullptr && poison == nullptr) {
-            soft_retry_in_progress = false;
-            retry_origin_poison = nullptr;
-            LOG_WARN("[PTO_RECOVERY] CHIP_RUN_LANE_SOFT_RETRY_SUCCEEDED");
-        }
     }
 
     void fail_launch(const std::shared_ptr<ChipRunState> &run) noexcept {
         run->error = std::current_exception();
-        if (run->soft_retry_attempt) poison_with(run, run->error);
         finish(run);
     }
 
@@ -173,7 +167,6 @@ struct ChipRunLaneState {
                 prepare(run);
             } catch (...) {
                 run->error = std::current_exception();
-                if (run->soft_retry_attempt) poison_with(run, run->error);
                 run->phase = ChipRunState::Phase::TERMINAL;
                 fifo.pop_front();
                 return;
@@ -300,8 +293,7 @@ struct ChipRunLaneState {
     std::vector<uint64_t> generations;
     uint64_t direct_generation{0};
     std::exception_ptr poison;
-    std::exception_ptr retry_origin_poison;
-    bool soft_retry_in_progress{false};
+    uint64_t poison_epoch{0};
     bool closed{false};
 };
 
@@ -367,12 +359,6 @@ void ChipRun::abandon() {
     }
     run_->phase = ChipRunState::Phase::TERMINAL;
     lane_->fifo.erase(it);
-    if (run_->soft_retry_attempt && lane_->soft_retry_in_progress) {
-        lane_->poison = lane_->retry_origin_poison;
-        lane_->retry_origin_poison = nullptr;
-        lane_->soft_retry_in_progress = false;
-        LOG_WARN("[PTO_RECOVERY] CHIP_RUN_LANE_SOFT_RETRY_CANCELLED");
-    }
     if (run_->error != nullptr) std::rethrow_exception(run_->error);
 }
 
@@ -431,7 +417,7 @@ ChipRun ChipRunLane::submit(
         dispatch_id < state_->fifo.front()->dispatch_id) {
         throw std::runtime_error("chip run lane cannot reorder before an active dispatch");
     }
-    const bool soft_retry_attempt = state_->require_usable();
+    state_->require_usable();
     auto run = std::make_shared<ChipRunState>();
     run->callable_id = callable_id;
     run->args = args;
@@ -444,7 +430,6 @@ ChipRun ChipRunLane::submit(
     run->execution_fault_sink = execution_fault_sink;
     run->pipeline_leased = true;
     run->activated = activated;
-    run->soft_retry_attempt = soft_retry_attempt;
     state_->generations[lease.slot_id] = lease.generation;
     auto position = std::upper_bound(
         state_->fifo.begin(), state_->fifo.end(), dispatch_id,
@@ -476,7 +461,7 @@ ChipRun ChipRunLane::submit(
 ) {
     std::lock_guard<std::mutex> lk(state_->mu);
     if (state_->generations.empty()) throw std::runtime_error("chip run lane has no runtime slots");
-    bool soft_retry_attempt = state_->require_usable();
+    state_->require_usable();
 
     // Direct admission follows the runtime contract but keeps the lane as its
     // only authority. A compatible active run may own one prepared successor;
@@ -488,7 +473,7 @@ ChipRun ChipRunLane::submit(
             state_->fifo.size() == 1 && state_->permits_native_successor(*state_->fifo.front());
         if (has_successor_capacity) break;
         state_->drain_front();
-        soft_retry_attempt = state_->require_usable() || soft_retry_attempt;
+        state_->require_usable();
         state_->launch_front();
     }
 
@@ -519,7 +504,6 @@ ChipRun ChipRunLane::submit(
     run->execution_fault_sink = execution_fault_sink;
     run->pipeline_leased = false;
     run->activated = true;
-    run->soft_retry_attempt = soft_retry_attempt;
     state_->fifo.push_back(run);
     if (state_->fifo.front() == run) {
         state_->launch_front();
@@ -548,28 +532,26 @@ void ChipRunLane::close() {
     if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
 }
 
-void ChipRunLane::experiment2_rearm_for_test() {
+ExecutionRecoveryResult ChipRunLane::recover_execution(uint64_t failed_run_epoch, ExecutionRecoveryScope scope) {
     std::lock_guard<std::mutex> lk(state_->mu);
-    if (!experiment2_soft_rearm_enabled()) {
-        throw std::runtime_error("experiment2 rearm requested without SIMPLER_EXPERIMENT2_SOFT_REARM=1");
+    if (state_->closed || !state_->fifo.empty() ||
+        (state_->poison != nullptr && state_->poison_epoch != failed_run_epoch)) {
+        ExecutionRecoveryResult result = state_->worker->execution_recovery_state();
+        result.scope = scope;
+        result.status = state_->closed        ? ExecutionRecoveryStatus::INVALID_STATE :
+                        !state_->fifo.empty() ? ExecutionRecoveryStatus::BUSY :
+                                                ExecutionRecoveryStatus::STALE_FAILURE;
+        result.recovery_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+        result.communication_preserved = 0;
+        return result;
     }
-    if (state_->closed) {
-        throw std::runtime_error("experiment2 rearm requested on a closed chip run lane");
+    ExecutionRecoveryResult result = state_->worker->recover_execution_substrate(failed_run_epoch, scope);
+    if (result.status == ExecutionRecoveryStatus::RECOVERED ||
+        result.status == ExecutionRecoveryStatus::ALREADY_RECOVERED) {
+        state_->poison = nullptr;
+        state_->poison_epoch = 0;
     }
-    if (!state_->fifo.empty()) {
-        throw std::runtime_error("experiment2 rearm requires an empty chip run FIFO");
-    }
-    if (state_->poison == nullptr) {
-        throw std::runtime_error("experiment2 rearm requires a poisoned chip run lane");
-    }
-
-    // Preserve every generation high-water mark. Only the sticky admission
-    // poison is cleared after the caller has independently verified that the
-    // failed native run is terminal and this probe's PTO-side explicit-fatal
-    // shutdown reached its stop proof. Device-wide synchronize status is not
-    // used as a second stop proof because it may retain the failed-task status.
-    state_->poison = nullptr;
-    LOG_WARN("[PTO_RECOVERY_EXP2] CHIP_RUN_LANE_POISON_CLEARED_EXPLICITLY");
+    return result;
 }
 
 bool ChipRunLane::poisoned() const {
