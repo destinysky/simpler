@@ -239,7 +239,7 @@ int comm_derive_context(
  * @param allocation_id           Caller-assigned unique id; scopes the
  *                                handshake / barrier filenames.  Must be
  *                                unique among currently-live allocations
- *                                on this handle.
+ *                                on this handle; A5 requires lifetime uniqueness.
  * @param rank_ids                Base-communicator rank ids in dense
  *                                domain order (length rank_count).
  * @param rank_count              Number of subset members.
@@ -282,7 +282,7 @@ int comm_alloc_domain_windows(
 int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
 
 /**
- * Experiment-3 read-only recovery snapshot.
+ * Read-only communication recovery snapshot.
  *
  * This is diagnostic surface only: it must not create/destroy communicators,
  * acquire channels, move queue heads/tails, or otherwise mutate communication

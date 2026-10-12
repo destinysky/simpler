@@ -674,6 +674,7 @@ target_include_directories(test_profiler_device_engine PRIVATE
 
 add_common_utils_test(test_worker_chip_orch_comm common/test_worker_chip_orch_comm.cpp)
 add_common_utils_test(test_file_marker_handshake common/test_file_marker_handshake.cpp)
+add_common_utils_test(test_domain_recovery common/test_domain_recovery.cpp)
 
 add_executable(test_trb_runtime_temp_buffer
     common/test_trb_runtime_temp_buffer.cpp

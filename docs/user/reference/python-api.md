@@ -85,6 +85,48 @@ cannot walk a legal-looking length past the end.
 `RunHandle` exposes `done() -> bool`, `wait(timeout=None)`, and
 `result(timeout=None)`.
 
+The A5 native `simpler.task_interface.ChipWorker` exposes explicit recovery controls:
+`execution_recovery_state()`, `recover_execution(failed_run_epoch)`,
+`recover_comm_domain(comm_handle, allocation_id, request)`, and
+`comm_recovery_snapshot(comm_handle, allocation_id)`. The snapshot reads identities
+and queue diagnostics; it does not prove that async engines or peer ranks have drained.
+
+`DomainRecoveryRequest` names a monotonically increasing, collective `recovery_id`,
+`expected_generation`, the local `failed_run_epoch` (zero for a healthy execution
+substrate), `original_rc`, and `DomainRecoveryImpact`. `EXECUTION_ONLY` returns
+`PRESERVED` with the same domain generation and bindings. `DOMAIN_BINDINGS` requests
+fresh windows, peer imports and device CommContext, preserving Context C, HCCL,
+communication stream and the SDMA workspace. The domain owner must first fence and
+drain **every** domain user on **every** member, including communication issued
+outside PTO, then set `collective_quiescence = 1`. A local native-slot drain or
+cooperative PTO shutdown alone does not establish this condition.
+
+All subset members call with matching recovery id, expected generation and impact.
+The backend votes prepare/build/retire results before publishing new bindings. A
+successful rebuild returns `REBUILT`, generation + 1 and `rebind_required = 1`;
+window contents, including signals, start at zero. The owner must collect successful
+results from all members before using them. Any failed/missing result ends this
+operator-recovery episode. This is resource recovery, not a distributed replay/commit
+protocol: TaskArgs rebinding and recovery dispatch remain outside this API.
+
+Exact duplicate requests return `ALREADY_RECOVERED` with the original result;
+changed/reused recovery ids and stale generations are refused. Logical allocation ids
+cannot be reused during one A5 communication session. Domain recovery never clears
+execution admission poison; execution rearming remains a separate explicit call.
+Original and recovery error codes are diagnostics, never eligibility whitelists.
+A failed rebuild returns no dispatchable binding and quarantines further soft recovery.
+Default terminal cleanup owns any remaining resources; this operation never resets a device.
+
+A5 currently rematerializes SDMA/VMM domain bindings. URMA execution-only preservation
+is supported, but its pinned provider retains HCCL registrations/channels until
+communicator teardown, so independent URMA rematerialization returns `UNSUPPORTED`.
+CCU has an engine id and provider capability seam but no resource provider in this
+backend. Affected domain transport without a recovery-capable provider, shared
+communication (HCCL, Context C or shared DMA engine), and device faults return
+`GIVE_UP`. Other hardware backends retain their existing ABI and report `UNSUPPORTED`
+for this optional operation.
+
+
 At L2 the `callable` is a registered `ChipCallable` handle. At L3+ the top-level
 callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 `orch` is the `Orchestrator`:

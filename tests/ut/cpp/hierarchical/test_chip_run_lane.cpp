@@ -29,6 +29,8 @@
 #include "task_args.h"
 #include "types.h"
 
+#include "../platform_comm/domain_recovery.h"
+
 #define private public
 #include "chip_worker.h"
 #undef private
@@ -56,6 +58,16 @@ bool g_supports_successor{true};
 ExecutionRecoveryResult g_recovery;
 size_t g_recovery_calls{0};
 uint64_t g_last_epoch{0};
+
+size_t g_domain_calls{0};
+int domain_recover(void *, uint64_t allocation_id, const DomainRecoveryRequest *request, DomainRecoveryResult *result) {
+    ++g_domain_calls;
+    result->status = DomainRecoveryStatus::PRESERVED;
+    result->allocation_id = allocation_id;
+    result->original_rc = request->original_rc;
+    result->generation = request->expected_generation;
+    return 0;
+}
 
 int recovery_state(void *, ExecutionRecoveryResult *result) {
     *result = g_recovery;
@@ -151,6 +163,8 @@ void prime_worker(ChipWorker &worker) {
     g_supports_successor = true;
     g_recovery = {};
     g_recovery_calls = 0;
+    g_domain_calls = 0;
+    worker.comm_recover_domain_fn_ = domain_recover;
     g_last_epoch = 0;
     {
         std::lock_guard<std::mutex> lk(g_wait_mu);
@@ -772,6 +786,83 @@ TEST(ChipRunLaneTest, RepeatedExternalFailuresDoNotConsumeL2RetryBudget) {
         );
     }
     EXPECT_EQ(g_recovery_calls, 3u);
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, DomainRecoveryRejectsUnsafeFifoAndNativeSlots) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.create_comm_session(reinterpret_cast<void *>(0xC0), nullptr, false);
+    ChipRunLane lane(worker);
+    DomainRecoveryRequest request;
+    request.recovery_id = 1;
+    request.expected_generation = 1;
+    ChipRun run = submit(lane, 101, 0);
+    EXPECT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::BUSY);
+    EXPECT_EQ(g_domain_calls, 0u);
+    g_complete[0] = true;
+    ASSERT_TRUE(run.done());
+    ChipStorageTaskArgs args{};
+    auto raw = worker.prepare_native_run(1, &args, CallConfig{}, PipelineSlotLease{0, 0, 103}, 103, 103);
+    EXPECT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::BUSY);
+    EXPECT_EQ(g_domain_calls, 0u);
+    worker.finalize_native_run(raw);
+    EXPECT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::PRESERVED);
+    EXPECT_EQ(g_domain_calls, 1u);
+    worker.comm_sessions_.clear();
+    worker.comm_session_index_.clear();
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, DomainRecoveryCannotClearPoisonOrAcceptStaleFailure) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.create_comm_session(reinterpret_cast<void *>(0xC0), nullptr, false);
+    ChipRunLane lane(worker);
+    ChipRun failed = submit(lane, 101, 0);
+    g_complete[0] = true;
+    g_finalize_rc[0] = 42;
+    ASSERT_TRUE(failed.done());
+    g_recovery.status = ExecutionRecoveryStatus::RECOVERY_REQUIRED;
+    g_recovery.failed_run_epoch = g_last_epoch;
+    g_recovery.quiesced = 1;
+    DomainRecoveryRequest request;
+    request.recovery_id = 1;
+    request.expected_generation = 1;
+    request.failed_run_epoch = g_last_epoch + 1;
+    EXPECT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::STALE_GENERATION);
+    EXPECT_EQ(g_domain_calls, 0u);
+    request.failed_run_epoch = g_last_epoch;
+    EXPECT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::PRESERVED);
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_THROW(submit(lane, 102, 1), std::runtime_error);
+    g_recovery.quiesced = 0;
+    EXPECT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::QUIESCENCE_UNPROVEN);
+    EXPECT_EQ(g_domain_calls, 1u);
+    worker.comm_sessions_.clear();
+    worker.comm_session_index_.clear();
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, UnsupportedDomainRecoveryAndDeviceFaultKeepExistingPlatformBehavior) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.create_comm_session(reinterpret_cast<void *>(0xC0), nullptr, false);
+    ChipRunLane lane(worker);
+    DomainRecoveryRequest request;
+    request.recovery_id = 1;
+    request.expected_generation = 1;
+    worker.comm_recover_domain_fn_ = nullptr;
+    EXPECT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::UNSUPPORTED);
+    g_recovery.status = ExecutionRecoveryStatus::DEVICE_UNUSABLE;
+    worker.comm_recover_domain_fn_ = domain_recover;
+    EXPECT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::GIVE_UP);
+    EXPECT_EQ(g_domain_calls, 0u);
+    worker.comm_sessions_.clear();
+    worker.comm_session_index_.clear();
     lane.close();
     worker.finalize();
 }

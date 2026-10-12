@@ -40,6 +40,10 @@ from simpler.task_interface import (
     CallConfig,
     ChipCallable,
     CoreCallable,
+    DomainRecoveryEngine,
+    DomainRecoveryImpact,
+    DomainRecoveryRequest,
+    DomainRecoveryStatus,
     ExecutionRecoveryScope,
     ExecutionRecoveryStatus,
     _flush_host_log,
@@ -544,16 +548,74 @@ def _recover_retired_generation(native_worker):
     return recovered
 
 
-def _exp3_plain_snapshot(native_worker, comm_handle: int, allocation_id: int) -> dict[str, int]:
-    raw = native_worker._impl._experiment3_comm_recovery_probe(int(comm_handle), int(allocation_id))
+def _comm_snapshot(native_worker, comm_handle: int, allocation_id: int) -> dict[str, int]:
+    raw = native_worker.comm_recovery_snapshot(int(comm_handle), int(allocation_id))
     return {str(key): int(value) for key, value in dict(raw).items()}
 
 
-def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_queue) -> None:
+def _recover_rank_domain(native_worker, comm_handle, allocation_id, before, healthy_handle, worker, config, *, rebuild):
+    """Check preservation and optional rebuild before execution admission reopens."""
+    failed = native_worker.execution_recovery_state()
+    preserve_request = DomainRecoveryRequest()
+    preserve_request.recovery_id = 1
+    preserve_request.expected_generation = 1
+    preserve_request.failed_run_epoch = failed.failed_run_epoch
+    preserve_request.original_rc = failed.original_rc
+    preserved = native_worker.recover_comm_domain(comm_handle, allocation_id, preserve_request)
+    assert preserved.status == DomainRecoveryStatus.PRESERVED
+    assert preserved.generation == 1 and preserved.domain_preserved == 1
+    assert preserved.rebind_required == 0
+    assert preserved.device_ctx == before["device_ctx"]
+    assert preserved.local_window_base == before["local_window_base"]
+    assert preserved.workspace == before["workspace_addr"]
+    duplicate = native_worker.recover_comm_domain(comm_handle, allocation_id, preserve_request)
+    assert duplicate.status == DomainRecoveryStatus.ALREADY_RECOVERED
+    if rebuild:
+        assert preserved.engine == DomainRecoveryEngine.SDMA, "rematerialization test requires SDMA provider"
+        request = DomainRecoveryRequest()
+        request.recovery_id = 2
+        request.expected_generation = 1
+        request.failed_run_epoch = failed.failed_run_epoch
+        request.original_rc = failed.original_rc
+        request.impact = DomainRecoveryImpact.DOMAIN_BINDINGS
+        unproven = native_worker.recover_comm_domain(comm_handle, allocation_id, request)
+        assert unproven.status == DomainRecoveryStatus.QUIESCENCE_UNPROVEN
+        # These rank processes own the only domain users. Their kernels are
+        # no-ops, issue no DMA, and both fatal generations have retired.
+        request.collective_quiescence = 1
+        marker = ctypes.c_uint64(0xABCD)
+        native_worker._impl.copy_to(preserved.local_window_base, ctypes.addressof(marker), ctypes.sizeof(marker))
+        rebuilt = native_worker.recover_comm_domain(comm_handle, allocation_id, request)
+        assert rebuilt.status == DomainRecoveryStatus.REBUILT
+        assert rebuilt.previous_generation == 1 and rebuilt.generation == 2
+        assert rebuilt.rebind_required == 1 and rebuilt.domain_preserved == 0
+        assert rebuilt.original_rc == failed.original_rc and rebuilt.recovery_rc == 0
+        assert rebuilt.device_ctx != preserved.device_ctx
+        assert rebuilt.local_window_base != preserved.local_window_base
+        for field in ("communication_context", "hccl_comm", "comm_stream", "workspace"):
+            assert getattr(rebuilt, field) == getattr(preserved, field), field
+        native_worker._impl.copy_from(ctypes.addressof(marker), rebuilt.local_window_base, ctypes.sizeof(marker))
+        assert marker.value == 0, "new domain signal/data memory must be reset"
+        duplicate = native_worker.recover_comm_domain(comm_handle, allocation_id, request)
+        assert duplicate.status == DomainRecoveryStatus.ALREADY_RECOVERED
+        assert duplicate.generation == 2 and duplicate.device_ctx == rebuilt.device_ctx
+        request.recovery_id = 3
+        stale = native_worker.recover_comm_domain(comm_handle, allocation_id, request)
+        assert stale.status == DomainRecoveryStatus.STALE_GENERATION
+        assert stale.generation == 2
+        with pytest.raises(RuntimeError, match="poisoned"):
+            worker.run(healthy_handle, None, config)
+
+
+def _comm_recovery_rank_process(
+    device_id: int, rank: int, rootinfo_path: str, result_queue, rebuild: bool = False
+) -> None:
     """One isolated rank: keep one dynamic CommDomain live across an execution-generation fault."""
     worker = None
     comm_handle = None
     allocation_live = False
+    # L3's first dynamic allocation uses ID zero.
+    allocation_id = 0
     try:
         configure_logging("info")
         healthy_callable = _build_chip_callable(
@@ -571,22 +633,21 @@ def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_que
         worker.init()
         native_worker = worker._chip_worker
         if native_worker is None:
-            raise RuntimeError("Experiment 3 lost the L2 ChipWorker")
+            raise RuntimeError("Communication recovery lost the L2 ChipWorker")
 
         comm_handle = native_worker.comm_init(rank, 2, rootinfo_path)
-        allocation_id = 0xE3000001
         commit_flag = ctypes.c_uint64(0)
         native_worker._impl.comm_alloc_domain_windows(
             int(comm_handle), allocation_id, [0, 1], rank, 4 * 1024 * 1024, ctypes.addressof(commit_flag)
         )
         if commit_flag.value != 1:
-            raise RuntimeError("Experiment 3 dynamic domain did not publish its commit flag")
+            raise RuntimeError("Communication recovery dynamic domain did not publish its commit flag")
         allocation_live = True
 
         config = CallConfig()
         config.aicpu_thread_num = 2
         worker.run(healthy_handle, None, config)
-        before = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
+        before = _comm_snapshot(native_worker, comm_handle, allocation_id)
         execution_before = native_worker.execution_recovery_state()
 
         try:
@@ -594,16 +655,19 @@ def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_que
         except RuntimeError:
             pass
         else:
-            raise AssertionError("Experiment 3 explicit-fatal run unexpectedly succeeded")
-        after_fault = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
+            raise AssertionError("Communication recovery explicit-fatal run unexpectedly succeeded")
+        after_fault = _comm_snapshot(native_worker, comm_handle, allocation_id)
         with pytest.raises(RuntimeError, match="poisoned"):
             worker.run(healthy_handle, None, config)
+        _recover_rank_domain(
+            native_worker, comm_handle, allocation_id, before, healthy_handle, worker, config, rebuild=rebuild
+        )
         recovered = _recover_retired_generation(native_worker)
         _assert_execution_identities(execution_before, recovered)
-        after_recovery = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
+        after_recovery = _comm_snapshot(native_worker, comm_handle, allocation_id)
 
         worker.run(healthy_handle, None, config)
-        after_retry = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
+        after_retry = _comm_snapshot(native_worker, comm_handle, allocation_id)
         _assert_execution_identities(recovered, native_worker.execution_recovery_state())
 
         # Release is intentionally part of the experiment: a dynamic allocation
@@ -611,7 +675,7 @@ def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_que
         # usable recovery outcome.
         native_worker._impl.comm_release_domain_windows(int(comm_handle), allocation_id, 2, rank)
         allocation_live = False
-        after_release = _exp3_plain_snapshot(native_worker, comm_handle, allocation_id)
+        after_release = _comm_snapshot(native_worker, comm_handle, allocation_id)
         native_worker.comm_destroy(int(comm_handle))
         comm_handle = None
         worker.close()
@@ -635,7 +699,7 @@ def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_que
         # turning the diagnostic exception itself into an unbounded cleanup loop.
         try:
             if allocation_live and worker is not None and worker._chip_worker is not None and comm_handle is not None:
-                worker._chip_worker._impl.comm_release_domain_windows(int(comm_handle), 0xE3000001, 2, rank)
+                worker._chip_worker._impl.comm_release_domain_windows(int(comm_handle), allocation_id, 2, rank)
         except BaseException:
             pass
         try:
@@ -652,21 +716,34 @@ def _exp3_rank_process(device_id: int, rank: int, rootinfo_path: str, result_que
 @pytest.mark.timeout(240)
 def test_a5_explicit_fatal_preserves_comm_domain(st_device_ids, tmp_path):
     """Communication ownership and empty queues survive explicit execution recovery."""
+    _check_comm_recovery(st_device_ids, tmp_path, rebuild=False)
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.device_count(2)
+@pytest.mark.runtime(RUNTIME)
+@pytest.mark.timeout(300)
+def test_a5_comm_domain_rematerialization(st_device_ids, tmp_path):
+    """Explicit collective domain rebuild advances bindings, preserving C/E and SDMA."""
+    _check_comm_recovery(st_device_ids, tmp_path, rebuild=True)
+
+
+def _check_comm_recovery(st_device_ids, tmp_path, *, rebuild: bool):
     assert len(st_device_ids) == 2
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
-    rootinfo_path = str(tmp_path / "exp3_hccl_rootinfo.bin")
+    rootinfo_path = str(tmp_path / "comm_recovery_hccl_rootinfo.bin")
     processes = [
         ctx.Process(
-            target=_exp3_rank_process,
-            args=(int(st_device_ids[rank]), rank, rootinfo_path, result_queue),
-            name=f"pto-exp3-rank-{rank}",
+            target=_comm_recovery_rank_process,
+            args=(int(st_device_ids[rank]), rank, rootinfo_path, result_queue, rebuild),
+            name=f"pto-comm-recovery-rank-{rank}",
         )
         for rank in range(2)
     ]
     for process in processes:
         process.start()
-    join_deadline = time.monotonic() + 190.0
+    join_deadline = time.monotonic() + (250.0 if rebuild else 190.0)
     for process in processes:
         process.join(timeout=max(0.0, join_deadline - time.monotonic()))
     for process in processes:
@@ -680,7 +757,7 @@ def test_a5_explicit_fatal_preserves_comm_domain(st_device_ids, tmp_path):
             results.append(result_queue.get(timeout=5))
         except queue.Empty:
             break
-    assert len(results) == 2, f"Experiment 3 returned only {len(results)} rank result(s)"
+    assert len(results) == 2, f"Communication recovery returned only {len(results)} rank result(s)"
     results.sort(key=lambda item: item["rank"])
     assert all(item["ok"] for item in results), results
     assert all(process.exitcode == 0 for process in processes), [process.exitcode for process in processes]
@@ -699,13 +776,16 @@ def test_a5_explicit_fatal_preserves_comm_domain(st_device_ids, tmp_path):
     )
     for result in results:
         snapshots = [result["before"], result["after_fault"], result["after_recovery"], result["after_retry"]]
+        if rebuild:
+            snapshots = snapshots[2:]
         for snapshot in snapshots:
             assert snapshot["version"] == 1
             assert snapshot["workspace_kind"] in (1, 2), snapshot
             assert snapshot["domain_allocation_count"] == 1, snapshot
             assert snapshot["allocation_present"] == 1, snapshot
             assert snapshot["peer_window_count"] == 1, snapshot
-            assert snapshot["active_queue_count"] == 48, snapshot
+            expected_queues = 48 if snapshot["workspace_kind"] == 1 else 1
+            assert snapshot["active_queue_count"] == expected_queues, snapshot
             assert snapshot["queue_read_errors"] == 0, snapshot
             assert snapshot["all_queues_empty"] == 1, snapshot
             assert snapshot["hccl_comm_identity"] != 0, snapshot
@@ -720,7 +800,8 @@ def test_a5_explicit_fatal_preserves_comm_domain(st_device_ids, tmp_path):
         released = result["after_release"]
         assert released["domain_allocation_count"] == 0, released
         assert released["allocation_present"] == 0, released
-    print("[PTO_RECOVERY_TEST] COMMUNICATION_PRESERVATION_PASS", flush=True)
+    marker = "DOMAIN_REMATERIALIZATION_PASS" if rebuild else "COMMUNICATION_PRESERVATION_PASS"
+    print(f"[PTO_RECOVERY_TEST] {marker}", flush=True)
 
 
 # The orchestrator fatals before any task completes, so this case leaves the

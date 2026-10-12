@@ -759,6 +759,7 @@ void DeviceRunner::record_execution_quiescence(const ActiveExecution &active) {
 ExecutionRecoveryResult DeviceRunner::execution_recovery_state() const {
     std::lock_guard<std::mutex> lk(execution_recovery_mu_);
     ExecutionRecoveryResult result = execution_recovery_;
+    if (device_unusable_.load(std::memory_order_acquire)) result.status = ExecutionRecoveryStatus::DEVICE_UNUSABLE;
     result.communication_context = reinterpret_cast<uint64_t>(default_rt_context_);
     result.execution_context = reinterpret_cast<uint64_t>(execution_rt_context_);
     result.aicpu_stream = reinterpret_cast<uint64_t>(stream_aicpu_);

@@ -260,6 +260,10 @@ void ChipWorker::init(
         comm_alloc_domain_windows_fn_ = load_symbol<CommAllocDomainWindowsFn>(handle, "comm_alloc_domain_windows");
         comm_release_domain_windows_fn_ =
             load_symbol<CommReleaseDomainWindowsFn>(handle, "comm_release_domain_windows");
+        dlerror();
+        comm_recover_domain_fn_ =
+            reinterpret_cast<decltype(comm_recover_domain_fn_)>(dlsym(handle, "comm_recover_domain"));
+        (void)dlerror();
         comm_global_domain_prepare_fn_ = load_symbol<CommGlobalDomainPrepareFn>(handle, "comm_global_domain_prepare");
         comm_global_domain_import_fn_ = load_symbol<CommGlobalDomainImportFn>(handle, "comm_global_domain_import");
         comm_global_domain_release_fn_ = load_symbol<CommGlobalDomainReleaseFn>(handle, "comm_global_domain_release");
@@ -396,6 +400,7 @@ void ChipWorker::init(
         comm_get_window_size_fn_ = nullptr;
         comm_alloc_domain_windows_fn_ = nullptr;
         comm_release_domain_windows_fn_ = nullptr;
+        comm_recover_domain_fn_ = nullptr;
         comm_global_domain_prepare_fn_ = nullptr;
         comm_global_domain_import_fn_ = nullptr;
         comm_global_domain_release_fn_ = nullptr;
@@ -462,6 +467,7 @@ void ChipWorker::init(
         comm_derive_context_fn_ = nullptr;
         comm_alloc_domain_windows_fn_ = nullptr;
         comm_release_domain_windows_fn_ = nullptr;
+        comm_recover_domain_fn_ = nullptr;
         comm_global_domain_prepare_fn_ = nullptr;
         comm_global_domain_import_fn_ = nullptr;
         comm_global_domain_release_fn_ = nullptr;
@@ -583,6 +589,7 @@ void ChipWorker::finalize_impl(bool recovery) {
     comm_derive_context_fn_ = nullptr;
     comm_alloc_domain_windows_fn_ = nullptr;
     comm_release_domain_windows_fn_ = nullptr;
+    comm_recover_domain_fn_ = nullptr;
     comm_global_domain_prepare_fn_ = nullptr;
     comm_global_domain_import_fn_ = nullptr;
     comm_global_domain_release_fn_ = nullptr;
@@ -1341,27 +1348,87 @@ void ChipWorker::comm_release_domain_windows(
     }
 }
 
-CommRecoveryProbeSnapshot ChipWorker::experiment3_comm_recovery_probe(uint64_t comm_handle, uint64_t allocation_id) {
-    if (!initialized_ || lib_handle_ == nullptr) {
-        throw std::runtime_error("experiment3 comm probe requires an initialized ChipWorker");
+DomainRecoveryResult
+ChipWorker::recover_comm_domain(uint64_t comm_handle, uint64_t allocation_id, const DomainRecoveryRequest &request) {
+    if (!initialized_ || run_lane_ == nullptr) return DomainRecoveryResult{};
+    return run_lane_->recover_comm_domain(comm_handle, allocation_id, request);
+}
+
+DomainRecoveryResult ChipWorker::recover_comm_domain_substrate(
+    uint64_t comm_handle, uint64_t allocation_id, const DomainRecoveryRequest &request
+) {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    DomainRecoveryResult result;
+    result.allocation_id = allocation_id;
+    result.recovery_id = request.recovery_id;
+    result.original_rc = request.original_rc;
+    if (find_comm_session(comm_handle) == nullptr) return result;
+    for (const auto &slot : native_run_states_) {
+        if (slot.phase != NativeRunPhase::EMPTY) {
+            result.status = DomainRecoveryStatus::BUSY;
+            return result;
+        }
     }
+    const auto execution = execution_recovery_state();
+    if (execution.status == ExecutionRecoveryStatus::DEVICE_UNUSABLE ||
+        request.impact == DomainRecoveryImpact::DEVICE) {
+        result.status = DomainRecoveryStatus::GIVE_UP;
+        return result;
+    }
+    if (request.failed_run_epoch != 0 && request.failed_run_epoch != execution.failed_run_epoch) {
+        result.status = DomainRecoveryStatus::STALE_GENERATION;
+        return result;
+    }
+    if (execution.status == ExecutionRecoveryStatus::RECOVERY_REQUIRED &&
+        (request.failed_run_epoch != execution.failed_run_epoch || execution.quiesced == 0)) {
+        result.status = DomainRecoveryStatus::QUIESCENCE_UNPROVEN;
+        return result;
+    }
+    if (execution.status == ExecutionRecoveryStatus::UNSUPPORTED) {
+        result.status = DomainRecoveryStatus::UNSUPPORTED;
+        return result;
+    }
+    if (comm_recover_domain_fn_ == nullptr) {
+        result.status = DomainRecoveryStatus::UNSUPPORTED;
+        return result;
+    }
+    int rc = comm_recover_domain_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, &request, &result);
+    if (result.abi_version != 1 || result.struct_bytes != sizeof(DomainRecoveryResult)) {
+        result.status = DomainRecoveryStatus::UNSUPPORTED;
+        result.device_ctx = 0;
+        result.local_window_base = 0;
+        result.workspace = 0;
+    }
+    if (rc != 0) {
+        result.status = DomainRecoveryStatus::RECOVERY_FAILED;
+        result.recovery_rc = rc;
+        result.device_ctx = 0;
+        result.local_window_base = 0;
+        result.workspace = 0;
+    }
+    return result;
+}
+
+CommRecoveryProbeSnapshot ChipWorker::comm_recovery_snapshot(uint64_t comm_handle, uint64_t allocation_id) {
+    if (!initialized_ || lib_handle_ == nullptr) {
+        throw std::runtime_error("communication recovery snapshot requires an initialized ChipWorker");
+    }
+    if (find_comm_session(comm_handle) == nullptr) throw std::invalid_argument("unknown communication handle");
     using ProbeFn = int (*)(void *, uint64_t, CommRecoveryProbeSnapshot *);
     dlerror();
     auto probe_fn = reinterpret_cast<ProbeFn>(dlsym(lib_handle_, "comm_recovery_probe_snapshot"));
     const char *symbol_error = dlerror();
     if (symbol_error != nullptr || probe_fn == nullptr) {
-        throw UnsupportedRuntimeOperation(
-            "experiment3 communication recovery probe is not exported by this platform runtime"
-        );
+        throw UnsupportedRuntimeOperation("communication recovery snapshot is not exported by this platform runtime");
     }
 
     CommRecoveryProbeSnapshot snapshot{};
     int rc = probe_fn(reinterpret_cast<void *>(comm_handle), allocation_id, &snapshot);
     if (rc != 0) {
-        throw std::runtime_error("experiment3 communication recovery probe failed with code " + std::to_string(rc));
+        throw std::runtime_error("communication recovery snapshot failed with code " + std::to_string(rc));
     }
     if (snapshot.version != COMM_RECOVERY_PROBE_VERSION) {
-        throw std::runtime_error("experiment3 communication recovery probe returned an unsupported version");
+        throw std::runtime_error("communication recovery snapshot returned an unsupported version");
     }
     return snapshot;
 }

@@ -18,6 +18,7 @@
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
 #include "pipeline_slot_pool.h"
+#include "../platform_comm/domain_recovery.h"
 #include "runtime_c_api.h"
 
 class ChipWorker;
@@ -78,6 +79,8 @@ public:
     void drain();
     void close();
     ExecutionRecoveryResult recover_execution(uint64_t failed_run_epoch, ExecutionRecoveryScope scope);
+    DomainRecoveryResult
+    recover_comm_domain(uint64_t comm_handle, uint64_t allocation_id, const DomainRecoveryRequest &request);
     bool poisoned() const;
 
 private:

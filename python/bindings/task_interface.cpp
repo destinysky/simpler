@@ -3385,6 +3385,59 @@ NB_MODULE(_task_interface, m) {
         );
 
     // --- ChipWorker ---
+    nb::enum_<DomainRecoveryImpact>(m, "DomainRecoveryImpact")
+        .value("EXECUTION_ONLY", DomainRecoveryImpact::EXECUTION_ONLY)
+        .value("DOMAIN_BINDINGS", DomainRecoveryImpact::DOMAIN_BINDINGS)
+        .value("DOMAIN_TRANSPORT", DomainRecoveryImpact::DOMAIN_TRANSPORT)
+        .value("SHARED_COMMUNICATION", DomainRecoveryImpact::SHARED_COMMUNICATION)
+        .value("DEVICE", DomainRecoveryImpact::DEVICE);
+    nb::enum_<DomainRecoveryEngine>(m, "DomainRecoveryEngine")
+        .value("NONE", DomainRecoveryEngine::NONE)
+        .value("SDMA", DomainRecoveryEngine::SDMA)
+        .value("URMA", DomainRecoveryEngine::URMA)
+        .value("CCU", DomainRecoveryEngine::CCU);
+    nb::enum_<DomainRecoveryStatus>(m, "DomainRecoveryStatus")
+        .value("PRESERVED", DomainRecoveryStatus::PRESERVED)
+        .value("REBUILT", DomainRecoveryStatus::REBUILT)
+        .value("ALREADY_RECOVERED", DomainRecoveryStatus::ALREADY_RECOVERED)
+        .value("INVALID_STATE", DomainRecoveryStatus::INVALID_STATE)
+        .value("STALE_GENERATION", DomainRecoveryStatus::STALE_GENERATION)
+        .value("BUSY", DomainRecoveryStatus::BUSY)
+        .value("QUIESCENCE_UNPROVEN", DomainRecoveryStatus::QUIESCENCE_UNPROVEN)
+        .value("UNSUPPORTED", DomainRecoveryStatus::UNSUPPORTED)
+        .value("GIVE_UP", DomainRecoveryStatus::GIVE_UP)
+        .value("RECOVERY_FAILED", DomainRecoveryStatus::RECOVERY_FAILED);
+    nb::class_<DomainRecoveryRequest>(m, "DomainRecoveryRequest")
+        .def(nb::init<>())
+        .def_ro("abi_version", &DomainRecoveryRequest::abi_version)
+        .def_ro("struct_bytes", &DomainRecoveryRequest::struct_bytes)
+        .def_rw("recovery_id", &DomainRecoveryRequest::recovery_id)
+        .def_rw("expected_generation", &DomainRecoveryRequest::expected_generation)
+        .def_rw("failed_run_epoch", &DomainRecoveryRequest::failed_run_epoch)
+        .def_rw("impact", &DomainRecoveryRequest::impact)
+        .def_rw("collective_quiescence", &DomainRecoveryRequest::collective_quiescence)
+        .def_rw("original_rc", &DomainRecoveryRequest::original_rc);
+    nb::class_<DomainRecoveryResult>(m, "DomainRecoveryResult")
+        .def_ro("abi_version", &DomainRecoveryResult::abi_version)
+        .def_ro("struct_bytes", &DomainRecoveryResult::struct_bytes)
+        .def_ro("status", &DomainRecoveryResult::status)
+        .def_ro("engine", &DomainRecoveryResult::engine)
+        .def_ro("original_rc", &DomainRecoveryResult::original_rc)
+        .def_ro("recovery_rc", &DomainRecoveryResult::recovery_rc)
+        .def_ro("recovery_id", &DomainRecoveryResult::recovery_id)
+        .def_ro("allocation_id", &DomainRecoveryResult::allocation_id)
+        .def_ro("previous_generation", &DomainRecoveryResult::previous_generation)
+        .def_ro("generation", &DomainRecoveryResult::generation)
+        .def_ro("communication_context", &DomainRecoveryResult::communication_context)
+        .def_ro("hccl_comm", &DomainRecoveryResult::hccl_comm)
+        .def_ro("comm_stream", &DomainRecoveryResult::comm_stream)
+        .def_ro("device_ctx", &DomainRecoveryResult::device_ctx)
+        .def_ro("local_window_base", &DomainRecoveryResult::local_window_base)
+        .def_ro("window_size", &DomainRecoveryResult::window_size)
+        .def_ro("workspace", &DomainRecoveryResult::workspace)
+        .def_ro("domain_preserved", &DomainRecoveryResult::domain_preserved)
+        .def_ro("rebind_required", &DomainRecoveryResult::rebind_required);
+
     nb::enum_<ExecutionRecoveryStatus>(m, "ExecutionRecoveryStatus")
         .value("RECOVERED", ExecutionRecoveryStatus::RECOVERED)
         .value("ALREADY_RECOVERED", ExecutionRecoveryStatus::ALREADY_RECOVERED)
@@ -3717,10 +3770,15 @@ NB_MODULE(_task_interface, m) {
             "Pair to comm_alloc_domain_windows: collectively release the per-rank pool."
         )
         .def(
-            "_experiment3_comm_recovery_probe",
+            "recover_comm_domain", &ChipWorker::recover_comm_domain, nb::arg("comm_handle"), nb::arg("allocation_id"),
+            nb::arg("request"), nb::call_guard<nb::gil_scoped_release>(),
+            "Recover one logical CommDomain after all users are fenced; returns generation and binding metadata "
+            "without dispatch."
+        )
+        .def(
+            "comm_recovery_snapshot",
             [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id) {
-                const CommRecoveryProbeSnapshot snapshot =
-                    self.experiment3_comm_recovery_probe(comm_handle, allocation_id);
+                const CommRecoveryProbeSnapshot snapshot = self.comm_recovery_snapshot(comm_handle, allocation_id);
                 nb::dict out;
                 out["version"] = snapshot.version;
                 out["workspace_kind"] = snapshot.workspace_kind;

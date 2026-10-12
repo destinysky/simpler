@@ -554,6 +554,25 @@ ExecutionRecoveryResult ChipRunLane::recover_execution(uint64_t failed_run_epoch
     return result;
 }
 
+DomainRecoveryResult
+ChipRunLane::recover_comm_domain(uint64_t comm_handle, uint64_t allocation_id, const DomainRecoveryRequest &request) {
+    std::lock_guard<std::mutex> lk(state_->mu);
+    DomainRecoveryResult result;
+    result.allocation_id = allocation_id;
+    result.recovery_id = request.recovery_id;
+    result.original_rc = request.original_rc;
+    if (state_->closed || !state_->fifo.empty()) {
+        result.status = state_->closed ? DomainRecoveryStatus::INVALID_STATE : DomainRecoveryStatus::BUSY;
+        return result;
+    }
+    // Domain recovery never clears execution admission poison.
+    if (state_->poison != nullptr && state_->poison_epoch != request.failed_run_epoch) {
+        result.status = DomainRecoveryStatus::STALE_GENERATION;
+        return result;
+    }
+    return state_->worker->recover_comm_domain_substrate(comm_handle, allocation_id, request);
+}
+
 bool ChipRunLane::poisoned() const {
     std::lock_guard<std::mutex> lk(state_->mu);
     return state_->poison != nullptr;

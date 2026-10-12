@@ -67,6 +67,11 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     CoreCallable,
     DataType,
     DeviceMemoryInfo,
+    DomainRecoveryEngine,
+    DomainRecoveryImpact,
+    DomainRecoveryRequest,
+    DomainRecoveryResult,
+    DomainRecoveryStatus,
     ExecutionRecoveryResult,
     ExecutionRecoveryScope,
     ExecutionRecoveryStatus,
@@ -181,6 +186,11 @@ from .global_comm_domain import GlobalDomainAttachment, GlobalDomainBuffer, Glob
 __all__ = [
     "DataType",
     "DeviceMemoryInfo",
+    "DomainRecoveryEngine",
+    "DomainRecoveryImpact",
+    "DomainRecoveryRequest",
+    "DomainRecoveryResult",
+    "DomainRecoveryStatus",
     "ExecutionRecoveryResult",
     "ExecutionRecoveryScope",
     "ExecutionRecoveryStatus",
@@ -1502,6 +1512,25 @@ class ChipWorker:
     def execution_recovery_state(self):
         """Read the failed native generation and original fault without rearming."""
         return self._impl.execution_recovery_state()
+
+    def recover_comm_domain(self, comm_handle: int, allocation_id: int, request):
+        """Explicit domain preservation/rematerialization; never dispatches or rebinds.
+
+        Rebuild requires collective_quiescence from the domain owner, covering
+        every member and all DMA users. All members must use the same recovery
+        id, generation and impact, then check every result before using bindings.
+        """
+        with self._lifecycle_lock:
+            if self._init_owner_thread is not threading.current_thread() or self._init_in_progress:
+                raise RuntimeError("ChipWorker.recover_comm_domain() requires the init owner thread")
+        try:
+            return self._impl.recover_comm_domain(comm_handle, allocation_id, request)
+        finally:
+            _flush_host_log_or_warn("ChipWorker.recover_comm_domain()")
+
+    def comm_recovery_snapshot(self, comm_handle: int, allocation_id: int):
+        """Read resource identities and queue diagnostics without certifying DMA drain."""
+        return self._impl.comm_recovery_snapshot(comm_handle, allocation_id)
 
     def recover_execution(self, failed_run_epoch: int, scope=None):
         """Explicitly rearm L2 execution; the caller owns replay and retry policy.

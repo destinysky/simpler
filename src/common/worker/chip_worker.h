@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "../platform_comm/comm.h"
+#include "../platform_comm/domain_recovery.h"
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
 #include "pipeline_slot_pool.h"
@@ -228,7 +229,9 @@ public:
     /// inside the backend's per-allocation record).
     void
     comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
-    CommRecoveryProbeSnapshot experiment3_comm_recovery_probe(uint64_t comm_handle, uint64_t allocation_id);
+    DomainRecoveryResult
+    recover_comm_domain(uint64_t comm_handle, uint64_t allocation_id, const DomainRecoveryRequest &request);
+    CommRecoveryProbeSnapshot comm_recovery_snapshot(uint64_t comm_handle, uint64_t allocation_id);
     std::tuple<std::vector<uint8_t>, uint64_t, size_t> comm_global_domain_prepare(
         uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
     );
@@ -366,6 +369,7 @@ private:
     CommDeriveContextFn comm_derive_context_fn_ = nullptr;
     CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
+    decltype(&comm_recover_domain) comm_recover_domain_fn_ = nullptr;
     CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
     CommGlobalDomainImportFn comm_global_domain_import_fn_ = nullptr;
     CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
@@ -407,6 +411,8 @@ private:
     );
     void cleanup_native_runs_noexcept() noexcept;
     ExecutionRecoveryResult recover_execution_substrate(uint64_t failed_run_epoch, ExecutionRecoveryScope scope);
+    DomainRecoveryResult
+    recover_comm_domain_substrate(uint64_t comm_handle, uint64_t allocation_id, const DomainRecoveryRequest &request);
 
     friend struct ChipRunLaneState;
     friend class ChipRunLane;
