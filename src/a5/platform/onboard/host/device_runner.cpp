@@ -28,7 +28,6 @@
 #include "aicpu_loader/host/load_aicpu_op.h"
 
 #include <cassert>
-#include <cstdlib>
 #include <cstddef>
 #include <cstring>
 #include <iostream>
@@ -48,13 +47,6 @@
 
 namespace {
 constexpr const char *kAicpuTopologyQueryName = "simpler_aicpu_query_topology";
-
-bool experiment2_env_enabled(const char *name) {
-    const char *value = std::getenv(name);
-    return value != nullptr && std::strcmp(value, "1") == 0;
-}
-
-bool experiment2_probe_enabled() { return experiment2_env_enabled("SIMPLER_EXPERIMENT2_PROBE"); }
 }  // namespace
 
 // dep_gen has two shapes, one per orchestration site, and each runtime provides
@@ -349,14 +341,6 @@ int DeviceRunner::prepare_execution(
     if (rc != 0) {
         LOG_ERROR("ensure_device_initialized failed: %d", rc);
         return rc;
-    }
-    if (experiment2_probe_enabled()) {
-        LOG_INFO(
-            "[PTO_RECOVERY_EXP2] EXECUTION_STREAMS stage=prepare run_epoch=%llu generation=%llu slot=%u "
-            "aicpu=%p aicore=%p",
-            static_cast<unsigned long long>(identity.run_epoch), static_cast<unsigned long long>(identity.generation),
-            pipeline_slot, reinterpret_cast<void *>(stream_aicpu_), reinterpret_cast<void *>(stream_aicore_)
-        );
     }
 
     ensure_device_wall_buffer(execution->kernel_args);

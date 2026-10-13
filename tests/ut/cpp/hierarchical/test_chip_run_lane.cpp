@@ -60,9 +60,11 @@ size_t g_recovery_calls{0};
 uint64_t g_last_epoch{0};
 
 size_t g_domain_calls{0};
+DomainRecoveryStatus g_domain_status{DomainRecoveryStatus::PRESERVED};
 int domain_recover(void *, uint64_t allocation_id, const DomainRecoveryRequest *request, DomainRecoveryResult *result) {
     ++g_domain_calls;
-    result->status = DomainRecoveryStatus::PRESERVED;
+    result->status = g_domain_status;
+    result->recovery_rc = g_domain_status == DomainRecoveryStatus::RECOVERY_FAILED ? 88 : 0;
     result->allocation_id = allocation_id;
     result->original_rc = request->original_rc;
     result->generation = request->expected_generation;
@@ -164,6 +166,7 @@ void prime_worker(ChipWorker &worker) {
     g_recovery = {};
     g_recovery_calls = 0;
     g_domain_calls = 0;
+    g_domain_status = DomainRecoveryStatus::PRESERVED;
     worker.comm_recover_domain_fn_ = domain_recover;
     g_last_epoch = 0;
     {
@@ -914,4 +917,33 @@ TEST(ChipRunLaneTest, UnsupportedDomainRecoveryAndDeviceFaultKeepExistingPlatfor
     worker.comm_session_index_.clear();
     lane.close();
     worker.finalize();
+}
+
+TEST(ChipRunLaneTest, FailedDomainRecoveryCannotBeBypassedByExecutionRearm) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    worker.create_comm_session(reinterpret_cast<void *>(0xC0), nullptr, true);
+    worker.comm_recover_domain_fn_ = domain_recover;
+    g_recovery.status = ExecutionRecoveryStatus::RECOVERY_REQUIRED;
+    g_recovery.failed_run_epoch = 7;
+    g_recovery.quiesced = 1;
+    g_domain_status = DomainRecoveryStatus::RECOVERY_FAILED;
+    DomainRecoveryRequest request;
+    request.recovery_id = 1;
+    request.expected_generation = 1;
+    request.failed_run_epoch = 7;
+    request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
+    request.collective_quiescence = 1;
+    request.original_rc = 507018;
+    ASSERT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::RECOVERY_FAILED);
+    const auto execution = lane.recover_execution(7, ExecutionRecoveryScope::EXECUTION_ONLY);
+    EXPECT_EQ(execution.status, ExecutionRecoveryStatus::INVALID_STATE);
+    EXPECT_EQ(execution.recovery_rc, 88);
+    EXPECT_EQ(execution.communication_preserved, 0u);
+    EXPECT_EQ(g_recovery_calls, 0u);
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_THROW(
+        lane.submit(0, ChipStorageTaskArgs{}, CallConfig{}, PipelineSlotLease{0, 0, 1}, 1, 1), std::runtime_error
+    );
 }

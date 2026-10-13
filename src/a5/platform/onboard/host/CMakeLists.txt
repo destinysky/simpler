@@ -54,6 +54,41 @@ if(NOT PTO_ISA_ROOT)
         "a5 onboard host_runtime PTO async workspace requires "
         "-DPTO_ISA_ROOT=<pin-resolved path> (needs pto-isa host headers)")
 endif()
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+    # The managed PTO checkout remains pristine. This pin-checked host-only
+    # provider overlay supplies stream ownership and Abort/requery operations.
+    find_package(Git REQUIRED)
+    set(SDMA_PROVIDER_DIR "${CMAKE_CURRENT_BINARY_DIR}/sdma-provider")
+    set(SDMA_PROVIDER_HEADER "include/pto/comm/async/sdma/sdma_workspace_manager.hpp")
+    set(SDMA_PROVIDER_PATCH "${CMAKE_CURRENT_SOURCE_DIR}/pto_sdma_recovery.patch")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${PTO_ISA_ROOT}/${SDMA_PROVIDER_HEADER}" "${SDMA_PROVIDER_PATCH}")
+    file(SHA256 "${PTO_ISA_ROOT}/${SDMA_PROVIDER_HEADER}" SDMA_PROVIDER_HASH)
+    if(NOT SDMA_PROVIDER_HASH STREQUAL "474655b0b2aee1a3b85817bb350f061a847988d4673fcc6295fb1aa29b2a06fa")
+        message(FATAL_ERROR "SDMA recovery provider does not match the pinned header; update its overlay")
+    endif()
+    configure_file("${PTO_ISA_ROOT}/${SDMA_PROVIDER_HEADER}"
+        "${SDMA_PROVIDER_DIR}/${SDMA_PROVIDER_HEADER}" COPYONLY)
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
+        "${GIT_EXECUTABLE}" apply --check --no-index "${SDMA_PROVIDER_PATCH}"
+        WORKING_DIRECTORY "${SDMA_PROVIDER_DIR}" RESULT_VARIABLE SDMA_PATCH_CHECK
+        ERROR_VARIABLE SDMA_PATCH_ERROR)
+    if(NOT SDMA_PATCH_CHECK EQUAL 0)
+        message(FATAL_ERROR "Pinned SDMA provider preimage mismatch: ${SDMA_PATCH_ERROR}")
+    endif()
+    execute_process(COMMAND "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
+        "${GIT_EXECUTABLE}" apply --no-index "${SDMA_PROVIDER_PATCH}"
+        WORKING_DIRECTORY "${SDMA_PROVIDER_DIR}" RESULT_VARIABLE SDMA_PATCH_APPLY
+        ERROR_VARIABLE SDMA_PATCH_ERROR)
+    if(NOT SDMA_PATCH_APPLY EQUAL 0)
+        message(FATAL_ERROR "SDMA provider overlay failed: ${SDMA_PATCH_ERROR}")
+    endif()
+    file(SHA256 "${SDMA_PROVIDER_DIR}/${SDMA_PROVIDER_HEADER}" SDMA_PROVIDER_POST_HASH)
+    if(NOT SDMA_PROVIDER_POST_HASH STREQUAL "735efb1e4f00ffdd6e3e9e151aef47ac48a9d9e30df31eca08321661d746a309")
+        message(FATAL_ERROR "SDMA recovery provider postimage mismatch")
+    endif()
+    list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${SDMA_PROVIDER_DIR}/include")
+endif()
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${PTO_ISA_ROOT}/include")
 
 # Build complete source list: core host sources + sources from CUSTOM_SOURCE_DIRS
@@ -102,6 +137,9 @@ list(LENGTH HOST_RUNTIME_SOURCES NUM_HOST_RUNTIME_SOURCES)
 message(STATUS "Host runtime: ${NUM_HOST_RUNTIME_SOURCES} source files")
 message(VERBOSE "Host runtime sources: ${HOST_RUNTIME_SOURCES}")
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
+if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
+    target_include_directories(host_runtime BEFORE PRIVATE "${SDMA_PROVIDER_DIR}/include")
+endif()
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(host_runtime)
 add_custom_command(TARGET host_runtime POST_BUILD

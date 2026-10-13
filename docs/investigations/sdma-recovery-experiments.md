@@ -1,88 +1,111 @@
-# SDMA failure and successor fencing experiments
+# SDMA recovery method comparison
 
-Baseline: `opretry-soft` at `ad3fa870ad76564b5ef9f4721399a41fdb7b1e0f`.
-These manual experiments require two A5 devices and the pinned PTO-ISA revision.
-They do not implement automatic operator recovery dispatch.
+Preimage: `opretry-soft` at `83f6a6befb5d5245478df90ee61e0e6f52d9b323`.
+Two A5 devices and the pinned PTO-ISA revision are required. URMA/CCU use no
+SDMA assumptions or repair operations. These experiments do not implement
+automatic distributed replay or select a recovery mode from a host error code.
 
-## Ordering contract
+## Scope and safety contract
 
-A successor may be QUEUED or PREPARED in a native slot while its predecessor is
-active, but it must not cross the device launch fence. A predecessor failure
-poisons admission and terminalizes its unlaunched successor. The old successor
-handle must remain terminal after recovery. The external driver redispatches A
-with a new generation, waits for A on both ranks, then redispatches B with a new
-generation. B's output must retain its sentinel until that redispatch.
+The protocol regression completes a real peer TGET before withholding a
+notification. Its explicit execution recovery preserves C/E, persistent execution
+streams, HCCL, comm stream, SDMA workspace, VMM windows and device CommContext.
 
-The CPU test covers both QUEUED and PREPARED successor paths and stale-token
-rejection. The device test records the actual preparation disposition. The two
-persistent execution streams therefore never contain a launched B behind A.
-This is a launch/admission contract, not a claim that arbitrary already-submitted
-vendor stream tasks can be cancelled independently.
+The transport comparison submits the same aligned unmapped source (`0x1000`) in
+both independent runs. Checkpoint 2 proves request-entry success, not hardware
+acceptance or an actual link/network outage. Local PTO retirement alone does not
+stop DMA. Every producer is fenced; the backend calls `aclrtStreamAbort` on all 48
+owned SDMA streams and collectively agrees on their results before workspace writes.
+No device-wide synchronize, device Abort, device reset or Context recreation is used.
 
-## Experiments
+- `rearm`: keep all streams/workspace and requery live STARS queue metadata.
+- `replace`: after the same successful collective Abort, provision new SDMA
+  streams/workspace while the old resources still exist; update the sole domain's
+  device workspace binding, then retire the old stopped transport. C/E, execution
+  streams, HCCL, comm stream, VMM windows and device CommContext address stay fixed.
 
-1. **Protocol timeout after completed SDMA:** one real peer TGET per rank completes.
-   Its tensor-dependent consumer records completion, then registers a notification
-   counter that neither rank publishes. The existing scheduler watchdog fails A.
-   After local PTO retirement and both ranks' data-completion proof, the driver
-   calls the explicit execution primitive and retries A before B. No other domain
-   users or outstanding data operations exist in this isolated workload. This
-   proves only this protocol-wait case; it does not prove transport fault repair.
-2. **Transport observation:** an aligned, unmapped source (`0x1000`) is passed to
-   the real SDMA TGET path. The checkpoint distinguishes entry (1), request-entry
-   returned success (2), and request-entry rejected (3). Collect the device logs
-   to establish whether an SDMA transport error or only completion timeout occurred.
-   No proven transport quiescence is available. This case never rearms execution,
-   retries, rematerializes windows, or explicitly releases communication resources.
-   Each isolated rank reports its evidence and exits; default process cleanup is
-   outside the soft-recovery primitive. An unclassified/failed injection is not
-   evidence that transport recovery works or that resources cannot be reused.
+The current provider refuses other allocations, subsets, derived/base window contexts
+and pending cleanup. Its request requires a full owner fence on all ranks. FIFO and
+native-slot gates do not prove that external users are fenced. Abort failure causes
+no requery/replacement/retry. Failure after mutation quarantines the transaction;
+the lane rejects subsequent execution rearming and submission. Communication
+cleanup transfers unproved DMA resources to the terminal device lifecycle,
+without freeing their workspace/windows in the soft primitive.
 
-The old SDMA snapshot comparison of workspace `sq_head/sq_tail` is removed.
-`all_queues_empty = 0` means unknown for this provider. Snapshot-copy error counts
-and stable identity/signature values cannot certify engine quiescence.
+The host-only PTO manager overlay supplies ownership-aware Abort and workspace
+refresh APIs. CMake checks the complete pinned-header SHA256 and applies a checked-in
+diff to a build-directory copy. The managed `build/pto-isa` checkout stays clean.
+No private-member layout cast or duplicated workspace manager is used. The original
+STOP_ON_FAILURE setter is retained. Once upstream supplies these APIs, the overlay
+and build adaptation can be removed together.
 
-## Build and run
+## Ordering and fresh-data proof
 
-Run from the Linux repository root. Use separate invocations; run the protocol
-case first. Retain device logs from the transport invocation before further tests.
+A fault terminalizes the prepared/queued B without launching it. Ordinary submission
+remains refused until explicit recovery. Old B cannot be activated after recovery.
+Retry A uses a new generation/completion allocation, new input values (200 + rank),
+zeroed completion markers and an output sentinel. All 16384 transferred floats must
+equal the new peer data. Both ranks commit A before redispatching B with a new
+generation and another input change (300 + rank). B remains untouched until then;
+its completion marker records predecessor 1 and final ordering word 2.
+
+Cached workspace head/tail and `all_queues_empty = 0` are diagnostic/unknown.
+`queue_read_errors` counts snapshot-copy failures. Dynamic queue signatures are
+progress, not transport identity. Refresh may update hardware descriptions while
+retaining the Runtime stream objects; resource identity must be read with that scope.
+
+## Commands
+
+Run sequentially from the Linux repository root. Activate the existing project-local
+venv. Reinstall before testing; runtime binaries are not rebuilt on import.
 
 ```bash
-python -m venv --system-site-packages .venv
-source .venv/bin/activate
 python -m pip install --no-build-isolation -e .
-cmake -S tests/ut/cpp -B build/sdma-recovery-ut -DCMAKE_BUILD_TYPE=Debug
-cmake --build build/sdma-recovery-ut --target test_chip_run_lane -j 4
-build/sdma-recovery-ut/test_chip_run_lane --gtest_filter=ChipRunLaneTest.FailedPredecessorRevokesSuccessorAndExternalReplayKeepsOrder
-mkdir -p sdma-recovery-test-logs/protocol-device sdma-recovery-test-logs/transport-device
+cmake -S tests/ut/cpp -B build/sdma-abort-ut -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/sdma-abort-ut --target test_chip_run_lane test_domain_recovery -j 4
+ctest --test-dir build/sdma-abort-ut --output-on-failure -R '^(test_chip_run_lane|test_domain_recovery)$'
+mkdir -p sdma-abort-test-logs/rearm-device sdma-abort-test-logs/replace-device
 set -o pipefail
-ASCEND_PROCESS_LOG_PATH="$PWD/sdma-recovery-test-logs/protocol-device" pytest tests/st/runtime_fatal_codes/test_runtime_fatal_codes.py::test_a5_sdma_protocol_timeout_and_fifo_order --platform a5 --runtime tensormap_and_ringbuffer --device 0,1 --manual include --require-pto-isa --pto-session-timeout 1200 -v -s 2>&1 | tee sdma-recovery-test-logs/protocol.log
-ASCEND_PROCESS_LOG_PATH="$PWD/sdma-recovery-test-logs/transport-device" pytest tests/st/runtime_fatal_codes/test_runtime_fatal_codes.py::test_a5_sdma_transport_fault_observation --platform a5 --runtime tensormap_and_ringbuffer --device 0,1 --manual include --require-pto-isa --pto-session-timeout 1200 -v -s 2>&1 | tee sdma-recovery-test-logs/transport.log
-grep -F '[SDMA_RECOVERY_EVIDENCE]' sdma-recovery-test-logs/protocol.log sdma-recovery-test-logs/transport.log
-grep -E 'EXECUTION_RECOVER|EXPLICIT_ORCH_FATAL|sched_error_code|sub_class|shutdown|SHUTDOWN|507014|507018' sdma-recovery-test-logs/protocol.log sdma-recovery-test-logs/transport.log
-grep -RniE 'sdma|smmu|exception|timeout|error|507014|507018' sdma-recovery-test-logs/transport-device
+pytest examples/a5/tensormap_and_ringbuffer/vector_example/test_vector_example.py --platform a5 --runtime tensormap_and_ringbuffer --device 0 --manual include --require-pto-isa --pto-session-timeout 1200 -v -s 2>&1 | tee sdma-abort-test-logs/A1.log
+pytest examples/a5/tensormap_and_ringbuffer/sdma_async_completion_demo/test_sdma_async_completion_demo.py --platform a5 --runtime tensormap_and_ringbuffer --device 0,1 --manual include --require-pto-isa --pto-session-timeout 1200 -v -s 2>&1 | tee sdma-abort-test-logs/A2.log
+pytest tests/st/runtime_fatal_codes/test_runtime_fatal_codes.py::test_a5_sdma_protocol_timeout_and_fifo_order --platform a5 --runtime tensormap_and_ringbuffer --device 0,1 --manual include --require-pto-isa --pto-session-timeout 1200 -v -s 2>&1 | tee sdma-abort-test-logs/protocol.log
+ASCEND_PROCESS_LOG_PATH="$PWD/sdma-abort-test-logs/rearm-device" pytest 'tests/st/runtime_fatal_codes/test_runtime_fatal_codes.py::test_a5_sdma_transport_recovery_compare[rearm]' --platform a5 --runtime tensormap_and_ringbuffer --device 0,1 --manual include --require-pto-isa --pto-session-timeout 1200 -v -s 2>&1 | tee sdma-abort-test-logs/rearm.log
+ASCEND_PROCESS_LOG_PATH="$PWD/sdma-abort-test-logs/replace-device" pytest 'tests/st/runtime_fatal_codes/test_runtime_fatal_codes.py::test_a5_sdma_transport_recovery_compare[replace]' --platform a5 --runtime tensormap_and_ringbuffer --device 0,1 --manual include --require-pto-isa --pto-session-timeout 1200 -v -s 2>&1 | tee sdma-abort-test-logs/replace.log
+grep -F '[SDMA_RECOVERY_EVIDENCE]' sdma-abort-test-logs/protocol.log sdma-abort-test-logs/rearm.log sdma-abort-test-logs/replace.log
+grep -E 'SDMA_STREAM_ABORT|SDMA_ABORT_RESULT|SDMA_REQUERY_RESULT|SDMA_REPLACEMENT_READY|TRANSPORT_REARMED|DOMAIN_RECOVERY_REJECTED|EXECUTION_RECOVER' sdma-abort-test-logs/rearm.log sdma-abort-test-logs/replace.log
+grep -RniE 'sdma|smmu|exception|timeout|error|507014|507018' sdma-abort-test-logs/rearm-device sdma-abort-test-logs/replace-device
 ```
 
-## Results to return
+When `task-submit` is installed on the hardware host, each pytest invocation must
+hold its two-device lock for the whole run. Avoid broad G/H matrices for this question.
 
-Return the CPU test summary, both pytest summaries, every
-`[SDMA_RECOVERY_EVIDENCE]` record, and relevant device-error records with timestamps.
-If a case fails, include its traceback and last evidence checkpoint.
+## Results and decision
 
-Protocol recovery succeeds only if **both ranks** report
-`SAME_RESOURCES_RETRY_A_THEN_B_PASS`, final ordering word 2, old B never launched,
-full transfer data and output-sentinel assertions pass, and C/E/execution streams,
-HCCL/comm stream/workspace/windows/CommContext bindings remain unchanged. There
-must be no 507014. Failed or unproven recovery reports are observations, not success.
+Return CPU/pytest summaries, all evidence records, all Abort result records and
+relevant device errors. Successful stop requires **channels = stopped = 48, rc = 0
+on both ranks**. Successful recovery additionally requires the corresponding
+`SDMA_REARM_RETRY_A_THEN_B_PASS` or `SDMA_REPLACE_RETRY_A_THEN_B_PASS` on both ranks,
+full fresh-data assertions, old B never launched and final order 2. Protocol regression
+requires `SAME_RESOURCES_RETRY_A_THEN_B_PASS`. A1/A2 require ordinary pytest PASS.
+There must be no actual new 507014 error; numeric constants in tracebacks do not count.
 
-`OBSERVATION_COMPLETE` and pytest PASS alone mean the observation harness completed.
-For the transport experiment, `TRANSPORT_QUIESCENCE_UNPROVEN_NO_RETRY` is the expected
-conservative result. Submission checkpoint 2 and device logs are needed to classify
-it; an unreadable checkpoint leaves injection evidence incomplete. A process timeout,
-missing rank, B launch, stale-handle activation, or data/order mismatch is a failure.
+The observation harness can complete with `TRANSPORT_RECOVERY_FAILED_NO_RETRY` or
+`LEGAL_RETRY_FAILED_NO_B`. A green pytest in those cases means bounded evidence
+collection, not recovered traffic. `failure_status` describes the original fault;
+`current_execution_status` is refreshed after rearm/probe so the two are not confused.
 
-The next decision is whether a protocol-only failure supports preservation on this
-hardware, and which backend stop/health evidence is missing for actual transport
-failure. Backend capability assessment, asymmetric-rank coordination, TaskArgs
-rebinding, replay eligibility, retry budgets/backoff and distributed commit are
-still pending. URMA and CCU are not changed by these experiments.
+| Original transport after Abort/requery | New transport after Abort | Decision |
+| --- | --- | --- |
+| Legal fresh transfer and A-before-B pass | Either | In-place recovery suffices for this injected failure |
+| Fails, with established stop and matched injection | Legal fresh transfer and A-before-B pass | Transport replacement is required under these implemented recovery capabilities |
+| Fails | Fails | Do not claim transport replacement solves it; inspect C/shared/device failure evidence |
+| Stop unproven or injection invalid | Any | No method conclusion; no unsafe replay |
+
+Replacement necessity is scoped to this fault and supported cleanup/requery method,
+not permanent hardware damage or arbitrary network outages. Actual SDMA/SMMU/link
+records are still required to classify the injected failure. Rank coordination,
+logical-op replay eligibility, TaskArgs rebind planning and retry/backoff/commit remain
+outside these tests. The obsolete observation-only transport entry is removed.
+The comparison injection remains only while it is needed to select the mechanism;
+after that decision, remove the injection branch and comparison harness together,
+retaining the resulting production primitive and ordering regressions.

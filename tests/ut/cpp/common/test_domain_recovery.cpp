@@ -217,6 +217,9 @@ TEST_F(DomainRecoveryTest, ProviderCapabilitiesDoNotAssumeSdmaForUrmaOrCcu) {
     EXPECT_TRUE(events.empty());
     ops.rebuild_supported = true;
     ops.transport_rebuild_supported = true;
+    ops.quiesce = [] {
+        return 0;
+    };
     request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
     EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::REBUILT);
 }
@@ -246,9 +249,9 @@ TEST_F(DomainRecoveryTest, FailedReleaseCannotReturnPreviouslyPreservedBinding) 
 }
 
 TEST_F(DomainRecoveryTest, IncompatibleAbiHasNoResourceEffects) {
-    request.abi_version = 2;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::UNSUPPORTED);
     request.abi_version = 1;
+    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::UNSUPPORTED);
+    request.abi_version = 2;
     request.struct_bytes = 0;
     EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::UNSUPPORTED);
     EXPECT_TRUE(events.empty());
@@ -263,6 +266,64 @@ TEST_F(DomainRecoveryTest, MalformedRequestHasNoResourceEffects) {
     request.impact = DomainRecoveryImpact::DOMAIN_BINDINGS;
     request.collective_quiescence = 2;
     EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::INVALID_STATE);
+    EXPECT_TRUE(events.empty());
+}
+
+TEST_F(DomainRecoveryTest, TransportAbortAgreementPrecedesAnyWorkspaceMutation) {
+    request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
+    request.transport_action = DomainTransportAction::REARM;
+    ops.transport_rearm_supported = true;
+    ops.quiesce = [&] {
+        events.push_back(30);
+        return 0;
+    };
+    ops.build = [&](auto &) {
+        events.push_back(10);
+        return 0;
+    };
+    const auto result = manager.recover(request, binding, ops);
+    EXPECT_EQ(result.status, DomainRecoveryStatus::REARMED);
+    EXPECT_EQ(events, (std::vector<int>{1, 30, 4, 10, 2, 20, 3}));
+    EXPECT_EQ(result.workspace, binding.workspace);
+    EXPECT_EQ(result.device_ctx, binding.device_ctx);
+    EXPECT_EQ(result.local_window_base, binding.local_window_base);
+    EXPECT_EQ(result.generation, 2u);
+    events.clear();
+    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::ALREADY_RECOVERED);
+    EXPECT_TRUE(events.empty());
+    request.transport_action = DomainTransportAction::REPLACE;
+    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::STALE_GENERATION);
+}
+
+TEST_F(DomainRecoveryTest, PartialAbortOrPeerAbortFailureCannotRequeryOrReplace) {
+    request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
+    request.transport_action = DomainTransportAction::REARM;
+    ops.transport_rearm_supported = true;
+    for (bool local_failure : {true, false}) {
+        DomainRecoveryManager separate;
+        events.clear();
+        ops.quiesce = [&] {
+            events.push_back(30);
+            return local_failure ? 88 : 0;
+        };
+        disagree_phase = local_failure ? 0 : 4;
+        const auto result = separate.recover(request, binding, ops);
+        EXPECT_EQ(result.status, DomainRecoveryStatus::RECOVERY_FAILED);
+        EXPECT_EQ(result.recovery_rc, local_failure ? 88 : 77);
+        EXPECT_EQ(result.original_rc, request.original_rc);
+        EXPECT_EQ(events, (std::vector<int>{1, 30, 4}));
+        EXPECT_EQ(result.device_ctx, 0u);
+        EXPECT_EQ(result.workspace, 0u);
+    }
+}
+
+TEST_F(DomainRecoveryTest, TransportProducerFenceAndProviderAreMandatory) {
+    request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
+    ops.transport_rebuild_supported = true;
+    request.collective_quiescence = 0;
+    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::QUIESCENCE_UNPROVEN);
+    request.collective_quiescence = 1;
+    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::UNSUPPORTED);
     EXPECT_TRUE(events.empty());
 }
 

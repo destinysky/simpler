@@ -20,8 +20,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     auto *comm = reinterpret_cast<__gm__ CommContext *>(args[2]);
     const uint64_t mode = static_cast<uint64_t>(args[3]);
     const uint64_t offset = src->buffer.addr - comm->windowsIn[comm->rankId];
-    // Mode 2 submits an unmapped source to the transport; it must never retry
-    // or retire communication allocations based only on PTO shutdown proof.
+    // Mode 2 submits an unmapped source. Collective transport Abort precedes
+    // workspace refresh/replacement and any legal replay.
     const uint64_t remote = mode == 2 ? 0x1000ULL : comm->windowsIn[1 - comm->rankId] + offset;
     using ShapeT = Shape<1, 1, 1, 1, 16384>;
     using StrideT = pto::Stride<16384, 16384, 16384, 16384, 1>;

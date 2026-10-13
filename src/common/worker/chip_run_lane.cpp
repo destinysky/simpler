@@ -18,6 +18,7 @@
 #include <exception>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -294,6 +295,7 @@ struct ChipRunLaneState {
     uint64_t direct_generation{0};
     std::exception_ptr poison;
     uint64_t poison_epoch{0};
+    std::optional<DomainRecoveryResult> domain_recovery_failure;
     bool closed{false};
 };
 
@@ -534,6 +536,17 @@ void ChipRunLane::close() {
 
 ExecutionRecoveryResult ChipRunLane::recover_execution(uint64_t failed_run_epoch, ExecutionRecoveryScope scope) {
     std::lock_guard<std::mutex> lk(state_->mu);
+    if (state_->domain_recovery_failure) {
+        ExecutionRecoveryResult result = state_->worker->execution_recovery_state();
+        result.scope = scope;
+        if (result.status != ExecutionRecoveryStatus::DEVICE_UNUSABLE)
+            result.status = ExecutionRecoveryStatus::INVALID_STATE;
+        result.recovery_rc = state_->domain_recovery_failure->recovery_rc != 0 ?
+                                 state_->domain_recovery_failure->recovery_rc :
+                                 PTO_RUNTIME_ERR_INVALID_STATE;
+        result.communication_preserved = 0;
+        return result;
+    }
     if (state_->closed || !state_->fifo.empty() ||
         (state_->poison != nullptr && state_->poison_epoch != failed_run_epoch)) {
         ExecutionRecoveryResult result = state_->worker->execution_recovery_state();
@@ -570,7 +583,17 @@ ChipRunLane::recover_comm_domain(uint64_t comm_handle, uint64_t allocation_id, c
         result.status = DomainRecoveryStatus::STALE_GENERATION;
         return result;
     }
-    return state_->worker->recover_comm_domain_substrate(comm_handle, allocation_id, request);
+    result = state_->worker->recover_comm_domain_substrate(comm_handle, allocation_id, request);
+    if (result.status == DomainRecoveryStatus::RECOVERY_FAILED ||
+        (result.status == DomainRecoveryStatus::GIVE_UP &&
+         state_->worker->execution_recovery_state().status != ExecutionRecoveryStatus::DEVICE_UNUSABLE)) {
+        state_->domain_recovery_failure = result;
+        if (state_->poison == nullptr) {
+            state_->poison = std::make_exception_ptr(std::runtime_error("communication recovery failed"));
+            state_->poison_epoch = request.failed_run_epoch;
+        }
+    }
+    return result;
 }
 
 bool ChipRunLane::poisoned() const {

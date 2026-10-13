@@ -72,6 +72,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     DomainRecoveryRequest,
     DomainRecoveryResult,
     DomainRecoveryStatus,
+    DomainTransportAction,
     ExecutionRecoveryResult,
     ExecutionRecoveryScope,
     ExecutionRecoveryStatus,
@@ -191,6 +192,7 @@ __all__ = [
     "DomainRecoveryRequest",
     "DomainRecoveryResult",
     "DomainRecoveryStatus",
+    "DomainTransportAction",
     "ExecutionRecoveryResult",
     "ExecutionRecoveryScope",
     "ExecutionRecoveryStatus",
@@ -1514,11 +1516,13 @@ class ChipWorker:
         return self._impl.execution_recovery_state()
 
     def recover_comm_domain(self, comm_handle: int, allocation_id: int, request):
-        """Explicit domain preservation/rematerialization; never dispatches or rebinds.
+        """Explicit resource recovery; never dispatches or rebinds TaskArgs.
 
-        Rebuild requires collective_quiescence from the domain owner, covering
-        every member and all DMA users. All members must use the same recovery
-        id, generation and impact, then check every result before using bindings.
+        Binding rebuild requires collective_quiescence from the domain owner, covering
+        every member and all DMA users. Transport recovery requires every
+        producer fenced; its provider obtains DMA stop proof through Abort.
+        All members use the same id, generation, impact and transport action,
+        then check every result before explicit execution rearm or redispatch.
         """
         with self._lifecycle_lock:
             if self._init_owner_thread is not threading.current_thread() or self._init_in_progress:

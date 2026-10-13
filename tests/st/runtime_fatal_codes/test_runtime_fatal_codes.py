@@ -45,6 +45,7 @@ from simpler.task_interface import (
     DomainRecoveryImpact,
     DomainRecoveryRequest,
     DomainRecoveryStatus,
+    DomainTransportAction,
     ExecutionRecoveryScope,
     ExecutionRecoveryStatus,
     _flush_host_log,
@@ -842,7 +843,9 @@ def _sdma_evidence(rank_id, phase, **fields):
     )
 
 
-def _sdma_recovery_rank(device_id, rank, rootinfo, barrier, proofs, outcomes, result_queue, mode):  # noqa: PLR0915
+def _sdma_recovery_rank(  # noqa: PLR0915
+    device_id, rank, rootinfo, barrier, proofs, outcomes, result_queue, mode, transport_action
+):
     """Own one device in an isolated process; unproven DMA only exits the process."""
     from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
@@ -879,26 +882,69 @@ def _sdma_recovery_rank(device_id, rank, rootinfo, barrier, proofs, outcomes, re
         result_queue.join_thread()
         _flush_host_log(1000)
 
-    def protocol_recovery(state):
+    def recover_transport(state):
+        request = DomainRecoveryRequest()
+        request.recovery_id = 1
+        request.expected_generation = 1
+        request.failed_run_epoch = state.failed_run_epoch
+        request.impact = DomainRecoveryImpact.DOMAIN_TRANSPORT
+        request.transport_action = (
+            DomainTransportAction.REARM if transport_action == "rearm" else DomainTransportAction.REPLACE
+        )
+        # This isolated full-communicator domain has no other producers.
+        # Backend Abort, not this owner vote, stops outstanding DMA.
+        request.collective_quiescence = 1
+        request.original_rc = state.original_rc
+        domain = native.recover_comm_domain(comm, 0, request)
+        outcomes[rank] = int(domain.status in (DomainRecoveryStatus.REARMED, DomainRecoveryStatus.REBUILT))
+        report.update(transport_status=str(domain.status), transport_rc=domain.recovery_rc)
+        _sdma_evidence(rank, "TRANSPORT_RECOVERY_RESULT", **report)
+        barrier.wait(timeout=90)
+        if not all(outcomes):
+            report.update(ok=True, outcome="TRANSPORT_RECOVERY_FAILED_NO_RETRY", b_launched=False)
+            publish(report)
+            os._exit(0)
+        assert domain.generation == 2
+        assert domain.device_ctx == device_ctx and domain.local_window_base == base
+        if transport_action == "rearm":
+            assert domain.workspace == before["workspace_addr"]
+        else:
+            assert domain.workspace != before["workspace_addr"]
+        duplicate = native.recover_comm_domain(comm, 0, request)
+        assert duplicate.status == DomainRecoveryStatus.ALREADY_RECOVERED
+        assert duplicate.workspace == domain.workspace
+
+    def recover_and_replay(state):
         evidence = read_words(a_marker)
-        assert evidence[:3] == [1, 0, 1], "notification timeout did not follow completed SDMA data transfer"
-        check_data(a_out, 101.0 - rank)
+        if mode == 1:
+            assert evidence[:3] == [1, 0, 1], "notification timeout did not follow completed SDMA data transfer"
+            check_data(a_out, 101.0 - rank)
+        else:
+            assert evidence[4] == 2, "fault did not follow SDMA request-entry success"
+            assert evidence[0] == 0, "invalid-source transfer unexpectedly completed"
+            report["submission_checkpoint"] = evidence[4]
         check_data(b_out, -77.0)
         assert read_words(b_marker) == [0] * 8 and read_words(base + 0x40000, 1) == [0]
-        proofs[rank] = int(state.quiesced == 1 and evidence[0] == 1)
+        proofs[rank] = int(state.quiesced == 1 and (mode == 2 or evidence[0] == 1))
         _sdma_evidence(rank, "B_BLOCKED", data_completed=evidence[0], b_launched=False, order=0)
         barrier.wait(timeout=30)
         if not all(proofs):
             report.update(ok=True, outcome="EXECUTION_QUIESCENCE_UNPROVEN_NO_RETRY")
             publish(report)
             os._exit(0)
-        # Only the protocol-wait case has proof for every submitted data op:
-        # one completed TGET per rank and no notification sends/other users.
+        if mode == 2:
+            recover_transport(state)
+        # Protocol waits have data-completion proof; transport faults require
+        # successful collective provider Abort and refresh/replacement first.
         recovered = native.recover_execution(state.failed_run_epoch, ExecutionRecoveryScope.EXECUTION_ONLY)
         outcomes[rank] = int(
             recovered.status in (ExecutionRecoveryStatus.RECOVERED, ExecutionRecoveryStatus.ALREADY_RECOVERED)
         )
-        report.update(recovery_status=str(recovered.status), recovery_rc=recovered.recovery_rc)
+        report.update(
+            recovery_status=str(recovered.status),
+            recovery_rc=recovered.recovery_rc,
+            current_execution_status=str(native.execution_recovery_state().status),
+        )
         _sdma_evidence(rank, "EXECUTION_REARM_RESULT", **report)
         barrier.wait(timeout=30)
         if not all(outcomes):
@@ -908,17 +954,49 @@ def _sdma_recovery_rank(device_id, rank, rootinfo, barrier, proofs, outcomes, re
         _assert_execution_identities(execution_before, recovered)
         after = _comm_snapshot(native, comm, 0)
         assert after["active_queue_count"] == 48 and after["queue_read_errors"] == 0, after
-        for field in comm_identity_fields:
+        stable_fields = (
+            comm_identity_fields
+            if mode == 1
+            else comm_identity_fields[:3] + ("local_window_base", "device_ctx", "workspace_size")
+        )
+        if mode == 2 and transport_action == "rearm":
+            stable_fields += ("workspace_addr",)
+        for field in stable_fields:
             assert after[field] == before[field], (rank, field, before[field], after[field])
         _sdma_evidence(rank, "COMM_AFTER_REARM", **after)
+        write(base, (ctypes.c_float * 16384)(*([200.0 + rank] * 16384)))
+        write(a_out, (ctypes.c_float * 16384)(*([-91.0] * 16384)))
         write(a_marker, (ctypes.c_uint32 * 8)())
+        barrier.wait(timeout=30)
         retry_args = args_for(a_out, a_marker, 0, 0, 1)
-        retry = submit(retry_args, 0, 3, 4)
-        assert retry.wait(30)
-        assert read_words(a_marker)[:3] == [1, 0, 1]
-        assert read_words(base + 0x40000, 1) == [1]
-        check_data(a_out, 101.0 - rank)
-        barrier.wait(timeout=30)  # both ranks finish retry A before new B
+        try:
+            retry = submit(retry_args, 0, 3, 4)
+            assert retry.wait(30)
+        except RuntimeError as exc:
+            outcomes[rank] = 0
+            failed_probe = native.execution_recovery_state()
+            report.update(
+                retry_error=str(exc),
+                retry_rc=failed_probe.original_rc,
+                retry_quiesced=failed_probe.quiesced,
+                current_execution_status=str(failed_probe.status),
+            )
+        else:
+            assert read_words(a_marker)[:3] == [1, 0, 1]
+            assert read_words(base + 0x40000, 1) == [1]
+            check_data(a_out, 201.0 - rank)
+            outcomes[rank] = 1
+        barrier.wait(timeout=30)
+        if not all(outcomes):
+            assert not queued.launched
+            check_data(b_out, -77.0)
+            assert read_words(b_marker) == [0] * 8
+            report.update(ok=True, outcome="LEGAL_RETRY_FAILED_NO_B", b_launched=False)
+            _sdma_evidence(rank, "LEGAL_RETRY_FAILED_NO_B", **report)
+            publish(report)
+            os._exit(0)
+        write(base, (ctypes.c_float * 16384)(*([300.0 + rank] * 16384)))
+        barrier.wait(timeout=30)  # every rank commits retry A before new B
         with pytest.raises(RuntimeError):
             queued.activate()
         assert not queued.launched
@@ -926,22 +1004,38 @@ def _sdma_recovery_rank(device_id, rank, rootinfo, barrier, proofs, outcomes, re
         assert successor.wait(30)
         assert read_words(b_marker)[:3] == [1, 1, 1]
         assert read_words(base + 0x40000, 1) == [2]
-        check_data(b_out, 101.0 - rank)
+        check_data(b_out, 301.0 - rank)
         _assert_execution_identities(execution_before, native.execution_recovery_state())
         after_retry = _comm_snapshot(native, comm, 0)
         assert after_retry["active_queue_count"] == 48 and after_retry["queue_read_errors"] == 0, after_retry
-        for field in comm_identity_fields:
+        for field in stable_fields:
             assert after_retry[field] == before[field], (rank, field, before[field], after_retry[field])
+        assert after_retry["workspace_addr"] == after["workspace_addr"]
         _sdma_evidence(rank, "COMM_AFTER_RETRY", **after_retry)
-        report.update(ok=True, outcome="SAME_RESOURCES_RETRY_A_THEN_B_PASS", b_launched=False, final_order=2)
-        _sdma_evidence(rank, "SAME_RESOURCES_RETRY_A_THEN_B_PASS", **report)
+        outcome = (
+            "SAME_RESOURCES_RETRY_A_THEN_B_PASS"
+            if mode == 1
+            else (
+                "SDMA_REARM_RETRY_A_THEN_B_PASS" if transport_action == "rearm" else "SDMA_REPLACE_RETRY_A_THEN_B_PASS"
+            )
+        )
+        report.update(
+            ok=True,
+            outcome=outcome,
+            b_launched=False,
+            final_order=2,
+            current_execution_status=str(native.execution_recovery_state().status),
+            workspace_preserved=before["workspace_addr"] == after_retry["workspace_addr"],
+            binding_signature_preserved=before["binding_signature"] == after_retry["binding_signature"],
+        )
+        _sdma_evidence(rank, outcome, **report)
         barrier.wait(timeout=30)
         native._impl.comm_release_domain_windows(int(comm), 0, 2, rank)
         native.comm_destroy(comm)
         worker.close()
         publish(report)
 
-    report = {"ok": False, "rank": rank, "mode": mode}
+    report = {"rank": rank, "mode": mode, "transport_action": transport_action}
     try:
         # Existing watchdog controls bound the injected notification wait and
         # transfer fault; no experiment flag changes production recovery.
@@ -1009,7 +1103,7 @@ def _sdma_recovery_rank(device_id, rank, rootinfo, barrier, proofs, outcomes, re
             raise AssertionError("fault injection did not fail A")
         state = native.execution_recovery_state()
         report.update(failed_epoch=state.failed_run_epoch, original_rc=state.original_rc, quiesced=state.quiesced)
-        report["execution_status"] = str(state.status)
+        report["failure_status"] = str(state.status)
         report["identities"] = {
             field: int(getattr(state, field))
             for field in ("communication_context", "execution_context", "aicpu_stream", "aicore_stream")
@@ -1024,20 +1118,7 @@ def _sdma_recovery_rank(device_id, rank, rootinfo, barrier, proofs, outcomes, re
         assert not queued.launched, "old B handle resurrected after poison"
         with pytest.raises(RuntimeError, match="poisoned"):
             submit(a_args, 0, 3, 4)
-        if mode == 2:
-            # PTO shutdown cannot prove that a faulted SDMA SQ will never DMA
-            # again. Do not probe/rebuild/free its windows or clear admission.
-            try:
-                report["submission_checkpoint"] = read_words(a_marker)[4]
-            except RuntimeError as exc:
-                report["submission_evidence_read_error"] = str(exc)
-            else:
-                assert report["submission_checkpoint"] == 2, "fault did not follow a successful SDMA post"
-            report.update(ok=True, outcome="TRANSPORT_QUIESCENCE_UNPROVEN_NO_RETRY", b_launched=False)
-            _sdma_evidence(rank, "TRANSPORT_QUIESCENCE_UNPROVEN_NO_RETRY", **report)
-            publish(report)
-            os._exit(0)
-        protocol_recovery(state)
+        recover_and_replay(state)
     except BaseException as exc:  # noqa: BLE001
         report.update(ok=False, error=repr(exc))
         _sdma_evidence(rank, "EXPERIMENT_FAILED", **report)
@@ -1045,7 +1126,7 @@ def _sdma_recovery_rank(device_id, rank, rootinfo, barrier, proofs, outcomes, re
         os._exit(1)
 
 
-def _check_sdma_recovery_experiment(st_device_ids, tmp_path, mode):
+def _check_sdma_recovery_experiment(st_device_ids, tmp_path, mode, transport_action=None):
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(2)
     proofs = ctx.Array("i", [0, 0])
@@ -1054,13 +1135,23 @@ def _check_sdma_recovery_experiment(st_device_ids, tmp_path, mode):
     ranks = [
         ctx.Process(
             target=_sdma_recovery_rank,
-            args=(int(st_device_ids[r]), r, str(tmp_path / "sdma.bin"), barrier, proofs, outcomes, results, mode),
+            args=(
+                int(st_device_ids[r]),
+                r,
+                str(tmp_path / "sdma.bin"),
+                barrier,
+                proofs,
+                outcomes,
+                results,
+                mode,
+                transport_action,
+            ),
         )
         for r in range(2)
     ]
     for rank in ranks:
         rank.start()
-    deadline = time.monotonic() + 200
+    deadline = time.monotonic() + (300 if mode == 2 else 200)
     for rank in ranks:
         rank.join(max(0, deadline - time.monotonic()))
     timed_out = [rank.pid for rank in ranks if rank.is_alive()]
@@ -1076,7 +1167,10 @@ def _check_sdma_recovery_experiment(st_device_ids, tmp_path, mode):
             break
     print(
         "[SDMA_RECOVERY_EVIDENCE] SUMMARY "
-        + json.dumps({"mode": mode, "timed_out": timed_out, "results": collected}, sort_keys=True),
+        + json.dumps(
+            {"mode": mode, "transport_action": transport_action, "timed_out": timed_out, "results": collected},
+            sort_keys=True,
+        ),
         flush=True,
     )
     assert not timed_out, "experiment watchdog fired; inspect last rank checkpoint, not a recovery PASS"
@@ -1100,10 +1194,11 @@ def test_a5_sdma_protocol_timeout_and_fifo_order(st_device_ids, tmp_path):
 @pytest.mark.platforms(["a5"])
 @pytest.mark.device_count(2)
 @pytest.mark.runtime(RUNTIME)
-@pytest.mark.timeout(240)
-def test_a5_sdma_transport_fault_observation(st_device_ids, tmp_path):
-    """An unmapped SDMA source is diagnostic only; no unsafe recovery probe."""
-    _check_sdma_recovery_experiment(st_device_ids, tmp_path, 2)
+@pytest.mark.timeout(360)
+@pytest.mark.parametrize("transport_action", ["rearm", "replace"])
+def test_a5_sdma_transport_recovery_compare(st_device_ids, tmp_path, transport_action):
+    """Compare collective Abort/requery with transport-only replacement after the same fault."""
+    _check_sdma_recovery_experiment(st_device_ids, tmp_path, 2, transport_action)
 
 
 # The orchestrator fatals before any task completes, so this case leaves the

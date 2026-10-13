@@ -1,0 +1,2 @@
+# Unified diff context on an empty line retains its required space prefix.
+pto_sdma_recovery.patch -whitespace

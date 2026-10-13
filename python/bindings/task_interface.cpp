@@ -3391,6 +3391,9 @@ NB_MODULE(_task_interface, m) {
         .value("DOMAIN_TRANSPORT", DomainRecoveryImpact::DOMAIN_TRANSPORT)
         .value("SHARED_COMMUNICATION", DomainRecoveryImpact::SHARED_COMMUNICATION)
         .value("DEVICE", DomainRecoveryImpact::DEVICE);
+    nb::enum_<DomainTransportAction>(m, "DomainTransportAction")
+        .value("REARM", DomainTransportAction::REARM)
+        .value("REPLACE", DomainTransportAction::REPLACE);
     nb::enum_<DomainRecoveryEngine>(m, "DomainRecoveryEngine")
         .value("NONE", DomainRecoveryEngine::NONE)
         .value("SDMA", DomainRecoveryEngine::SDMA)
@@ -3406,7 +3409,8 @@ NB_MODULE(_task_interface, m) {
         .value("QUIESCENCE_UNPROVEN", DomainRecoveryStatus::QUIESCENCE_UNPROVEN)
         .value("UNSUPPORTED", DomainRecoveryStatus::UNSUPPORTED)
         .value("GIVE_UP", DomainRecoveryStatus::GIVE_UP)
-        .value("RECOVERY_FAILED", DomainRecoveryStatus::RECOVERY_FAILED);
+        .value("RECOVERY_FAILED", DomainRecoveryStatus::RECOVERY_FAILED)
+        .value("REARMED", DomainRecoveryStatus::REARMED);
     nb::class_<DomainRecoveryRequest>(m, "DomainRecoveryRequest")
         .def(nb::init<>())
         .def_ro("abi_version", &DomainRecoveryRequest::abi_version)
@@ -3416,7 +3420,8 @@ NB_MODULE(_task_interface, m) {
         .def_rw("failed_run_epoch", &DomainRecoveryRequest::failed_run_epoch)
         .def_rw("impact", &DomainRecoveryRequest::impact)
         .def_rw("collective_quiescence", &DomainRecoveryRequest::collective_quiescence)
-        .def_rw("original_rc", &DomainRecoveryRequest::original_rc);
+        .def_rw("original_rc", &DomainRecoveryRequest::original_rc)
+        .def_rw("transport_action", &DomainRecoveryRequest::transport_action);
     nb::class_<DomainRecoveryResult>(m, "DomainRecoveryResult")
         .def_ro("abi_version", &DomainRecoveryResult::abi_version)
         .def_ro("struct_bytes", &DomainRecoveryResult::struct_bytes)

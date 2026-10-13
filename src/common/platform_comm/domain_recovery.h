@@ -20,6 +20,8 @@ enum class DomainRecoveryImpact : uint32_t {
     DEVICE = 4,
 };
 
+enum class DomainTransportAction : uint32_t { REPLACE = 0, REARM = 1 };
+
 enum class DomainRecoveryEngine : uint32_t { NONE = 0, SDMA = 1, URMA = 2, CCU = 3 };
 
 enum class DomainRecoveryStatus : uint32_t {
@@ -33,13 +35,16 @@ enum class DomainRecoveryStatus : uint32_t {
     UNSUPPORTED = 7,
     GIVE_UP = 8,
     RECOVERY_FAILED = 9,
+    REARMED = 10,
 };
 
-// A nonzero collective_quiescence asserts that the owner has fenced every
-// domain user on every member, including async communication outside PTO.
-// A local FIFO drain or a diagnostic queue snapshot alone is insufficient.
+// A nonzero collective_quiescence asserts that every producer is fenced on
+// every member, including users of a shared transport outside this domain.
+// Binding-only replacement additionally requires all data operations retired.
+// Transport recovery obtains submitted-work stop proof from its provider.
+// A local FIFO drain or diagnostic queue snapshot alone is insufficient.
 struct DomainRecoveryRequest {
-    uint32_t abi_version{1};
+    uint32_t abi_version{2};
     uint32_t struct_bytes{sizeof(DomainRecoveryRequest)};
     uint64_t recovery_id{0};
     uint64_t expected_generation{0};
@@ -47,7 +52,9 @@ struct DomainRecoveryRequest {
     DomainRecoveryImpact impact{DomainRecoveryImpact::EXECUTION_ONLY};
     uint32_t collective_quiescence{0};
     int32_t original_rc{0};
+    DomainTransportAction transport_action{DomainTransportAction::REPLACE};
     uint32_t reserved{0};
+    uint32_t reserved2{0};
 };
 
 struct DomainRecoveryResult {
@@ -74,7 +81,7 @@ struct DomainRecoveryResult {
 
 static_assert(std::is_standard_layout_v<DomainRecoveryRequest> && std::is_trivially_copyable_v<DomainRecoveryRequest>);
 static_assert(std::is_standard_layout_v<DomainRecoveryResult> && std::is_trivially_copyable_v<DomainRecoveryResult>);
-static_assert(sizeof(DomainRecoveryRequest) == 48 && offsetof(DomainRecoveryRequest, impact) == 32);
+static_assert(sizeof(DomainRecoveryRequest) == 56 && offsetof(DomainRecoveryRequest, impact) == 32);
 static_assert(sizeof(DomainRecoveryResult) == 120 && offsetof(DomainRecoveryResult, device_ctx) == 80);
 
 // Optional host-runtime symbol. Backends without this operation retain their
@@ -85,11 +92,13 @@ extern "C" int comm_recover_domain(
 
 class DomainRecoveryManager {
 public:
-    enum class Phase : uint32_t { PREPARE = 1, BUILD = 2, RETIRE = 3 };
+    enum class Phase : uint32_t { PREPARE = 1, BUILD = 2, RETIRE = 3, QUIESCE = 4 };
     struct Operations {
         bool preserve_supported{true};
         bool rebuild_supported{false};
         bool transport_rebuild_supported{false};
+        bool transport_rearm_supported{false};
+        std::function<int()> quiesce;
         // Agreement includes this rank's failure vote; no rank may publish a
         // replacement unless every member has completed every phase.
         std::function<int(Phase, int)> agree;
@@ -121,15 +130,19 @@ public:
             current.recovery_rc = rc;
             return current;
         };
-        if (request.abi_version != 1 || request.struct_bytes != sizeof(DomainRecoveryRequest)) {
+        if (request.abi_version != 2 || request.struct_bytes != sizeof(DomainRecoveryRequest)) {
             return reject(DomainRecoveryStatus::UNSUPPORTED);
         }
-        if (request.recovery_id == 0 || request.reserved != 0 || request.collective_quiescence > 1) {
+        if (request.recovery_id == 0 || request.reserved != 0 || request.reserved2 != 0 ||
+            request.collective_quiescence > 1 ||
+            (request.transport_action != DomainTransportAction::REPLACE &&
+             request.transport_action != DomainTransportAction::REARM)) {
             return reject(DomainRecoveryStatus::INVALID_STATE);
         }
         if (last_id_ == request.recovery_id && same_request(request, last_request_)) {
             auto result = last_result_;
-            if (result.status == DomainRecoveryStatus::PRESERVED || result.status == DomainRecoveryStatus::REBUILT) {
+            if (result.status == DomainRecoveryStatus::PRESERVED || result.status == DomainRecoveryStatus::REBUILT ||
+                result.status == DomainRecoveryStatus::REARMED) {
                 result.status = DomainRecoveryStatus::ALREADY_RECOVERED;
             }
             return result;
@@ -138,9 +151,11 @@ public:
             return reject(DomainRecoveryStatus::STALE_GENERATION);
         }
         if (failed_) return reject(DomainRecoveryStatus::GIVE_UP);
+        const bool transport = request.impact == DomainRecoveryImpact::DOMAIN_TRANSPORT;
+        const bool rearm = transport && request.transport_action == DomainTransportAction::REARM;
         if (request.impact == DomainRecoveryImpact::DEVICE ||
             request.impact == DomainRecoveryImpact::SHARED_COMMUNICATION ||
-            (request.impact == DomainRecoveryImpact::DOMAIN_TRANSPORT && !operations.transport_rebuild_supported)) {
+            (transport && !(rearm ? operations.transport_rearm_supported : operations.transport_rebuild_supported))) {
             failed_ = true;
             auto result = reject(DomainRecoveryStatus::GIVE_UP);
             remember(request, result);
@@ -161,7 +176,8 @@ public:
         if (!operations.rebuild_supported) return reject(DomainRecoveryStatus::UNSUPPORTED);
         if (!request.collective_quiescence) return reject(DomainRecoveryStatus::QUIESCENCE_UNPROVEN);
         if (generation_ == std::numeric_limits<uint64_t>::max()) return reject(DomainRecoveryStatus::GIVE_UP);
-        if (!operations.agree || !operations.build || !operations.retire || !operations.discard) {
+        if (!operations.agree || !operations.build || !operations.retire || !operations.discard ||
+            (transport && !operations.quiesce)) {
             return reject(DomainRecoveryStatus::UNSUPPORTED);
         }
         auto checked = [](const auto &call) {
@@ -175,6 +191,15 @@ public:
         int rc = checked([&] {
             return operations.agree(Phase::PREPARE, 0);
         });
+        if (rc == 0 && transport) {
+            int local_rc = checked([&] {
+                return operations.quiesce();
+            });
+            int agreement_rc = checked([&] {
+                return operations.agree(Phase::QUIESCE, local_rc);
+            });
+            rc = local_rc != 0 ? local_rc : agreement_rc;
+        }
         if (rc == 0) {
             int local_rc = checked([&] {
                 return operations.build(replacement);
@@ -207,7 +232,8 @@ public:
             remember(request, current);
             return current;
         }
-        replacement.status = DomainRecoveryStatus::REBUILT;
+        replacement.status = rearm ? DomainRecoveryStatus::REARMED : DomainRecoveryStatus::REBUILT;
+        replacement.domain_preserved = rearm ? 1 : 0;
         replacement.generation = ++generation_;
         replacement.rebind_required = 1;
         replacement.recovery_rc = 0;
@@ -220,7 +246,7 @@ private:
         return a.recovery_id == b.recovery_id && a.expected_generation == b.expected_generation &&
                a.failed_run_epoch == b.failed_run_epoch && a.impact == b.impact &&
                a.collective_quiescence == b.collective_quiescence && a.original_rc == b.original_rc &&
-               a.reserved == b.reserved;
+               a.transport_action == b.transport_action && a.reserved == b.reserved && a.reserved2 == b.reserved2;
     }
     void remember(const DomainRecoveryRequest &request, const DomainRecoveryResult &result) {
         last_id_ = request.recovery_id;

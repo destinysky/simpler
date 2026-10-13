@@ -121,13 +121,37 @@ Original and recovery error codes are diagnostics, never eligibility whitelists.
 A failed rebuild returns no dispatchable binding and quarantines further soft recovery.
 Default terminal cleanup owns any remaining resources; this operation never resets a device.
 
-A5 currently rematerializes SDMA/VMM domain bindings. URMA execution-only preservation
-is supported, but its pinned provider retains HCCL registrations/channels until
-communicator teardown, so independent URMA rematerialization returns `UNSUPPORTED`.
-CCU has an engine id and provider capability seam but no resource provider in this
-backend. Affected domain transport without a recovery-capable provider, shared
-communication (HCCL, Context C or shared DMA engine), and device faults return
-`GIVE_UP`. Other hardware backends retain their existing ABI and report `UNSUPPORTED`
+A5 rematerializes SDMA/VMM bindings for `DOMAIN_BINDINGS`. For
+`DOMAIN_TRANSPORT`, `DomainTransportAction.REARM` retains SDMA streams/workspace
+and repopulates their live metadata after Abort; `REPLACE` provisions new SDMA
+streams/workspace while retaining the VMM windows and device CommContext address.
+The request ABI is version 2 (56 bytes); older requests are rejected. Both transport
+operations require an empty FIFO, retired native slots, local execution quiescence,
+an owner fence on all ranks and all shared-workspace producers, and successful
+`aclrtStreamAbort` on every SDMA stream on every member before any workspace write
+or release. The collective votes prepare/stop/build/retire outcomes. An Abort
+error preserves the original and recovery faults and returns no dispatchable binding.
+A failed domain transaction fences execution rearming and new submission; unproved
+transport resources remain owned by the terminal device lifecycle for cleanup.
+This provider currently accepts only one full-communicator domain, with no base
+window context, derived contexts, or pending allocation cleanup; wider shared
+transport recovery requires a broader fence and binding transaction.
+
+`REARM` returns `REARMED`, preserved addresses and generation + 1. `REPLACE`
+returns `REBUILT`, generation + 1 and a changed workspace. Both require the owner
+to refresh its domain generation and obtain all-member success before explicit
+execution rearming and external redispatch. Window contents are preserved by
+transport recovery; binding-only rebuild starts new windows at zero. No successful
+resource operation alone proves that legal SDMA traffic can complete again.
+The manual comparison tests establish that separately with changed input data,
+new generation/completion state and strict predecessor/successor ordering.
+
+URMA execution-only preservation is supported; independent URMA rematerialization
+and transport repair remain unsupported by the pinned provider. CCU retains an
+engine id and provider capability seam. There is no fault-code-based mode choice,
+automatic retry budget, or automatic escalation from rearm to replacement here.
+Shared communication (HCCL or Context C) and device faults return `GIVE_UP`.
+Other hardware backends retain their existing comm ABI and report `UNSUPPORTED`
 for this optional operation.
 
 
