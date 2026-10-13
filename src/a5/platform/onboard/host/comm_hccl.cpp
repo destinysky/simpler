@@ -1859,7 +1859,8 @@ comm_recovery_probe_snapshot(CommHandle h, uint64_t allocation_id, CommRecoveryP
             ++snapshot.queue_read_errors;
             snapshot.all_queues_empty = 0;
         } else {
-            snapshot.all_queues_empty = 1;
+            // Workspace descriptions are diagnostic; live transport quiescence is unknown.
+            snapshot.all_queues_empty = 0;
             for (uint32_t channel = 0; channel < channels.size(); ++channel) {
                 const RecoveryProbeSdmaChannelInfo &info = channels[channel];
                 if (info.sq_depth == 0 || info.sq_base == 0 || info.sq_reg_base == 0) continue;
@@ -1876,8 +1877,7 @@ comm_recovery_probe_snapshot(CommHandle h, uint64_t allocation_id, CommRecoveryP
                 mix(queue_hash, info.sq_head);
                 mix(queue_hash, info.sq_tail);
                 mix(queue_hash, info.report_cqe_num);
-                if (info.sq_head != info.sq_tail) snapshot.all_queues_empty = 0;
-                if (channel < 4 || info.sq_head != info.sq_tail) {
+                if (channel < 4) {
                     LOG_INFO(
                         "[PTO_RECOVERY] SDMA_CHANNEL rank=%d channel=%u stream_id=%u sq_id=%u cq_id=%u "
                         "sq_head=%u sq_tail=%u depth=%u report_cqe=%u",
@@ -1886,7 +1886,6 @@ comm_recovery_probe_snapshot(CommHandle h, uint64_t allocation_id, CommRecoveryP
                     );
                 }
             }
-            if (snapshot.active_queue_count == 0) snapshot.all_queues_empty = 0;
         }
     }
 #endif

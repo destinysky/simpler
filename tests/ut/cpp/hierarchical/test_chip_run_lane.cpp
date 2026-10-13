@@ -731,6 +731,55 @@ TEST(ChipRunLaneTest, RecoveryRefusesUnsafeFifoWithoutDrainingIt) {
     worker.finalize();
 }
 
+TEST(ChipRunLaneTest, FailedPredecessorRevokesSuccessorAndExternalReplayKeepsOrder) {
+    for (bool prepared : {false, true}) {
+        SCOPED_TRACE(prepared);
+        ChipWorker worker;
+        prime_worker(worker);
+        g_supports_successor = prepared;
+        ChipRunLane lane(worker);
+        ChipRun first = submit(lane, 101, 0);
+        const uint64_t failed_epoch = g_last_epoch;
+        ChipRun successor = submit(lane, 102, 1);
+        ASSERT_FALSE(successor.launched());
+        g_poll_rc[0] = 507018;
+        ASSERT_TRUE(first.done());
+        ASSERT_TRUE(successor.done());
+        ASSERT_FALSE(successor.launched());
+        EXPECT_THROW(successor.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
+        EXPECT_THROW(successor.activate(), std::runtime_error);
+        EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "launch1"), 0);
+        EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize1"), prepared ? 1 : 0);
+        EXPECT_THROW(submit(lane, 103, 0), std::runtime_error);
+        g_recovery.status = ExecutionRecoveryStatus::RECOVERY_REQUIRED;
+        g_recovery.failed_run_epoch = failed_epoch;
+        g_recovery.quiesced = 1;
+        ASSERT_EQ(
+            lane.recover_execution(failed_epoch, ExecutionRecoveryScope::EXECUTION_ONLY).status,
+            ExecutionRecoveryStatus::RECOVERED
+        );
+        const auto retired_events = g_events;
+        EXPECT_THROW(successor.activate(), std::runtime_error);
+        EXPECT_THROW(first.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
+        EXPECT_THROW(worker.launch_native_run(ChipWorkerNativeRun{0, 101, failed_epoch, 101, 101}), std::runtime_error);
+        EXPECT_EQ(g_events, retired_events);
+        g_poll_rc[0] = 0;
+        ChipRun retry = submit(lane, 103, 0);
+        ChipRun replay_successor = submit(lane, 104, 1);
+        ASSERT_FALSE(replay_successor.launched());
+        g_complete[0] = true;
+        ASSERT_TRUE(retry.done());
+        ASSERT_TRUE(replay_successor.launched());
+        const auto retry_finalized = std::find(g_events.begin() + retired_events.size(), g_events.end(), "finalize0");
+        const auto successor_launched = std::find(g_events.begin(), g_events.end(), "launch1");
+        ASSERT_LT(retry_finalized, successor_launched);
+        g_complete[1] = true;
+        ASSERT_TRUE(replay_successor.done());
+        lane.close();
+        worker.finalize();
+    }
+}
+
 TEST(ChipRunLaneTest, RecoveryRefusesOutstandingNativeSlotOutsideLane) {
     ChipWorker worker;
     prime_worker(worker);

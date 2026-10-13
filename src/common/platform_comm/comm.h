@@ -307,7 +307,8 @@ typedef struct CommRecoveryProbeSnapshot {
     uint32_t allocation_present;
     uint32_t peer_window_count;
     uint32_t active_queue_count;
-    uint32_t queue_read_errors;
+    uint32_t queue_read_errors;  // Snapshot-copy errors, not transport task failures.
+    // A5 SDMA reports 0 (unproven): workspace descriptors are not live SQ registers.
     uint32_t all_queues_empty;
     uint32_t reserved0;
     uint32_t reserved1;

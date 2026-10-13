@@ -90,6 +90,10 @@ The A5 native `simpler.task_interface.ChipWorker` exposes explicit recovery cont
 `recover_comm_domain(comm_handle, allocation_id, request)`, and
 `comm_recovery_snapshot(comm_handle, allocation_id)`. The snapshot reads identities
 and queue diagnostics; it does not prove that async engines or peer ranks have drained.
+For A5 SDMA, `all_queues_empty = 0` means **unproven**, not confirmed busy:
+workspace channel descriptions do not read live SQ head/tail registers.
+`queue_read_errors` counts snapshot-copy errors, not communication task failures.
+Neither field authorizes recovery or window retirement.
 
 `DomainRecoveryRequest` names a monotonically increasing, collective `recovery_id`,
 `expected_generation`, the local `failed_run_epoch` (zero for a healthy execution
