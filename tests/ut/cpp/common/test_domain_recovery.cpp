@@ -11,7 +11,6 @@
 #include <vector>
 
 namespace {
-
 class DomainRecoveryTest : public ::testing::Test {
 protected:
     DomainRecoveryManager manager;
@@ -19,16 +18,15 @@ protected:
     DomainRecoveryResult binding;
     DomainRecoveryManager::Operations ops;
     std::vector<int> events;
-    int build_rc{0};
-    int retire_rc{0};
-    int disagree_phase{0};
-    int discard_count{0};
+    int stop_rc{0};
+    int rearm_rc{0};
+    uint32_t stopped{48};
 
     void SetUp() override {
         request.recovery_id = 10;
         request.expected_generation = 1;
         request.failed_run_epoch = 99;
-        request.impact = DomainRecoveryImpact::DOMAIN_BINDINGS;
+        request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
         request.collective_quiescence = 1;
         request.original_rc = 507018;
         binding.engine = DomainRecoveryEngine::SDMA;
@@ -39,292 +37,211 @@ protected:
         binding.device_ctx = 34;
         binding.local_window_base = 35;
         binding.workspace = 36;
-        ops.rebuild_supported = true;
-        ops.agree = [&](DomainRecoveryManager::Phase phase, int local_rc) {
-            events.push_back(static_cast<int>(phase));
-            return disagree_phase == static_cast<int>(phase) ? 77 : local_rc;
+        ops.rearm_supported = true;
+        ops.quiesce = [&](DomainRecoveryResult &proof) {
+            events.push_back(1);
+            proof.transport_channel_count = 48;
+            proof.stopped_channel_count = stopped;
+            proof.transport_stopped = stopped == 48 && stop_rc == 0;
+            return stop_rc;
         };
-        ops.build = [&](DomainRecoveryResult &candidate) {
-            events.push_back(10);
-            candidate.device_ctx = 134;
-            candidate.local_window_base = 135;
-            return build_rc;
+        ops.rearm = [&] {
+            events.push_back(2);
+            return rearm_rc;
         };
-        ops.retire = [&] {
-            events.push_back(20);
-            return retire_rc;
-        };
-        ops.discard = [&] {
-            ++discard_count;
-        };
+    }
+    DomainRecoveryResult recover() { return manager.recover(request, binding, ops); }
+    void expect_no_bindings(const DomainRecoveryResult &result) {
+        EXPECT_EQ(result.device_ctx, 0u);
+        EXPECT_EQ(result.local_window_base, 0u);
+        EXPECT_EQ(result.workspace, 0u);
+        EXPECT_EQ(result.domain_preserved, 0u);
     }
 };
 
-TEST_F(DomainRecoveryTest, RebuildPublishesOnlyAfterAllMembersRetire) {
-    const auto result = manager.recover(request, binding, ops);
-    EXPECT_EQ(result.status, DomainRecoveryStatus::REBUILT);
-    EXPECT_EQ(events, (std::vector<int>{1, 10, 2, 20, 3}));
-    EXPECT_EQ(result.previous_generation, 1u);
-    EXPECT_EQ(result.generation, 2u);
-    EXPECT_EQ(result.rebind_required, 1u);
-    EXPECT_EQ(result.domain_preserved, 0u);
-    EXPECT_EQ(result.device_ctx, 134u);
-    EXPECT_EQ(result.local_window_base, 135u);
-    EXPECT_EQ(result.workspace, binding.workspace);
-    EXPECT_EQ(result.hccl_comm, binding.hccl_comm);
-    EXPECT_EQ(result.comm_stream, binding.comm_stream);
-    EXPECT_EQ(result.communication_context, binding.communication_context);
-    EXPECT_EQ(discard_count, 0);
-}
-
-TEST_F(DomainRecoveryTest, ExecutionOnlyPreservesWithoutCallingBackend) {
-    request.impact = DomainRecoveryImpact::EXECUTION_ONLY;
-    request.collective_quiescence = 0;
-    for (auto engine : {DomainRecoveryEngine::SDMA, DomainRecoveryEngine::URMA, DomainRecoveryEngine::CCU}) {
-        DomainRecoveryManager separate;
-        binding.engine = engine;
-        auto result = separate.recover(request, binding, ops);
-        EXPECT_EQ(result.status, DomainRecoveryStatus::PRESERVED);
-        EXPECT_EQ(result.generation, 1u);
-        EXPECT_EQ(result.domain_preserved, 1u);
-        EXPECT_EQ(result.rebind_required, 0u);
-        EXPECT_EQ(result.device_ctx, binding.device_ctx);
-        EXPECT_EQ(result.workspace, binding.workspace);
-    }
-    EXPECT_TRUE(events.empty());
-}
-
-TEST_F(DomainRecoveryTest, DuplicateReturnsCommittedResultWithoutNewResources) {
-    auto first = manager.recover(request, binding, ops);
-    events.clear();
-    auto duplicate = manager.recover(request, binding, ops);
-    EXPECT_EQ(duplicate.status, DomainRecoveryStatus::ALREADY_RECOVERED);
-    EXPECT_EQ(duplicate.generation, first.generation);
-    EXPECT_EQ(duplicate.device_ctx, first.device_ctx);
-    EXPECT_TRUE(events.empty());
-    request.original_rc = 123;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::STALE_GENERATION);
-}
-
-TEST_F(DomainRecoveryTest, OldGenerationAndEpisodeCannotRebuildAgain) {
-    ASSERT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::REBUILT);
-    events.clear();
-    ++request.recovery_id;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::STALE_GENERATION);
-    request.expected_generation = 2;
-    request.recovery_id = 9;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::STALE_GENERATION);
-    EXPECT_TRUE(events.empty());
-}
-
-TEST_F(DomainRecoveryTest, QuiescenceMustCoverAllMembersAndAsyncUsers) {
-    request.collective_quiescence = 0;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::QUIESCENCE_UNPROVEN);
-    EXPECT_TRUE(events.empty());
-    EXPECT_EQ(manager.generation(), 1u);
-}
-
-TEST_F(DomainRecoveryTest, PeerBuildFailureLeavesOldResourcesUnretired) {
-    disagree_phase = 2;
-    const auto result = manager.recover(request, binding, ops);
-    EXPECT_EQ(result.status, DomainRecoveryStatus::RECOVERY_FAILED);
-    EXPECT_EQ(events, (std::vector<int>{1, 10, 2}));
-    EXPECT_EQ(result.original_rc, 507018);
-    EXPECT_EQ(result.recovery_rc, 77);
-    EXPECT_EQ(result.generation, 1u);
-    EXPECT_EQ(result.device_ctx, 0u);
-    EXPECT_EQ(result.local_window_base, 0u);
-    EXPECT_EQ(discard_count, 1);
-    events.clear();
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::RECOVERY_FAILED);
-    ++request.recovery_id;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::GIVE_UP);
-    EXPECT_TRUE(events.empty());
-}
-
-TEST_F(DomainRecoveryTest, LocalBuildFailureIsVotedAndKeepsBothFaults) {
-    build_rc = 507014;
-    auto result = manager.recover(request, binding, ops);
-    EXPECT_EQ(result.status, DomainRecoveryStatus::RECOVERY_FAILED);
-    EXPECT_EQ(result.original_rc, 507018);
-    EXPECT_EQ(result.recovery_rc, 507014);
-    EXPECT_EQ(events, (std::vector<int>{1, 10, 2}));
-    EXPECT_EQ(discard_count, 1);
-}
-
-TEST_F(DomainRecoveryTest, RetireFailureCannotPublishCandidate) {
-    retire_rc = 88;
-    auto result = manager.recover(request, binding, ops);
-    EXPECT_EQ(result.status, DomainRecoveryStatus::RECOVERY_FAILED);
-    EXPECT_EQ(result.recovery_rc, 88);
-    EXPECT_EQ(result.generation, 1u);
-    EXPECT_EQ(result.device_ctx, 0u);
-    EXPECT_EQ(result.rebind_required, 0u);
-    EXPECT_EQ(discard_count, 1);
-    EXPECT_EQ(events, (std::vector<int>{1, 10, 2, 20, 3}));
-}
-
-TEST_F(DomainRecoveryTest, PeerRetireFailureCannotPublishCandidate) {
-    disagree_phase = 3;
-    auto result = manager.recover(request, binding, ops);
-    EXPECT_EQ(result.status, DomainRecoveryStatus::RECOVERY_FAILED);
-    EXPECT_EQ(result.generation, 1u);
-    EXPECT_EQ(result.device_ctx, 0u);
-    EXPECT_EQ(discard_count, 1);
-}
-
-TEST_F(DomainRecoveryTest, ExceptionsFollowFailureVoteAndDiscard) {
-    ops.build = [](auto &) -> int {
-        throw std::runtime_error("allocation");
-    };
-    auto result = manager.recover(request, binding, ops);
-    EXPECT_EQ(result.status, DomainRecoveryStatus::RECOVERY_FAILED);
+TEST_F(DomainRecoveryTest, PrepareStopsBeforeRearmAndCommitOnlyAdvancesGeneration) {
+    const auto prepared = recover();
+    ASSERT_EQ(prepared.status, DomainRecoveryStatus::PREPARED);
+    EXPECT_TRUE(manager.prepared());
     EXPECT_EQ(events, (std::vector<int>{1, 2}));
-    EXPECT_EQ(discard_count, 1);
+    EXPECT_EQ(prepared.generation, 1u);
+    EXPECT_EQ(manager.generation(), 1u);
+    EXPECT_EQ(prepared.transport_stopped, 1u);
+    EXPECT_EQ(prepared.domain_preserved, 0u);
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::PREPARED);
+    EXPECT_EQ(events.size(), 2u);
+    request.phase = DomainRecoveryPhase::COMMIT;
+    const auto committed = recover();
+    ASSERT_EQ(committed.status, DomainRecoveryStatus::REARMED);
+    EXPECT_FALSE(manager.prepared());
+    EXPECT_EQ(committed.previous_generation, 1u);
+    EXPECT_EQ(committed.generation, 2u);
+    EXPECT_EQ(committed.domain_preserved, 1u);
+    EXPECT_EQ(committed.rebind_required, 1u);
+    EXPECT_EQ(committed.communication_context, binding.communication_context);
+    EXPECT_EQ(committed.hccl_comm, binding.hccl_comm);
+    EXPECT_EQ(committed.comm_stream, binding.comm_stream);
+    EXPECT_EQ(committed.device_ctx, binding.device_ctx);
+    EXPECT_EQ(committed.local_window_base, binding.local_window_base);
+    EXPECT_EQ(committed.workspace, binding.workspace);
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::ALREADY_RECOVERED);
+    request.phase = DomainRecoveryPhase::PREPARE;
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::ALREADY_RECOVERED);
+    EXPECT_EQ(events.size(), 2u);
 }
 
-TEST_F(DomainRecoveryTest, SharedAndDeviceFaultsDoNotCallSoftBackend) {
-    for (auto impact :
-         {DomainRecoveryImpact::SHARED_COMMUNICATION, DomainRecoveryImpact::DEVICE,
-          DomainRecoveryImpact::DOMAIN_TRANSPORT}) {
-        DomainRecoveryManager separate;
-        request.impact = impact;
-        EXPECT_EQ(separate.recover(request, binding, ops).status, DomainRecoveryStatus::GIVE_UP);
-    }
+TEST_F(DomainRecoveryTest, CommitAndAbortCannotCreateARecoveryTransaction) {
+    request.phase = DomainRecoveryPhase::COMMIT;
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::INVALID_STATE);
+    request.phase = DomainRecoveryPhase::ABORT;
+    request.collective_rc = 77;
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::INVALID_STATE);
     EXPECT_TRUE(events.empty());
 }
 
-TEST_F(DomainRecoveryTest, SevereFaultCannotBeBypassedByOldDuplicate) {
-    request.impact = DomainRecoveryImpact::EXECUTION_ONLY;
-    ASSERT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::PRESERVED);
-    auto old = request;
+TEST_F(DomainRecoveryTest, BusyPreparationCannotBeSupersededOrChanged) {
+    ASSERT_EQ(recover().status, DomainRecoveryStatus::PREPARED);
     ++request.recovery_id;
-    request.impact = DomainRecoveryImpact::SHARED_COMMUNICATION;
-    ASSERT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::GIVE_UP);
-    EXPECT_EQ(manager.recover(old, binding, ops).status, DomainRecoveryStatus::STALE_GENERATION);
-    ++request.recovery_id;
-    request.impact = DomainRecoveryImpact::EXECUTION_ONLY;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::GIVE_UP);
-    EXPECT_TRUE(events.empty());
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::BUSY);
+    --request.recovery_id;
+    ++request.failed_run_epoch;
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::STALE_GENERATION);
+    EXPECT_EQ(events.size(), 2u);
 }
 
-TEST_F(DomainRecoveryTest, ProviderCapabilitiesDoNotAssumeSdmaForUrmaOrCcu) {
-    ops.rebuild_supported = false;
-    for (auto engine : {DomainRecoveryEngine::URMA, DomainRecoveryEngine::CCU}) {
-        binding.engine = engine;
-        EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::UNSUPPORTED);
-    }
-    EXPECT_TRUE(events.empty());
-    ops.rebuild_supported = true;
-    ops.transport_rebuild_supported = true;
-    ops.quiesce = [] {
-        return 0;
-    };
-    request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::REBUILT);
-}
-
-TEST_F(DomainRecoveryTest, HostErrorCodeNeverSelectsRecoveryEligibility) {
-    for (int code : {-17, 507014, 507018, 507899}) {
-        DomainRecoveryManager separate;
-        request.original_rc = code;
-        auto result = separate.recover(request, binding, ops);
-        EXPECT_EQ(result.status, DomainRecoveryStatus::REBUILT);
-        EXPECT_EQ(result.original_rc, code);
-    }
-}
-
-TEST_F(DomainRecoveryTest, FailedReleaseCannotReturnPreviouslyPreservedBinding) {
-    request.impact = DomainRecoveryImpact::EXECUTION_ONLY;
-    ASSERT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::PRESERVED);
-    manager.quarantine(88);
-    auto duplicate = manager.recover(request, binding, ops);
-    EXPECT_EQ(duplicate.status, DomainRecoveryStatus::RECOVERY_FAILED);
-    EXPECT_EQ(duplicate.original_rc, request.original_rc);
-    EXPECT_EQ(duplicate.recovery_rc, 88);
-    EXPECT_EQ(duplicate.device_ctx, 0u);
-    ++request.recovery_id;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::GIVE_UP);
-    EXPECT_TRUE(events.empty());
-}
-
-TEST_F(DomainRecoveryTest, IncompatibleAbiHasNoResourceEffects) {
-    request.abi_version = 1;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::UNSUPPORTED);
-    request.abi_version = 2;
-    request.struct_bytes = 0;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::UNSUPPORTED);
-    EXPECT_TRUE(events.empty());
-}
-
-TEST_F(DomainRecoveryTest, MalformedRequestHasNoResourceEffects) {
-    request.recovery_id = 0;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::INVALID_STATE);
-    request.recovery_id = 10;
-    request.impact = static_cast<DomainRecoveryImpact>(99);
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::INVALID_STATE);
-    request.impact = DomainRecoveryImpact::DOMAIN_BINDINGS;
-    request.collective_quiescence = 2;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::INVALID_STATE);
-    EXPECT_TRUE(events.empty());
-}
-
-TEST_F(DomainRecoveryTest, TransportAbortAgreementPrecedesAnyWorkspaceMutation) {
-    request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
-    request.transport_action = DomainTransportAction::REARM;
-    ops.transport_rearm_supported = true;
-    ops.quiesce = [&] {
-        events.push_back(30);
-        return 0;
-    };
-    ops.build = [&](auto &) {
-        events.push_back(10);
-        return 0;
-    };
-    const auto result = manager.recover(request, binding, ops);
-    EXPECT_EQ(result.status, DomainRecoveryStatus::REARMED);
-    EXPECT_EQ(events, (std::vector<int>{1, 30, 4, 10, 2, 20, 3}));
-    EXPECT_EQ(result.workspace, binding.workspace);
-    EXPECT_EQ(result.device_ctx, binding.device_ctx);
-    EXPECT_EQ(result.local_window_base, binding.local_window_base);
-    EXPECT_EQ(result.generation, 2u);
-    events.clear();
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::ALREADY_RECOVERED);
-    EXPECT_TRUE(events.empty());
-    request.transport_action = DomainTransportAction::REPLACE;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::STALE_GENERATION);
-}
-
-TEST_F(DomainRecoveryTest, PartialAbortOrPeerAbortFailureCannotRequeryOrReplace) {
-    request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
-    request.transport_action = DomainTransportAction::REARM;
-    ops.transport_rearm_supported = true;
-    for (bool local_failure : {true, false}) {
-        DomainRecoveryManager separate;
-        events.clear();
-        ops.quiesce = [&] {
-            events.push_back(30);
-            return local_failure ? 88 : 0;
-        };
-        disagree_phase = local_failure ? 0 : 4;
-        const auto result = separate.recover(request, binding, ops);
-        EXPECT_EQ(result.status, DomainRecoveryStatus::RECOVERY_FAILED);
-        EXPECT_EQ(result.recovery_rc, local_failure ? 88 : 77);
-        EXPECT_EQ(result.original_rc, request.original_rc);
-        EXPECT_EQ(events, (std::vector<int>{1, 30, 4}));
-        EXPECT_EQ(result.device_ctx, 0u);
-        EXPECT_EQ(result.workspace, 0u);
-    }
-}
-
-TEST_F(DomainRecoveryTest, TransportProducerFenceAndProviderAreMandatory) {
-    request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
-    ops.transport_rebuild_supported = true;
+TEST_F(DomainRecoveryTest, CollectiveProducerFenceIsRequiredBeforeTouchingTransport) {
     request.collective_quiescence = 0;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::QUIESCENCE_UNPROVEN);
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::QUIESCENCE_UNPROVEN);
+    EXPECT_TRUE(events.empty());
     request.collective_quiescence = 1;
-    EXPECT_EQ(manager.recover(request, binding, ops).status, DomainRecoveryStatus::UNSUPPORTED);
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::PREPARED);
+}
+
+TEST_F(DomainRecoveryTest, PartialStopCannotRequeryAndPermanentlyQuarantines) {
+    stopped = 47;
+    const auto failed = recover();
+    EXPECT_EQ(failed.status, DomainRecoveryStatus::RECOVERY_FAILED);
+    EXPECT_EQ(failed.original_rc, 507018);
+    EXPECT_NE(failed.recovery_rc, 0);
+    EXPECT_EQ(events, (std::vector<int>{1}));
+    expect_no_bindings(failed);
+    request.phase = DomainRecoveryPhase::COMMIT;
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::RECOVERY_FAILED);
+    ++request.recovery_id;
+    request.phase = DomainRecoveryPhase::PREPARE;
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::GIVE_UP);
+    EXPECT_EQ(events.size(), 1u);
+}
+
+TEST_F(DomainRecoveryTest, StopAndRearmErrorsPreserveBothFaults) {
+    for (bool stop_failed : {true, false}) {
+        DomainRecoveryManager local;
+        stop_rc = stop_failed ? 73 : 0;
+        rearm_rc = stop_failed ? 0 : 81;
+        const auto result = local.recover(request, binding, ops);
+        EXPECT_EQ(result.status, DomainRecoveryStatus::RECOVERY_FAILED);
+        EXPECT_EQ(result.original_rc, 507018);
+        EXPECT_EQ(result.recovery_rc, stop_failed ? 73 : 81);
+        expect_no_bindings(result);
+    }
+}
+
+TEST_F(DomainRecoveryTest, ThrowingProviderFailsWithoutPublishingBindings) {
+    ops.rearm = []() -> int {
+        throw std::runtime_error("query failure");
+    };
+    const auto result = recover();
+    EXPECT_EQ(result.status, DomainRecoveryStatus::RECOVERY_FAILED);
+    expect_no_bindings(result);
+}
+
+TEST_F(DomainRecoveryTest, PeerAbortQuarantinesPreparedAndLocallyCommittedMembers) {
+    for (bool committed : {false, true}) {
+        DomainRecoveryManager local;
+        request.phase = DomainRecoveryPhase::PREPARE;
+        request.collective_rc = 0;
+        ASSERT_EQ(local.recover(request, binding, ops).status, DomainRecoveryStatus::PREPARED);
+        if (committed) {
+            request.phase = DomainRecoveryPhase::COMMIT;
+            ASSERT_EQ(local.recover(request, binding, ops).status, DomainRecoveryStatus::REARMED);
+        }
+        request.phase = DomainRecoveryPhase::ABORT;
+        request.collective_rc = 93;
+        const auto result = local.recover(request, binding, ops);
+        EXPECT_EQ(result.status, DomainRecoveryStatus::RECOVERY_FAILED);
+        EXPECT_EQ(result.original_rc, 507018);
+        EXPECT_EQ(result.recovery_rc, 93);
+        expect_no_bindings(result);
+        EXPECT_EQ(local.recover(request, binding, ops).recovery_rc, 93);
+        request.phase = DomainRecoveryPhase::COMMIT;
+        request.collective_rc = 0;
+        EXPECT_EQ(local.recover(request, binding, ops).status, DomainRecoveryStatus::RECOVERY_FAILED);
+    }
+}
+
+TEST_F(DomainRecoveryTest, InvalidAbiPhaseAndReservedFieldsDoNotMutateResources) {
+    auto original = request;
+    request.abi_version = 2;
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::UNSUPPORTED);
+    request = original;
+    request.reserved = 1;
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::INVALID_STATE);
+    request = original;
+    request.phase = static_cast<DomainRecoveryPhase>(99);
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::INVALID_STATE);
+    request = original;
+    request.collective_rc = 93;
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::INVALID_STATE);
     EXPECT_TRUE(events.empty());
 }
 
+TEST_F(DomainRecoveryTest, RepeatedTransactionsUseGenerationsWithoutRetryBudgetsOrCodeWhitelists) {
+    for (int original_rc : {507018, 507014, -42}) {
+        request.original_rc = original_rc;
+        request.phase = DomainRecoveryPhase::PREPARE;
+        const auto prepared = recover();
+        ASSERT_EQ(prepared.status, DomainRecoveryStatus::PREPARED);
+        request.phase = DomainRecoveryPhase::COMMIT;
+        const auto committed = recover();
+        ASSERT_EQ(committed.status, DomainRecoveryStatus::REARMED);
+        EXPECT_EQ(committed.original_rc, original_rc);
+        EXPECT_EQ(committed.generation, request.expected_generation + 1);
+        ++request.recovery_id;
+        EXPECT_EQ(recover().status, DomainRecoveryStatus::STALE_GENERATION);
+        request.expected_generation = committed.generation;
+    }
+    EXPECT_EQ(events.size(), 6u);
+}
+
+TEST_F(DomainRecoveryTest, ExecutionOnlyPreservesWithoutCallingProviderOrCommitting) {
+    request.impact = DomainRecoveryImpact::EXECUTION_ONLY;
+    request.collective_quiescence = 0;
+    const auto result = recover();
+    EXPECT_EQ(result.status, DomainRecoveryStatus::PRESERVED);
+    EXPECT_EQ(result.generation, 1u);
+    EXPECT_EQ(result.workspace, binding.workspace);
+    EXPECT_TRUE(events.empty());
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::ALREADY_RECOVERED);
+    request.phase = DomainRecoveryPhase::COMMIT;
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::INVALID_STATE);
+}
+
+TEST_F(DomainRecoveryTest, UnsupportedTransportAndSevereDomainsGiveUpWithoutResourceOperations) {
+    for (auto engine : {DomainRecoveryEngine::URMA, DomainRecoveryEngine::CCU}) {
+        DomainRecoveryManager local;
+        binding.engine = engine;
+        ops.rearm_supported = false;
+        const auto result = local.recover(request, binding, ops);
+        EXPECT_EQ(result.status, DomainRecoveryStatus::GIVE_UP);
+        expect_no_bindings(result);
+    }
+    for (auto impact : {DomainRecoveryImpact::SHARED_COMMUNICATION, DomainRecoveryImpact::DEVICE}) {
+        DomainRecoveryManager local;
+        request.impact = impact;
+        EXPECT_EQ(local.recover(request, binding, ops).status, DomainRecoveryStatus::GIVE_UP);
+    }
+    request.impact = static_cast<DomainRecoveryImpact>(1);
+    EXPECT_EQ(recover().status, DomainRecoveryStatus::INVALID_STATE);
+    EXPECT_TRUE(events.empty());
+}
 }  // namespace

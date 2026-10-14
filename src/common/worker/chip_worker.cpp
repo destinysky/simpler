@@ -1393,7 +1393,7 @@ DomainRecoveryResult ChipWorker::recover_comm_domain_substrate(
         return result;
     }
     int rc = comm_recover_domain_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, &request, &result);
-    if (result.abi_version != 1 || result.struct_bytes != sizeof(DomainRecoveryResult)) {
+    if (result.abi_version != 2 || result.struct_bytes != sizeof(DomainRecoveryResult)) {
         result.status = DomainRecoveryStatus::UNSUPPORTED;
         result.device_ctx = 0;
         result.local_window_base = 0;
@@ -1409,25 +1409,25 @@ DomainRecoveryResult ChipWorker::recover_comm_domain_substrate(
     return result;
 }
 
-CommRecoveryProbeSnapshot ChipWorker::comm_recovery_snapshot(uint64_t comm_handle, uint64_t allocation_id) {
+CommRecoverySnapshot ChipWorker::comm_recovery_snapshot(uint64_t comm_handle, uint64_t allocation_id) {
     if (!initialized_ || lib_handle_ == nullptr) {
         throw std::runtime_error("communication recovery snapshot requires an initialized ChipWorker");
     }
     if (find_comm_session(comm_handle) == nullptr) throw std::invalid_argument("unknown communication handle");
-    using ProbeFn = int (*)(void *, uint64_t, CommRecoveryProbeSnapshot *);
+    using SnapshotFn = int (*)(void *, uint64_t, CommRecoverySnapshot *);
     dlerror();
-    auto probe_fn = reinterpret_cast<ProbeFn>(dlsym(lib_handle_, "comm_recovery_probe_snapshot"));
+    auto snapshot_fn = reinterpret_cast<SnapshotFn>(dlsym(lib_handle_, "comm_recovery_snapshot"));
     const char *symbol_error = dlerror();
-    if (symbol_error != nullptr || probe_fn == nullptr) {
+    if (symbol_error != nullptr || snapshot_fn == nullptr) {
         throw UnsupportedRuntimeOperation("communication recovery snapshot is not exported by this platform runtime");
     }
 
-    CommRecoveryProbeSnapshot snapshot{};
-    int rc = probe_fn(reinterpret_cast<void *>(comm_handle), allocation_id, &snapshot);
+    CommRecoverySnapshot snapshot{};
+    int rc = snapshot_fn(reinterpret_cast<void *>(comm_handle), allocation_id, &snapshot);
     if (rc != 0) {
         throw std::runtime_error("communication recovery snapshot failed with code " + std::to_string(rc));
     }
-    if (snapshot.version != COMM_RECOVERY_PROBE_VERSION) {
+    if (snapshot.version != COMM_RECOVERY_SNAPSHOT_VERSION) {
         throw std::runtime_error("communication recovery snapshot returned an unsupported version");
     }
     return snapshot;

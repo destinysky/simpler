@@ -94,65 +94,73 @@ For A5 SDMA, `all_queues_empty = 0` means **unproven**, not confirmed busy:
 workspace channel descriptions do not read live SQ head/tail registers.
 `queue_read_errors` counts snapshot-copy errors, not communication task failures.
 Neither field authorizes recovery or window retirement.
+`binding_signature` fingerprints resource addresses and queue configuration;
+`queue_signature` fingerprints mutable queue progress. Its value may change
+during normal SDMA work or rearm and is not a resource-preservation invariant.
 
-`DomainRecoveryRequest` names a monotonically increasing, collective `recovery_id`,
-`expected_generation`, the local `failed_run_epoch` (zero for a healthy execution
-substrate), `original_rc`, and `DomainRecoveryImpact`. `EXECUTION_ONLY` returns
-`PRESERVED` with the same domain generation and bindings. `DOMAIN_BINDINGS` requests
-fresh windows, peer imports and device CommContext, preserving Context C, HCCL,
-communication stream and the SDMA workspace. The domain owner must first fence and
-drain **every** domain user on **every** member, including communication issued
-outside PTO, then set `collective_quiescence = 1`. A local native-slot drain or
-cooperative PTO shutdown alone does not establish this condition.
+`DomainRecoveryRequest` (ABI 3, 56 bytes) names a monotonically increasing
+`recovery_id`, `expected_generation`, local `failed_run_epoch`, `original_rc`,
+`DomainRecoveryImpact` and `DomainRecoveryPhase`. Original and recovery codes
+are diagnostics; they do not select a recovery mode or authorize replay.
 
-All subset members call with matching recovery id, expected generation and impact.
-The backend votes prepare/build/retire results before publishing new bindings. A
-successful rebuild returns `REBUILT`, generation + 1 and `rebind_required = 1`;
-window contents, including signals, start at zero. The owner must collect successful
-results from all members before using them. Any failed/missing result ends this
-operator-recovery episode. This is resource recovery, not a distributed replay/commit
-protocol: TaskArgs rebinding and recovery dispatch remain outside this API.
+`EXECUTION_ONLY` with `PREPARE` returns `PRESERVED`: domain generation, Context C,
+HCCL, comm stream, workspace, windows and device CommContext remain unchanged.
+`DOMAIN_TRANSPORT` requests the backend's supported recovery mechanism, currently
+SDMA in-place rearm. There is no caller choice of stream replacement or domain
+rebuild. The owner fences all producers on every member before setting
+`collective_quiescence = 1`; cooperative PTO retirement alone does not certify
+outstanding async DMA stop. SDMA accepts one full-communicator domain with no
+base/derived context users or pending allocation cleanup.
 
-Exact duplicate requests return `ALREADY_RECOVERED` with the original result;
-changed/reused recovery ids and stale generations are refused. Logical allocation ids
-cannot be reused during one A5 communication session. Domain recovery never clears
-execution admission poison; execution rearming remains a separate explicit call.
-Original and recovery error codes are diagnostics, never eligibility whitelists.
-A failed rebuild returns no dispatchable binding and quarantines further soft recovery.
-Default terminal cleanup owns any remaining resources; this operation never resets a device.
+The transaction is local and explicit:
 
-A5 rematerializes SDMA/VMM bindings for `DOMAIN_BINDINGS`. For
-`DOMAIN_TRANSPORT`, `DomainTransportAction.REARM` retains SDMA streams/workspace
-and repopulates their live metadata after Abort; `REPLACE` provisions new SDMA
-streams/workspace while retaining the VMM windows and device CommContext address.
-The request ABI is version 2 (56 bytes); older requests are rejected. Both transport
-operations require an empty FIFO, retired native slots, local execution quiescence,
-an owner fence on all ranks and all shared-workspace producers, and successful
-`aclrtStreamAbort` on every SDMA stream on every member before any workspace write
-or release. The collective votes prepare/stop/build/retire outcomes. An Abort
-error preserves the original and recovery faults and returns no dispatchable binding.
-A failed domain transaction fences execution rearming and new submission; unproved
-transport resources remain owned by the terminal device lifecycle for cleanup.
-This provider currently accepts only one full-communicator domain, with no base
-window context, derived contexts, or pending allocation cleanup; wider shared
-transport recovery requires a broader fence and binding transaction.
+1. `PREPARE` stops every manager-owned SDMA stream through `aclrtStreamAbort`,
+   validates the complete stop report, and requeries the existing workspace.
+   `PREPARED` retains generation and resource addresses. Execution admission
+   stays fenced, and `recover_execution` returns `BUSY` while a domain is prepared.
+   Window allocation/release, context derivation and business comm barriers are
+   refused until local COMMIT. Destruction of a pending transaction quarantines
+   its resources for terminal device cleanup.
+2. The owner collects matching successful preparation from **all** members,
+   then issues `COMMIT` on all members. Local `REARMED` advances generation once
+   and reports preserved addresses with `rebind_required = 1`; the owner refreshes
+   generation metadata. This does not implement Step6 TaskArgs rebinding.
+3. Only after every COMMIT acknowledgment may the owner explicitly recover
+   execution and decide whether to dispatch the logical task again. A failed or
+   missing acknowledgment ends recovery; `ABORT` with nonzero `collective_rc`
+   quarantines prepared or locally committed members and preserves both faults.
+   A lost member requires the control plane's existing terminal handling.
 
-`REARM` returns `REARMED`, preserved addresses and generation + 1. `REPLACE`
-returns `REBUILT`, generation + 1 and a changed workspace. Both require the owner
-to refresh its domain generation and obtain all-member success before explicit
-execution rearming and external redispatch. Window contents are preserved by
-transport recovery; binding-only rebuild starts new windows at zero. No successful
-resource operation alone proves that legal SDMA traffic can complete again.
-The manual comparison tests establish that separately with changed input data,
-new generation/completion state and strict predecessor/successor ordering.
+All members agree on id, generation, impact and producer fence; failed execution
+epochs are local. The cross-host control plane owns agreement, deadlines and
+failure decisions. No filesystem marker or HCCL barrier implements recovery
+agreement inside the backend. COMMIT is a local resource transaction acknowledgment,
+not a distributed task/result commit. The owner must keep admissions fenced through
+all-member acknowledgment; Step7 replay eligibility and Step8 dispatch remain separate.
 
-URMA execution-only preservation is supported; independent URMA rematerialization
-and transport repair remain unsupported by the pinned provider. CCU retains an
-engine id and provider capability seam. There is no fault-code-based mode choice,
-automatic retry budget, or automatic escalation from rearm to replacement here.
-Shared communication (HCCL or Context C) and device faults return `GIVE_UP`.
-Other hardware backends retain their existing comm ABI and report `UNSUPPORTED`
-for this optional operation.
+`DomainRecoveryResult` (ABI 2, 136 bytes) includes `transport_channel_count`,
+`stopped_channel_count`, and `transport_stopped`. These describe local provider
+stop proof, unlike queue snapshots. Exact duplicate PREPARE is `PREPARED` before
+commit and `ALREADY_RECOVERED` afterward; duplicate COMMIT never advances generation
+twice. Changed/reused ids, stale generations and COMMIT without PREPARE are rejected.
+Domain recovery never clears execution admission poison. Failures return no
+dispatchable binding and permanently fence soft recovery. Unproved DMA/query
+resources belong to terminal device cleanup; the primitive never resets a device.
+
+The SDMA provider targets the validated A5 CANN runtime. The
+[CANN 9.2.0-beta.2 StreamAbort contract](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/920beta2/API/runtimeapi/aclcppdevg_03_1777.html)
+does not exclude `DEVICE_USE_ONLY` streams; the A5 restriction concerns
+`ACL_STREAM_PERSISTENT`, which this manager does not use. Older SDK contracts
+must be checked separately; absence of the Abort symbol returns failure.
+
+SDMA transport recovery preserves window contents. The regression separately
+proves fresh SDMA data movement and failed-A / blocked-old-B / new-A / new-B ordering.
+Tests use the existing explicit execution-fatal fixture; they do not simulate a
+network outage or certify recovery from every physical transport fault.
+URMA supports execution-only preservation; its transport recovery is unsupported.
+CCU retains an engine/capability boundary. The former binding-rebuild and transport
+replacement APIs are removed; shared communication or device scope returns `GIVE_UP`. Other
+hardware backends retain their existing comm ABI and return `UNSUPPORTED`.
 
 
 At L2 the `callable` is a registered `ChipCallable` handle. At L3+ the top-level

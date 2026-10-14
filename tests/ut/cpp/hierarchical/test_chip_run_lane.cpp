@@ -947,3 +947,100 @@ TEST(ChipRunLaneTest, FailedDomainRecoveryCannotBeBypassedByExecutionRearm) {
         lane.submit(0, ChipStorageTaskArgs{}, CallConfig{}, PipelineSlotLease{0, 0, 1}, 1, 1), std::runtime_error
     );
 }
+
+TEST(ChipRunLaneTest, PreparedDomainsFenceSubmissionAndExecutionUntilEveryLocalCommit) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.create_comm_session(reinterpret_cast<void *>(0xC0), nullptr, false);
+    worker.create_comm_session(reinterpret_cast<void *>(0xC1), nullptr, false);
+    ChipRunLane lane(worker);
+    g_recovery.status = ExecutionRecoveryStatus::RECOVERY_REQUIRED;
+    g_recovery.failed_run_epoch = 7;
+    g_recovery.quiesced = 1;
+    DomainRecoveryRequest request;
+    request.recovery_id = 1;
+    request.expected_generation = 1;
+    request.failed_run_epoch = 7;
+    request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
+    request.collective_quiescence = 1;
+    g_domain_status = DomainRecoveryStatus::PREPARED;
+    ASSERT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::PREPARED);
+    ASSERT_EQ(lane.recover_comm_domain(0xC1, 24, request).status, DomainRecoveryStatus::PREPARED);
+    EXPECT_EQ(lane.recover_execution(7, ExecutionRecoveryScope::EXECUTION_ONLY).status, ExecutionRecoveryStatus::BUSY);
+    EXPECT_EQ(g_recovery_calls, 0u);
+    EXPECT_THROW(submit(lane, 101, 0), std::runtime_error);
+    request.phase = DomainRecoveryPhase::COMMIT;
+    g_domain_status = DomainRecoveryStatus::REARMED;
+    ASSERT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::REARMED);
+    EXPECT_EQ(lane.recover_execution(7, ExecutionRecoveryScope::EXECUTION_ONLY).status, ExecutionRecoveryStatus::BUSY);
+    ASSERT_EQ(lane.recover_comm_domain(0xC1, 24, request).status, DomainRecoveryStatus::REARMED);
+    EXPECT_EQ(
+        lane.recover_execution(7, ExecutionRecoveryScope::EXECUTION_ONLY).status, ExecutionRecoveryStatus::RECOVERED
+    );
+    EXPECT_EQ(g_recovery_calls, 1u);
+    worker.comm_sessions_.clear();
+    worker.comm_session_index_.clear();
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, PeerAbortAfterLocalCommitFencesExecutionRecovery) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.create_comm_session(reinterpret_cast<void *>(0xC0), nullptr, false);
+    ChipRunLane lane(worker);
+    g_recovery.status = ExecutionRecoveryStatus::RECOVERY_REQUIRED;
+    g_recovery.failed_run_epoch = 7;
+    g_recovery.quiesced = 1;
+    DomainRecoveryRequest request;
+    request.recovery_id = 1;
+    request.expected_generation = 1;
+    request.failed_run_epoch = 7;
+    request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
+    request.collective_quiescence = 1;
+    g_domain_status = DomainRecoveryStatus::PREPARED;
+    ASSERT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::PREPARED);
+    request.phase = DomainRecoveryPhase::COMMIT;
+    g_domain_status = DomainRecoveryStatus::REARMED;
+    ASSERT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::REARMED);
+    request.phase = DomainRecoveryPhase::ABORT;
+    request.collective_rc = 88;
+    g_domain_status = DomainRecoveryStatus::RECOVERY_FAILED;
+    ASSERT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::RECOVERY_FAILED);
+    EXPECT_EQ(
+        lane.recover_execution(7, ExecutionRecoveryScope::EXECUTION_ONLY).status, ExecutionRecoveryStatus::INVALID_STATE
+    );
+    EXPECT_EQ(g_recovery_calls, 0u);
+    EXPECT_THROW(submit(lane, 101, 0), std::runtime_error);
+    worker.comm_sessions_.clear();
+    worker.comm_session_index_.clear();
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, UnsupportedAffectedTransportCannotBeBypassedByExecutionRearm) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.create_comm_session(reinterpret_cast<void *>(0xC0), nullptr, false);
+    worker.comm_recover_domain_fn_ = nullptr;
+    ChipRunLane lane(worker);
+    g_recovery.status = ExecutionRecoveryStatus::RECOVERY_REQUIRED;
+    g_recovery.failed_run_epoch = 7;
+    g_recovery.quiesced = 1;
+    DomainRecoveryRequest request;
+    request.recovery_id = 1;
+    request.expected_generation = 1;
+    request.failed_run_epoch = 7;
+    request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
+    request.collective_quiescence = 1;
+    ASSERT_EQ(lane.recover_comm_domain(0xC0, 23, request).status, DomainRecoveryStatus::UNSUPPORTED);
+    EXPECT_EQ(
+        lane.recover_execution(7, ExecutionRecoveryScope::EXECUTION_ONLY).status, ExecutionRecoveryStatus::INVALID_STATE
+    );
+    EXPECT_EQ(g_recovery_calls, 0u);
+    EXPECT_THROW(submit(lane, 101, 0), std::runtime_error);
+    worker.comm_sessions_.clear();
+    worker.comm_session_index_.clear();
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}

@@ -461,13 +461,6 @@ int DeviceRunner::prepare_execution(
     }
     execution->num_aicore = num_aicore;
     execution->launch_aicpu_num = active_aicpu_num;
-    // The pooled SM may still contain a prior generation's stop publication.
-    // Clearing it precedes every launch, including failed-init generations.
-    if (void *flag = execution_quiescence_flag(&runtime); flag != nullptr) {
-        const int32_t pending = 0;
-        rc = copy_to_device(flag, &pending, sizeof(pending));
-        if (rc != 0) return rc;
-    }
     prepare_rollback.dismiss();
     *prepared = std::move(execution);
     return 0;
@@ -494,6 +487,13 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             // including a thread-spawn or allocation throw — are reported as an rc
             // and leave the run safely rollback-able.
             try {
+                // Shared scratch belongs to the launch claim. Preparing a
+                // successor must not erase its predecessor's stop publication.
+                if (void *flag = execution_quiescence_flag(&runtime); flag != nullptr) {
+                    const int32_t pending = 0;
+                    const int reset_rc = copy_to_device(flag, &pending, sizeof(pending));
+                    if (reset_rc != 0) return reset_rc;
+                }
                 activate_launch_shape(runtime);
                 (void)arm_device_wall_buffer(prepared->kernel_args);
                 if (int arm_rc = arm_collectors_for_run(runtime, *prepared); arm_rc != 0) return arm_rc;
@@ -735,8 +735,12 @@ void DeviceRunner::record_execution_quiescence(const ActiveExecution &active) {
     execution_recovery_.quiesced = active.progress == LaunchProgress::Complete && proof_rc == 0 && proof == 1 ? 1 : 0;
     execution_recovery_.recovery_rc = proof_rc;
     LOG_WARN(
-        "[PTO_RECOVERY] EXECUTION_QUIESCENCE run_epoch=%llu proved=%u proof_rc=%d",
-        static_cast<unsigned long long>(prepared.identity.run_epoch), execution_recovery_.quiesced, proof_rc
+        "[PTO_RECOVERY] EXECUTION_QUIESCENCE run_epoch=%llu proved=%u proof_rc=%d proof_value=%d "
+        "launch_complete=%d slot=%u generation=%llu flag=0x%llx",
+        static_cast<unsigned long long>(prepared.identity.run_epoch), execution_recovery_.quiesced, proof_rc, proof,
+        static_cast<int>(active.progress == LaunchProgress::Complete), prepared.pipeline_slot,
+        static_cast<unsigned long long>(prepared.identity.generation),
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(flag))
     );
 }
 

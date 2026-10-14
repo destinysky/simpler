@@ -290,15 +290,15 @@ int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t ran
  * ChipWorker resolves it with optional dlsym so this does not extend the
  * mandatory cross-platform host-runtime ABI.
  */
-#define COMM_RECOVERY_PROBE_VERSION 1U
+#define COMM_RECOVERY_SNAPSHOT_VERSION 1U
 
-typedef enum CommRecoveryProbeWorkspaceKind {
-    COMM_RECOVERY_PROBE_WORKSPACE_NONE = 0,
-    COMM_RECOVERY_PROBE_WORKSPACE_SDMA = 1,
-    COMM_RECOVERY_PROBE_WORKSPACE_URMA = 2,
-} CommRecoveryProbeWorkspaceKind;
+typedef enum CommRecoveryWorkspaceKind {
+    COMM_RECOVERY_WORKSPACE_NONE = 0,
+    COMM_RECOVERY_WORKSPACE_SDMA = 1,
+    COMM_RECOVERY_WORKSPACE_URMA = 2,
+} CommRecoveryWorkspaceKind;
 
-typedef struct CommRecoveryProbeSnapshot {
+typedef struct CommRecoverySnapshot {
     uint32_t version;
     uint32_t workspace_kind;
     uint32_t rank;
@@ -323,9 +323,9 @@ typedef struct CommRecoveryProbeSnapshot {
     uint64_t workspace_size;
     uint64_t binding_signature;
     uint64_t queue_signature;
-} CommRecoveryProbeSnapshot;
+} CommRecoverySnapshot;
 
-int comm_recovery_probe_snapshot(CommHandle h, uint64_t allocation_id, CommRecoveryProbeSnapshot *snapshot_out);
+int comm_recovery_snapshot(CommHandle h, uint64_t allocation_id, CommRecoverySnapshot *snapshot_out);
 
 /**
  * Create one local window for a Global CommDomain and export its transport

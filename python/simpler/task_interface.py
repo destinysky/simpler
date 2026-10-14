@@ -69,10 +69,10 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     DeviceMemoryInfo,
     DomainRecoveryEngine,
     DomainRecoveryImpact,
+    DomainRecoveryPhase,
     DomainRecoveryRequest,
     DomainRecoveryResult,
     DomainRecoveryStatus,
-    DomainTransportAction,
     ExecutionRecoveryResult,
     ExecutionRecoveryScope,
     ExecutionRecoveryStatus,
@@ -192,7 +192,7 @@ __all__ = [
     "DomainRecoveryRequest",
     "DomainRecoveryResult",
     "DomainRecoveryStatus",
-    "DomainTransportAction",
+    "DomainRecoveryPhase",
     "ExecutionRecoveryResult",
     "ExecutionRecoveryScope",
     "ExecutionRecoveryStatus",
@@ -1518,11 +1518,13 @@ class ChipWorker:
     def recover_comm_domain(self, comm_handle: int, allocation_id: int, request):
         """Explicit resource recovery; never dispatches or rebinds TaskArgs.
 
-        Binding rebuild requires collective_quiescence from the domain owner, covering
-        every member and all DMA users. Transport recovery requires every
-        producer fenced; its provider obtains DMA stop proof through Abort.
-        All members use the same id, generation, impact and transport action,
-        then check every result before explicit execution rearm or redispatch.
+        The owner fences every producer on every member before PREPARE.
+        PREPARED is local stop/rearm proof, not permission to dispatch. After
+        collecting every member's PREPARED result, the owner issues COMMIT to
+        all members and checks all acknowledgments before execution recovery.
+        Any failure ends the episode: ABORT carries the peer recovery fault
+        to prepared or committed members. Cross-host agreement belongs to
+        the owner's control plane; this local primitive never waits on peers.
         """
         with self._lifecycle_lock:
             if self._init_owner_thread is not threading.current_thread() or self._init_in_progress:

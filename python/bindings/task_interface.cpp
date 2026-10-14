@@ -3387,13 +3387,13 @@ NB_MODULE(_task_interface, m) {
     // --- ChipWorker ---
     nb::enum_<DomainRecoveryImpact>(m, "DomainRecoveryImpact")
         .value("EXECUTION_ONLY", DomainRecoveryImpact::EXECUTION_ONLY)
-        .value("DOMAIN_BINDINGS", DomainRecoveryImpact::DOMAIN_BINDINGS)
         .value("DOMAIN_TRANSPORT", DomainRecoveryImpact::DOMAIN_TRANSPORT)
         .value("SHARED_COMMUNICATION", DomainRecoveryImpact::SHARED_COMMUNICATION)
         .value("DEVICE", DomainRecoveryImpact::DEVICE);
-    nb::enum_<DomainTransportAction>(m, "DomainTransportAction")
-        .value("REARM", DomainTransportAction::REARM)
-        .value("REPLACE", DomainTransportAction::REPLACE);
+    nb::enum_<DomainRecoveryPhase>(m, "DomainRecoveryPhase")
+        .value("PREPARE", DomainRecoveryPhase::PREPARE)
+        .value("COMMIT", DomainRecoveryPhase::COMMIT)
+        .value("ABORT", DomainRecoveryPhase::ABORT);
     nb::enum_<DomainRecoveryEngine>(m, "DomainRecoveryEngine")
         .value("NONE", DomainRecoveryEngine::NONE)
         .value("SDMA", DomainRecoveryEngine::SDMA)
@@ -3401,7 +3401,6 @@ NB_MODULE(_task_interface, m) {
         .value("CCU", DomainRecoveryEngine::CCU);
     nb::enum_<DomainRecoveryStatus>(m, "DomainRecoveryStatus")
         .value("PRESERVED", DomainRecoveryStatus::PRESERVED)
-        .value("REBUILT", DomainRecoveryStatus::REBUILT)
         .value("ALREADY_RECOVERED", DomainRecoveryStatus::ALREADY_RECOVERED)
         .value("INVALID_STATE", DomainRecoveryStatus::INVALID_STATE)
         .value("STALE_GENERATION", DomainRecoveryStatus::STALE_GENERATION)
@@ -3410,7 +3409,8 @@ NB_MODULE(_task_interface, m) {
         .value("UNSUPPORTED", DomainRecoveryStatus::UNSUPPORTED)
         .value("GIVE_UP", DomainRecoveryStatus::GIVE_UP)
         .value("RECOVERY_FAILED", DomainRecoveryStatus::RECOVERY_FAILED)
-        .value("REARMED", DomainRecoveryStatus::REARMED);
+        .value("REARMED", DomainRecoveryStatus::REARMED)
+        .value("PREPARED", DomainRecoveryStatus::PREPARED);
     nb::class_<DomainRecoveryRequest>(m, "DomainRecoveryRequest")
         .def(nb::init<>())
         .def_ro("abi_version", &DomainRecoveryRequest::abi_version)
@@ -3421,7 +3421,8 @@ NB_MODULE(_task_interface, m) {
         .def_rw("impact", &DomainRecoveryRequest::impact)
         .def_rw("collective_quiescence", &DomainRecoveryRequest::collective_quiescence)
         .def_rw("original_rc", &DomainRecoveryRequest::original_rc)
-        .def_rw("transport_action", &DomainRecoveryRequest::transport_action);
+        .def_rw("phase", &DomainRecoveryRequest::phase)
+        .def_rw("collective_rc", &DomainRecoveryRequest::collective_rc);
     nb::class_<DomainRecoveryResult>(m, "DomainRecoveryResult")
         .def_ro("abi_version", &DomainRecoveryResult::abi_version)
         .def_ro("struct_bytes", &DomainRecoveryResult::struct_bytes)
@@ -3441,7 +3442,10 @@ NB_MODULE(_task_interface, m) {
         .def_ro("window_size", &DomainRecoveryResult::window_size)
         .def_ro("workspace", &DomainRecoveryResult::workspace)
         .def_ro("domain_preserved", &DomainRecoveryResult::domain_preserved)
-        .def_ro("rebind_required", &DomainRecoveryResult::rebind_required);
+        .def_ro("rebind_required", &DomainRecoveryResult::rebind_required)
+        .def_ro("transport_channel_count", &DomainRecoveryResult::transport_channel_count)
+        .def_ro("stopped_channel_count", &DomainRecoveryResult::stopped_channel_count)
+        .def_ro("transport_stopped", &DomainRecoveryResult::transport_stopped);
 
     nb::enum_<ExecutionRecoveryStatus>(m, "ExecutionRecoveryStatus")
         .value("RECOVERED", ExecutionRecoveryStatus::RECOVERED)
@@ -3783,7 +3787,7 @@ NB_MODULE(_task_interface, m) {
         .def(
             "comm_recovery_snapshot",
             [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id) {
-                const CommRecoveryProbeSnapshot snapshot = self.comm_recovery_snapshot(comm_handle, allocation_id);
+                const CommRecoverySnapshot snapshot = self.comm_recovery_snapshot(comm_handle, allocation_id);
                 nb::dict out;
                 out["version"] = snapshot.version;
                 out["workspace_kind"] = snapshot.workspace_kind;
@@ -3808,7 +3812,7 @@ NB_MODULE(_task_interface, m) {
                 return out;
             },
             nb::arg("comm_handle"), nb::arg("allocation_id"),
-            "Experiment-only: read a non-mutating communication recovery snapshot."
+            "Read a non-mutating communication recovery snapshot; queue observations are diagnostic only."
         )
         .def(
             "comm_global_domain_prepare",

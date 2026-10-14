@@ -74,16 +74,16 @@ static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(
 // ordinary host g++ translation unit.
 //
 // These layouts mirror pto::comm::sdma::{BatchWriteFlagInfo,
-// BatchWriteChannelInfo} from the pinned PTO-ISA revision.  The probe only
+// BatchWriteChannelInfo} from the pinned PTO-ISA revision.  The snapshot only
 // copies the device workspace to host memory and reads these fields; it never
 // writes the workspace.
-struct RecoveryProbeSdmaFlagInfo {
+struct RecoverySdmaFlagInfo {
     uint32_t flag;
     uint32_t total_queue_num;
     uint8_t reserved[56];
 };
 
-struct RecoveryProbeSdmaChannelInfo {
+struct RecoverySdmaChannelInfo {
     uint32_t sq_head;
     uint32_t sq_tail;
     uint64_t sq_base;
@@ -99,8 +99,8 @@ struct RecoveryProbeSdmaChannelInfo {
     uint8_t reserved[4];
 };
 
-static_assert(sizeof(RecoveryProbeSdmaFlagInfo) == 64, "SDMA flag-info ABI drift");
-static_assert(sizeof(RecoveryProbeSdmaChannelInfo) == 64, "SDMA channel-info ABI drift");
+static_assert(sizeof(RecoverySdmaFlagInfo) == 64, "SDMA flag-info ABI drift");
+static_assert(sizeof(RecoverySdmaChannelInfo) == 64, "SDMA channel-info ABI drift");
 
 #endif
 
@@ -157,7 +157,6 @@ struct CommHandle_ {
     std::unordered_map<uint64_t, std::unique_ptr<DomainAllocation>> domain_allocations;
     // Logical allocation ids cannot be reused within one communication session.
     std::unordered_set<uint64_t> domain_ids;
-    std::vector<std::unique_ptr<DomainAllocation>> pending_domain_cleanup;
     bool transport_quarantined{false};
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
@@ -174,6 +173,13 @@ struct CommHandle_ {
 namespace {
 
 static constexpr uint64_t ROOTINFO_MAGIC = 0x50544f5f4843434cULL;  // "PTO_HCCL"
+
+static bool comm_recovery_pending(CommHandle h) {
+    for (const auto &entry : h->domain_allocations) {
+        if (entry.second->recovery.prepared()) return true;
+    }
+    return false;
+}
 
 static int bind_comm_context(CommHandle h, const char *stage) {
     if (h == nullptr || h->runtime_context == nullptr) {
@@ -973,11 +979,9 @@ static int release_domain_allocation(DomainAllocation &alloc) {
 // the peer imports live on `out->peer_windows` for comm_release_domain_windows.
 static int domain_alloc_via_ipc(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    uint64_t win_size, DomainAllocation *out, uint64_t recovery_id = 0
+    uint64_t win_size, DomainAllocation *out
 ) {
-    const std::string rootinfo = recovery_id == 0 ? h->rootinfo_path :
-                                                    h->rootinfo_path + ".domain_" + std::to_string(allocation_id) +
-                                                        ".recovery_" + std::to_string(recovery_id);
+    const std::string &rootinfo = h->rootinfo_path;
     const uint64_t run_token = h->run_token;
     const int subset_n = static_cast<int>(rank_count);
     const int my_dr = static_cast<int>(domain_rank);
@@ -1272,7 +1276,7 @@ static int domain_alloc_via_ipc(
 
 extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *device_ctx_out) try {
     if (!h || !device_ctx_out) return -1;
-    if (h->transport_quarantined) return -1;
+    if (h->transport_quarantined || comm_recovery_pending(h)) return -1;
     if (bind_comm_context(h, "comm_alloc_windows") != 0) return -1;
 
     // Idempotency guard: comm_alloc_windows is not re-entrant. The localBuf
@@ -1337,7 +1341,7 @@ extern "C" int comm_derive_context(
     size_t window_size, uint64_t *device_ctx_out
 ) try {
     if (!h || !rank_ids || !device_ctx_out) return -1;
-    if (h->transport_quarantined) return -1;
+    if (h->transport_quarantined || comm_recovery_pending(h)) return -1;
     if (bind_comm_context(h, "comm_derive_context") != 0) return -1;
     if (h->host_ctx.rankNum == 0) {
         LOG_ERROR("[comm rank %d] comm_derive_context: base windows are not allocated", h->rank);
@@ -1404,6 +1408,7 @@ extern "C" int comm_derive_context(
 
 extern "C" int comm_barrier(CommHandle h) {
     if (!h) return -1;
+    if (h->transport_quarantined || comm_recovery_pending(h)) return -1;
     if (bind_comm_context(h, "comm_barrier") != 0) return -1;
     // HcclBarrier is synchronous — it blocks until all ranks arrive.
     // Do NOT call aclrtSynchronizeStream after it: HcclBarrier internally
@@ -1422,7 +1427,7 @@ extern "C" int comm_alloc_domain_windows(
     size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
 ) try {
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out) return -1;
-    if (h->transport_quarantined) return -1;
+    if (h->transport_quarantined || comm_recovery_pending(h)) return -1;
     if (bind_comm_context(h, "alloc_domain") != 0) return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         LOG_ERROR(
@@ -1475,7 +1480,7 @@ extern "C" int comm_alloc_domain_windows(
 extern "C" int
 comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) try {
     if (!h) return -1;
-    if (h->transport_quarantined) return -1;
+    if (h->transport_quarantined || comm_recovery_pending(h)) return -1;
     if (bind_comm_context(h, "release_domain") != 0) return -1;
     auto it = h->domain_allocations.find(allocation_id);
     if (it == h->domain_allocations.end()) {
@@ -1535,77 +1540,6 @@ static DomainRecoveryResult domain_binding(CommHandle h, uint64_t allocation_id,
     return result;
 }
 
-struct DomainRecoveryVote {
-    uint64_t generation;
-    uint64_t recovery_id;
-    uint64_t window_size;
-    uint64_t member_signature;
-    uint32_t impact;
-    uint32_t engine;
-    uint32_t transport_action;
-    int32_t rc;
-    uint32_t reserved;
-};
-
-static int domain_recovery_agree(
-    CommHandle h, uint64_t allocation_id, const DomainAllocation &alloc, const DomainRecoveryRequest &request,
-    DomainRecoveryManager::Phase phase, int local_rc
-) {
-    uint64_t member_signature = 0xcbf29ce484222325ULL;
-    for (uint32_t rank : alloc.rank_ids) {
-        member_signature ^= rank;
-        member_signature *= 0x100000001b3ULL;
-    }
-    DomainRecoveryVote vote{
-        request.expected_generation,
-        request.recovery_id,
-        alloc.window_size,
-        member_signature,
-        static_cast<uint32_t>(request.impact),
-        static_cast<uint32_t>(alloc.engine),
-        static_cast<uint32_t>(request.transport_action),
-        local_rc,
-        0
-    };
-    const std::string tag = domain_barrier_tag(allocation_id, "recovery") + "_g" +
-                            std::to_string(request.expected_generation) + "_r" + std::to_string(request.recovery_id) +
-                            "_p" + std::to_string(static_cast<uint32_t>(phase));
-    const std::string path = barrier_marker_path(h->rootinfo_path, h->run_token, tag, alloc.rank);
-    const std::string tmp = path + ".tmp." + std::to_string(getpid());
-    {
-        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
-        file.write(reinterpret_cast<const char *>(&vote), sizeof(vote));
-        if (!file.good()) {
-            std::remove(tmp.c_str());
-            return -1;
-        }
-    }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
-        std::remove(tmp.c_str());
-        return -1;
-    }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
-    for (int rank = 0; rank < alloc.nranks; ++rank) {
-        const std::string peer_path = barrier_marker_path(h->rootinfo_path, h->run_token, tag, rank);
-        while (true) {
-            std::ifstream file(peer_path, std::ios::binary);
-            DomainRecoveryVote peer{};
-            if (file.read(reinterpret_cast<char *>(&peer), sizeof(peer))) {
-                if (peer.generation != vote.generation || peer.recovery_id != vote.recovery_id ||
-                    peer.window_size != vote.window_size || peer.member_signature != vote.member_signature ||
-                    peer.impact != vote.impact || peer.engine != vote.engine ||
-                    peer.transport_action != vote.transport_action || peer.reserved != 0)
-                    return -1;
-                if (peer.rc != 0) return peer.rc;
-                break;
-            }
-            if (std::chrono::steady_clock::now() >= deadline) return -1;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    }
-    return local_rc;
-}
-
 }  // namespace
 
 extern "C" int comm_recover_domain(
@@ -1622,99 +1556,35 @@ extern "C" int comm_recover_domain(
     auto it = h->domain_allocations.find(allocation_id);
     if (it == h->domain_allocations.end()) return 0;
     DomainAllocation &old = *it->second;
-    std::unique_ptr<DomainAllocation> candidate;
     DomainRecoveryManager::Operations operations;
     operations.preserve_supported = old.engine != DomainRecoveryEngine::CCU;
-    // URMA registrations and channels are HCCL-owned in the pinned provider.
-    operations.rebuild_supported = old.engine == DomainRecoveryEngine::SDMA || old.engine == DomainRecoveryEngine::NONE;
-    operations.agree = [&](DomainRecoveryManager::Phase phase, int rc) {
-        return domain_recovery_agree(h, allocation_id, old, *request, phase, rc);
-    };
-    operations.build = [&](DomainRecoveryResult &replacement) {
-        candidate = std::make_unique<DomainAllocation>();
-        int rc = domain_alloc_via_ipc(
-            h, allocation_id, old.rank_ids.data(), old.rank_ids.size(), static_cast<uint32_t>(old.rank),
-            old.window_size, candidate.get(), request->recovery_id
-        );
-        if (rc != 0) {
-            candidate.reset();
-            return rc;
-        }
-        // Binding ownership and transaction metadata have different lifetimes.
-        const auto binding = domain_binding(h, allocation_id, *candidate);
-        replacement.device_ctx = binding.device_ctx;
-        replacement.local_window_base = binding.local_window_base;
-        replacement.workspace = binding.workspace;
-        replacement.engine = binding.engine;
-        return 0;
-    };
-    operations.retire = [&] {
-        return release_domain_allocation(old);
-    };
-    operations.discard = [&] {
-        if (candidate && release_domain_allocation(*candidate) != 0) {
-            h->pending_domain_cleanup.push_back(std::move(candidate));
-        }
-        candidate.reset();
-    };
     const bool transport = request->impact == DomainRecoveryImpact::DOMAIN_TRANSPORT;
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-    std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> transport_candidate;
     if (transport) {
-        // A workspace is shared by all allocations on this handle. This
-        // provider supports a single full-communicator domain; broader users
-        // require a shared-transport fence and binding transaction.
+        // All manager-owned streams share this workspace. Local stop proof
+        // covers a single full-communicator domain with no other producers.
         bool exclusive = old.engine == DomainRecoveryEngine::SDMA && h->sdma_workspace &&
-                         h->domain_allocations.size() == 1 && h->pending_domain_cleanup.empty() &&
-                         h->device_ctx == nullptr && h->derived_contexts.empty() && old.nranks == h->nranks &&
-                         old.rank_ids.size() == static_cast<size_t>(h->nranks);
+                         h->domain_allocations.size() == 1 && h->device_ctx == nullptr && h->derived_contexts.empty() &&
+                         old.nranks == h->nranks && old.rank_ids.size() == static_cast<size_t>(h->nranks);
         for (size_t rank = 0; exclusive && rank < old.rank_ids.size(); ++rank)
             exclusive = old.rank_ids[rank] == rank;
-        operations.transport_rebuild_supported = exclusive;
-        operations.transport_rearm_supported = exclusive;
-        operations.quiesce = [&] {
-            const auto aborted = h->sdma_workspace->AbortStreams();
+        operations.rearm_supported = exclusive;
+        operations.quiesce = [&](DomainRecoveryResult &proof) {
+            const auto stopped = h->sdma_workspace->AbortStreams();
+            proof.transport_channel_count = stopped.channels;
+            proof.stopped_channel_count = stopped.stopped;
+            proof.transport_stopped =
+                stopped.channels != 0 && stopped.first_rc == 0 && stopped.stopped == stopped.channels;
             LOG_INFO(
-                "[PTO_RECOVERY] SDMA_ABORT_RESULT rank=%d channels=%u stopped=%u failed_channel=%d rc=%d", h->rank,
-                aborted.channels, aborted.stopped, aborted.failed_channel, aborted.first_rc
+                "[PTO_RECOVERY] SDMA_STOP_RESULT rank=%d channels=%u stopped=%u failed_channel=%d rc=%d", h->rank,
+                stopped.channels, stopped.stopped, stopped.failed_channel, stopped.first_rc
             );
-            return aborted.first_rc == 0 && aborted.channels == 48 && aborted.stopped == aborted.channels ?
-                       0 :
-                       (aborted.first_rc != 0 ? aborted.first_rc : -1);
+            return stopped.first_rc;
         };
-        operations.build = [&](DomainRecoveryResult &replacement) {
-            if (request->transport_action == DomainTransportAction::REARM) {
-                const bool ok = h->sdma_workspace->RefreshWorkspaceAfterAbort(10000);
-                LOG_INFO("[PTO_RECOVERY] SDMA_REQUERY_RESULT rank=%d ok=%d", h->rank, static_cast<int>(ok));
-                return ok ? 0 : -1;
-            }
-            transport_candidate = std::make_unique<pto::comm::sdma::SdmaWorkspaceManager>();
-            if (!transport_candidate->Init(10000)) return -1;
-            replacement.workspace = reinterpret_cast<uint64_t>(transport_candidate->GetWorkspaceAddr());
-            LOG_INFO(
-                "[PTO_RECOVERY] SDMA_REPLACEMENT_READY rank=%d old=0x%llx new=0x%llx", h->rank,
-                static_cast<unsigned long long>(old.workspace_addr),
-                static_cast<unsigned long long>(replacement.workspace)
-            );
-            return 0;
-        };
-        operations.retire = [&] {
-            if (request->transport_action == DomainTransportAction::REARM) return 0;
-            const uint64_t workspace = reinterpret_cast<uint64_t>(transport_candidate->GetWorkspaceAddr());
-            const int rc = aclrtMemcpy(
-                reinterpret_cast<char *>(old.device_ctx) + offsetof(CommContext, workSpace), sizeof(workspace),
-                &workspace, sizeof(workspace), ACL_MEMCPY_HOST_TO_DEVICE
-            );
-            if (rc != ACL_SUCCESS) return rc;
-            old.workspace_addr = workspace;
-            h->host_ctx.workSpace = workspace;
-            // Every old stream has completed Abort and every member built a
-            // candidate. No old DMA producer can access the old workspace.
-            h->sdma_workspace = std::move(transport_candidate);
-            return 0;
-        };
-        operations.discard = [&] {
-            transport_candidate.reset();
+        operations.rearm = [&] {
+            const int rc = h->sdma_workspace->RearmAfterAbort(10000);
+            LOG_INFO("[PTO_RECOVERY] SDMA_REARM_RESULT rank=%d rc=%d", h->rank, rc);
+            return rc;
         };
     }
 #endif
@@ -1722,13 +1592,9 @@ extern "C" int comm_recover_domain(
     if (transport && old.engine == DomainRecoveryEngine::SDMA &&
         (result->status == DomainRecoveryStatus::RECOVERY_FAILED || result->status == DomainRecoveryStatus::GIVE_UP))
         h->transport_quarantined = true;
-    if (result->status == DomainRecoveryStatus::REBUILT && !transport) {
-        candidate->recovery = old.recovery;
-        it->second = std::move(candidate);
-    }
-    const char *outcome = result->status == DomainRecoveryStatus::REARMED           ? "TRANSPORT_REARMED" :
+    const char *outcome = result->status == DomainRecoveryStatus::PREPARED          ? "DOMAIN_RECOVERY_PREPARED" :
+                          result->status == DomainRecoveryStatus::REARMED           ? "DOMAIN_RECOVERY_COMMITTED" :
                           result->status == DomainRecoveryStatus::PRESERVED         ? "PRESERVE_COMM_DOMAIN" :
-                          result->status == DomainRecoveryStatus::REBUILT           ? "DOMAIN_REBUILT" :
                           result->status == DomainRecoveryStatus::ALREADY_RECOVERED ? "DOMAIN_ALREADY_RECOVERED" :
                                                                                       "DOMAIN_RECOVERY_REJECTED";
     LOG_INFO(
@@ -1748,13 +1614,12 @@ extern "C" int comm_recover_domain(
     return -1;
 }
 
-extern "C" int
-comm_recovery_probe_snapshot(CommHandle h, uint64_t allocation_id, CommRecoveryProbeSnapshot *snapshot_out) try {
+extern "C" int comm_recovery_snapshot(CommHandle h, uint64_t allocation_id, CommRecoverySnapshot *snapshot_out) try {
     if (!h || !snapshot_out) return -1;
-    if (bind_comm_context(h, "recovery_probe") != 0) return -1;
+    if (bind_comm_context(h, "recovery_snapshot") != 0) return -1;
 
-    CommRecoveryProbeSnapshot snapshot{};
-    snapshot.version = COMM_RECOVERY_PROBE_VERSION;
+    CommRecoverySnapshot snapshot{};
+    snapshot.version = COMM_RECOVERY_SNAPSHOT_VERSION;
     snapshot.rank = static_cast<uint32_t>(h->rank);
     snapshot.nranks = static_cast<uint32_t>(h->nranks);
     snapshot.domain_allocation_count = static_cast<uint32_t>(h->domain_allocations.size());
@@ -1803,7 +1668,7 @@ comm_recovery_probe_snapshot(CommHandle h, uint64_t allocation_id, CommRecoveryP
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
     if (alloc.urma_workspace && alloc.urma_workspace->GetWorkspaceAddr() != nullptr) {
         using namespace pto::comm::urma;
-        snapshot.workspace_kind = COMM_RECOVERY_PROBE_WORKSPACE_URMA;
+        snapshot.workspace_kind = COMM_RECOVERY_WORKSPACE_URMA;
         snapshot.workspace_addr =
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(alloc.urma_workspace->GetWorkspaceAddr()));
         snapshot.workspace_size = urma_workspace_bytes(static_cast<uint32_t>(alloc.nranks));
@@ -1910,23 +1775,23 @@ comm_recovery_probe_snapshot(CommHandle h, uint64_t allocation_id, CommRecoveryP
 #endif
 
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-    if (snapshot.workspace_kind == COMM_RECOVERY_PROBE_WORKSPACE_NONE && h->sdma_workspace &&
+    if (snapshot.workspace_kind == COMM_RECOVERY_WORKSPACE_NONE && h->sdma_workspace &&
         h->sdma_workspace->GetWorkspaceAddr() != nullptr) {
         using namespace pto::comm::sdma;
-        snapshot.workspace_kind = COMM_RECOVERY_PROBE_WORKSPACE_SDMA;
+        snapshot.workspace_kind = COMM_RECOVERY_WORKSPACE_SDMA;
         snapshot.workspace_addr =
             static_cast<uint64_t>(reinterpret_cast<uintptr_t>(h->sdma_workspace->GetWorkspaceAddr()));
         snapshot.workspace_size = kSdmaWorkspaceBytes;
         mix(binding_hash, snapshot.workspace_addr);
         mix(binding_hash, snapshot.workspace_size);
 
-        std::vector<RecoveryProbeSdmaChannelInfo> channels(kSdmaMaxChannelGroups);
-        const uint64_t channel_addr = snapshot.workspace_addr + sizeof(RecoveryProbeSdmaFlagInfo);
+        std::vector<RecoverySdmaChannelInfo> channels(kSdmaMaxChannelGroups);
+        const uint64_t channel_addr = snapshot.workspace_addr + sizeof(RecoverySdmaFlagInfo);
 
         const aclError rc = aclrtMemcpy(
-            channels.data(), channels.size() * sizeof(RecoveryProbeSdmaChannelInfo),
+            channels.data(), channels.size() * sizeof(RecoverySdmaChannelInfo),
             reinterpret_cast<void *>(static_cast<uintptr_t>(channel_addr)),
-            channels.size() * sizeof(RecoveryProbeSdmaChannelInfo), ACL_MEMCPY_DEVICE_TO_HOST
+            channels.size() * sizeof(RecoverySdmaChannelInfo), ACL_MEMCPY_DEVICE_TO_HOST
         );
         if (rc != ACL_SUCCESS) {
             ++snapshot.queue_read_errors;
@@ -1935,7 +1800,7 @@ comm_recovery_probe_snapshot(CommHandle h, uint64_t allocation_id, CommRecoveryP
             // Workspace descriptions are diagnostic; live transport quiescence is unknown.
             snapshot.all_queues_empty = 0;
             for (uint32_t channel = 0; channel < channels.size(); ++channel) {
-                const RecoveryProbeSdmaChannelInfo &info = channels[channel];
+                const RecoverySdmaChannelInfo &info = channels[channel];
                 if (info.sq_depth == 0 || info.sq_base == 0 || info.sq_reg_base == 0) continue;
                 ++snapshot.active_queue_count;
                 mix(binding_hash, info.sq_base);
@@ -2008,6 +1873,7 @@ extern "C" int comm_global_domain_release(uint64_t) {
 
 extern "C" int comm_destroy(CommHandle h) try {
     if (!h) return -1;
+    if (comm_recovery_pending(h)) h->transport_quarantined = true;
     if (h->transport_quarantined) {
         LOG_WARN("[PTO_RECOVERY] COMM_QUARANTINE_TO_DEVICE_LIFECYCLE rank=%d", h->rank);
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
@@ -2052,11 +1918,6 @@ extern "C" int comm_destroy(CommHandle h) try {
         if (rc == 0) rc = cleanup_rc;
     }
     h->domain_allocations.clear();
-    for (auto &alloc : h->pending_domain_cleanup) {
-        int cleanup_rc = release_domain_allocation(*alloc);
-        if (rc == 0) rc = cleanup_rc;
-    }
-    h->pending_domain_cleanup.clear();
     reset_base_urma_workspace(h);
     if (h->hccl_comm) {
         HcclResult hret = hccl_comm_destroy(h->hccl_comm);

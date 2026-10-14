@@ -231,7 +231,7 @@ public:
     comm_release_domain_windows(uint64_t comm_handle, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank);
     DomainRecoveryResult
     recover_comm_domain(uint64_t comm_handle, uint64_t allocation_id, const DomainRecoveryRequest &request);
-    CommRecoveryProbeSnapshot comm_recovery_snapshot(uint64_t comm_handle, uint64_t allocation_id);
+    CommRecoverySnapshot comm_recovery_snapshot(uint64_t comm_handle, uint64_t allocation_id);
     std::tuple<std::vector<uint8_t>, uint64_t, size_t> comm_global_domain_prepare(
         uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
     );

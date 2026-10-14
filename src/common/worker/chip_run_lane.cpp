@@ -19,6 +19,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -64,6 +65,7 @@ struct ChipRunLaneState {
     void require_usable() const {
         if (closed) throw std::runtime_error("chip run lane is closed");
         if (poison != nullptr) rethrow_as_poisoned(poison);
+        if (!pending_domains.empty()) throw std::runtime_error("communication recovery is not committed");
     }
 
     void rethrow_run_error(const std::shared_ptr<ChipRunState> &run) const {
@@ -296,6 +298,7 @@ struct ChipRunLaneState {
     std::exception_ptr poison;
     uint64_t poison_epoch{0};
     std::optional<DomainRecoveryResult> domain_recovery_failure;
+    std::set<std::pair<uint64_t, uint64_t>> pending_domains;
     bool closed{false};
 };
 
@@ -547,6 +550,13 @@ ExecutionRecoveryResult ChipRunLane::recover_execution(uint64_t failed_run_epoch
         result.communication_preserved = 0;
         return result;
     }
+    if (!state_->pending_domains.empty()) {
+        auto result = state_->worker->execution_recovery_state();
+        result.scope = scope;
+        result.status = ExecutionRecoveryStatus::BUSY;
+        result.communication_preserved = 0;
+        return result;
+    }
     if (state_->closed || !state_->fifo.empty() ||
         (state_->poison != nullptr && state_->poison_epoch != failed_run_epoch)) {
         ExecutionRecoveryResult result = state_->worker->execution_recovery_state();
@@ -584,7 +594,17 @@ ChipRunLane::recover_comm_domain(uint64_t comm_handle, uint64_t allocation_id, c
         return result;
     }
     result = state_->worker->recover_comm_domain_substrate(comm_handle, allocation_id, request);
+    const auto domain = std::make_pair(comm_handle, allocation_id);
+    if (result.status == DomainRecoveryStatus::PREPARED) {
+        state_->pending_domains.insert(domain);
+    } else if (request.phase == DomainRecoveryPhase::COMMIT &&
+               (result.status == DomainRecoveryStatus::REARMED ||
+                result.status == DomainRecoveryStatus::ALREADY_RECOVERED)) {
+        state_->pending_domains.erase(domain);
+    }
     if (result.status == DomainRecoveryStatus::RECOVERY_FAILED ||
+        (request.impact == DomainRecoveryImpact::DOMAIN_TRANSPORT && result.status == DomainRecoveryStatus::UNSUPPORTED
+        ) ||
         (result.status == DomainRecoveryStatus::GIVE_UP &&
          state_->worker->execution_recovery_state().status != ExecutionRecoveryStatus::DEVICE_UNUSABLE)) {
         state_->domain_recovery_failure = result;
