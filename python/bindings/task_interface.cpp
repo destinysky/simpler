@@ -68,6 +68,7 @@
 #include "worker_chip_orch_comm.h"
 #include "worker_bind.h"
 #include "task_args_wire.h"
+#include "recovery_binding_plan.h"
 #include "tensor.h"
 
 namespace nb = nanobind;
@@ -2603,6 +2604,20 @@ NB_MODULE(_task_interface, m) {
     // --- TaskArgs (unified vector-backed builder with per-tensor TensorArgType tags) ---
     nb::class_<TaskArgs>(m, "TaskArgs", nb::is_weak_referenceable())
         .def(nb::init<>())
+        .def(
+            "add_domain_binding",
+            [](TaskArgs &self, const TaskDomainBinding &binding) {
+                RecoveryBindingPlan::validate_binding(self, binding);
+                self.domain_bindings.push_back(binding);
+            },
+            nb::arg("binding")
+        )
+        .def_prop_ro(
+            "domain_bindings",
+            [](const TaskArgs &self) {
+                return self.domain_bindings;
+            }
+        )
 
         .def(
             "add_tensor",
@@ -3385,6 +3400,44 @@ NB_MODULE(_task_interface, m) {
         );
 
     // --- ChipWorker ---
+    nb::enum_<RecoveryArgKind>(m, "RecoveryArgKind")
+        .value("COMM_CONTEXT", RecoveryArgKind::COMM_CONTEXT)
+        .value("WINDOW_ADDRESS", RecoveryArgKind::WINDOW_ADDRESS)
+        .value("WINDOW_TENSOR", RecoveryArgKind::WINDOW_TENSOR);
+    nb::class_<RecoveryDomainBinding>(m, "RecoveryDomainBinding")
+        .def(nb::init<>())
+        .def_rw("allocation_id", &RecoveryDomainBinding::allocation_id)
+        .def_rw("generation", &RecoveryDomainBinding::generation)
+        .def_rw("device_ctx", &RecoveryDomainBinding::device_ctx)
+        .def_rw("local_window_base", &RecoveryDomainBinding::local_window_base)
+        .def_rw("window_size", &RecoveryDomainBinding::window_size)
+        .def_rw("workspace", &RecoveryDomainBinding::workspace);
+    nb::class_<RecoveryArgBinding>(m, "RecoveryArgBinding")
+        .def(nb::init<>())
+        .def_rw("kind", &RecoveryArgBinding::kind)
+        .def_rw("index", &RecoveryArgBinding::index)
+        .def_rw("offset", &RecoveryArgBinding::offset);
+    nb::class_<TaskDomainBinding>(m, "TaskDomainBinding")
+        .def(nb::init<>())
+        .def_rw("domain", &TaskDomainBinding::domain)
+        .def_rw("arguments", &TaskDomainBinding::arguments);
+    nb::class_<MaterializedRecoveryBinding>(m, "MaterializedRecoveryBinding")
+        .def_ro("args", &MaterializedRecoveryBinding::args)
+        .def_ro("domain_bindings", &MaterializedRecoveryBinding::domain_bindings);
+    nb::class_<RecoveryBindingPlan>(m, "RecoveryBindingPlan")
+        .def(nb::init<uint64_t>(), nb::arg("recovery_id"))
+        .def_prop_ro("recovery_id", &RecoveryBindingPlan::recovery_id)
+        .def("add_domain", &RecoveryBindingPlan::add_domain, nb::arg("worker_id"), nb::arg("before"), nb::arg("result"))
+        .def(
+            "add_tensor_replacement", &RecoveryBindingPlan::add_tensor_replacement, nb::arg("worker_id"),
+            nb::arg("allocation_id"), nb::arg("index"), nb::arg("tensor")
+        )
+        .def("rebind", &RecoveryBindingPlan::rebind, nb::arg("args"), nb::arg("worker_id"))
+        .def(
+            "rebind_materialized", &RecoveryBindingPlan::rebind_materialized, nb::arg("args"),
+            nb::arg("domain_bindings"), nb::arg("worker_id")
+        );
+
     nb::enum_<DomainRecoveryImpact>(m, "DomainRecoveryImpact")
         .value("EXECUTION_ONLY", DomainRecoveryImpact::EXECUTION_ONLY)
         .value("DOMAIN_TRANSPORT", DomainRecoveryImpact::DOMAIN_TRANSPORT)

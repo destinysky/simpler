@@ -53,6 +53,7 @@ from .task_interface import (
     DeviceMemoryInfo,
     GlobalCommDomainHandle,
     GlobalCommDomainView,
+    RecoveryBindingPlan,
     RemoteAddressSpace,
     TaskArgs,
     TaskHandle,
@@ -517,6 +518,10 @@ class Orchestrator:
     # Dynamic CommDomain allocation (collective; blocks orch_fn for the
     # duration of the alloc / release handshake)
     # ------------------------------------------------------------------
+
+    def rebind_task_args(self, task: TaskHandle, plan: RecoveryBindingPlan) -> None:
+        """Update a retained recovery task without dispatching or releasing its hold."""
+        self._o.rebind_task_args(task, plan)
 
     def allocate_domain(
         self,

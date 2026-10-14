@@ -261,6 +261,10 @@ inline void bind_worker(nb::module_ &m) {
     // to this C++ type.
     nb::class_<Orchestrator>(m, "_Orchestrator")
         .def(
+            "rebind_task_args", &Orchestrator::rebind_task_args, nb::arg("task"), nb::arg("plan"),
+            "Atomically rebind a retained RETRY_PENDING task without dispatching or releasing its hold."
+        )
+        .def(
             "submit_next_level",
             [](Orchestrator &self, nb::bytes digest, const std::string &kind, const std::string &target_namespace,
                const TaskArgs &args, const CallConfig &config, int32_t worker_id,

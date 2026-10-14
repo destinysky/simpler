@@ -124,7 +124,7 @@ The transaction is local and explicit:
 2. The owner collects matching successful preparation from **all** members,
    then issues `COMMIT` on all members. Local `REARMED` advances generation once
    and reports preserved addresses with `rebind_required = 1`; the owner refreshes
-   generation metadata. This does not implement Step6 TaskArgs rebinding.
+   generation metadata through `RecoveryBindingPlan` before any external dispatch.
 3. Only after every COMMIT acknowledgment may the owner explicitly recover
    execution and decide whether to dispatch the logical task again. A failed or
    missing acknowledgment ends recovery; `ABORT` with nonzero `collective_rc`
@@ -146,6 +146,57 @@ twice. Changed/reused ids, stale generations and COMMIT without PREPARE are reje
 Domain recovery never clears execution admission poison. Failures return no
 dispatchable binding and permanently fence soft recovery. Unproved DMA/query
 resources belong to terminal device cleanup; the primitive never resets a device.
+
+### Retained argument rebinding
+
+`RecoveryBindingPlan` is a host-side mechanism. It consumes successful committed
+domain results and returns new argument sets; it never decides replay eligibility,
+dispatches a task, resets a device, or releases a recovery hold.
+
+`TaskArgs.add_domain_binding(TaskDomainBinding)` annotates a domain's resources
+and the exact argument indices that reference them. `RecoveryDomainBinding`
+contains allocation id, generation, device CommContext, local window base/size
+and workspace. `RecoveryArgBinding` names `COMM_CONTEXT` or `WINDOW_ADDRESS`
+scalar slots, or a `WINDOW_TENSOR` backing with a domain-relative byte offset.
+Ordinary scalar data is unchanged even if its bit pattern equals an address.
+Annotations must be captured before submission. They remain on the retained
+parent TaskSlot and are not serialized into the ordinary mailbox blob.
+
+The owner constructs `RecoveryBindingPlan(recovery_id)` and calls
+`add_domain(worker_id, before, committed_result)` for every bound domain/member.
+PREPARED, failed, partial-stop, wrong-id and stale-generation results are refused.
+PRESERVED retains both generation and resources; REARMED advances exactly one
+generation, even if every address stays unchanged. `rebind(args, worker_id)`
+returns a copy, preserving tensor views, argument tags and explicit dependencies.
+Repeated application to the matching new generation is safe.
+
+`Orchestrator.rebind_task_args(task_handle, plan)` applies these copies atomically
+to the existing local chip TaskSlot in the current RETRY_PENDING episode. Every
+group member validates before any member changes; executing peers are refused.
+TaskSlot/run identity, callable, pipeline lease, TensorMap keys, fanin/fanout and
+the recovery hold stay intact. A new scalar address does not relabel the DAG.
+This API is for the recovery owner; it is not callable on an ordinary READY or
+RUNNING task and does not connect automatic Scheduler recovery dispatch.
+
+If a window address changes, wire tensors require an owner-registered replacement
+descriptor supplied through `add_tensor_replacement`. The descriptor must retain
+the view and access permissions but carry a fresh canonical buffer identity, so
+an old import-cache mapping cannot silently stand for a new address. The owner
+owns registry publication and old-buffer lifetime; the plan does neither.
+The retained-TaskSlot API refuses a changed canonical backing identity: publishing
+its graph aliases and rebinding downstream consumers is not implemented yet.
+Standalone copy/materialization can describe relocated resources, but must not
+be mistaken for a complete retained-graph migration transaction.
+The current SDMA provider preserves addresses and needs no replacement descriptor.
+
+`rebind_materialized(chip_args, domain_bindings, worker_id)` is the same mechanism
+for already-materialized local L2 arguments. It returns `MaterializedRecoveryBinding`
+with copied arguments and updated binding metadata. The original retired native
+token remains invalid; a later external dispatch acquires a fresh native lease.
+The CPU tests exercise a real retained L3 TaskSlot; the A5 SDMA regression tests
+this materialized boundary. They do not claim automatic L3 replay or L4+ binding
+transport is implemented. Step7/8 must coordinate rank eligibility and validate
+the attempt envelope when actually dispatching the rebound task.
 
 The SDMA provider targets the validated A5 CANN runtime. The
 [CANN 9.2.0-beta.2 StreamAbort contract](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/920beta2/API/runtimeapi/aclcppdevg_03_1777.html)

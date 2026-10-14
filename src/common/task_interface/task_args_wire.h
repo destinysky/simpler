@@ -44,6 +44,7 @@
 
 #include "buffer.h"  // Tensor wire type, AccessMode, validate_tensor, tensors_overlap
 #include "task_args.h"
+#include "recovery_domain_binding.h"
 
 // ============================================================================
 // Type aliases
@@ -54,7 +55,15 @@
 // time and are stripped before the args cross the dispatch boundary. The element
 // is Tensor (self-describing view; L3+ holds no C++ ChipTensor) — the L3→L2 wire
 // carries Tensors, materialized to ChipStorageTaskArgs (ChipTensor) on the L2 child.
-using TaskArgs = TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType>;
+struct TaskArgs : TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType> {
+    // Parent-owned metadata. The ordinary mailbox blob and L2 POD stay unchanged.
+    std::vector<TaskDomainBinding> domain_bindings;
+
+    void clear() {
+        TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType>::clear();
+        domain_bindings.clear();
+    }
+};
 
 // ============================================================================
 // TaskArgsView — zero-copy view over a wire blob

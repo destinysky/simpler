@@ -45,6 +45,7 @@
 #include "../task_interface/call_config.h"
 #include "../task_interface/data_type.h"
 #include "../task_interface/task_args_wire.h"
+#include "../task_interface/recovery_binding_plan.h"
 #include "../task_interface/tensor.h"
 #include "../worker/pipeline_slot_pool.h"
 #include "../worker/device_memory_info.h"
@@ -198,6 +199,8 @@ public:
     // releases that hold; Scheduler still owns the eventual FAILED commit.
     std::optional<uint32_t> begin_task_recovery(TaskSlot slot, uint64_t recovery_id);
     bool finish_task_recovery(TaskSlot slot, uint64_t recovery_id);
+    // Mutate only held argument bindings; logical DAG identity and admission stay held.
+    void rebind_task_args(const TaskHandle &task, const RecoveryBindingPlan &plan);
     void set_global_recovery_freeze(bool frozen);
 
     // Called once for each dispatched group member after its endpoint has

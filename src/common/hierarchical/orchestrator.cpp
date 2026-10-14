@@ -597,6 +597,40 @@ std::optional<uint32_t> Orchestrator::begin_task_recovery(TaskSlot slot, uint64_
     return task->recovery_attempt;
 }
 
+void Orchestrator::rebind_task_args(const TaskHandle &handle, const RecoveryBindingPlan &plan) {
+    TaskSlotState *task = allocator_->slot_state(handle.task_slot);
+    if (task == nullptr || task->run_id != handle.run_id) throw std::invalid_argument("stale recovery task handle");
+    auto run = find_run(handle.run_id);
+    if (run == nullptr) throw std::invalid_argument("unknown recovery run");
+    std::lock_guard<std::mutex> lk(run->completion_mu);
+    if (task->run_id != handle.run_id || run->submission_failed || run->first_error ||
+        is_terminal(run->phase.load(std::memory_order_acquire)) ||
+        task->state.load(std::memory_order_acquire) != TaskState::RETRY_PENDING || !task->recovery_active ||
+        task->active_recovery_id.load(std::memory_order_acquire) != plan.recovery_id() ||
+        task->worker_type != WorkerType::NEXT_LEVEL || task->callable.target_namespace != TargetNamespace::LOCAL_CHIP)
+        throw std::logic_error("argument rebinding requires the current retained local recovery episode");
+    plan.validate_workers(task->target_worker_ids);
+    std::lock_guard<std::mutex> group_lk(task->group_mu);
+    if (task->is_group() &&
+        std::find(task->group_member_states.begin(), task->group_member_states.end(), GroupMemberState::RUNNING) !=
+            task->group_member_states.end())
+        throw std::logic_error("cannot rebind a group with an executing member");
+    std::vector<TaskArgs> staged;
+    staged.reserve(static_cast<size_t>(task->group_size()));
+    for (int32_t member = 0; member < task->group_size(); ++member) {
+        const auto &source = task->args(member);
+        auto next = plan.rebind(source, task->target_worker_id(member));
+        for (int32_t index = 0; index < source.tensor_count(); ++index)
+            if (!(next.tensor(index).buffer.identity == source.tensor(index).buffer.identity))
+                throw std::logic_error("retained graph rebinding cannot change TensorMap backing identity");
+        staged.push_back(std::move(next));
+    }
+    // Every member validates before any argument set changes. Fanin/fanout,
+    // TensorMap keys, callable, slot lease and recovery hold remain untouched.
+    if (task->is_group()) task->task_args_list.swap(staged);
+    else task->task_args = std::move(staged.front());
+}
+
 bool Orchestrator::finish_task_recovery(TaskSlot slot, uint64_t recovery_id) {
     if (recovery_id == 0) return false;
     TaskSlotState *task = allocator_->slot_state(slot);
@@ -830,6 +864,14 @@ SubmitResult Orchestrator::submit_impl(
     validate_remote_sidecars(args_list, remote_sidecars, eligible_worker_ids);
     validate_explicit_deps(run->id, args_list);
     validate_submit_args(args_list);
+    if (worker_type != WorkerType::NEXT_LEVEL || callable.target_namespace != TargetNamespace::LOCAL_CHIP) {
+        for (const auto &args : args_list)
+            if (!args.domain_bindings.empty())
+                throw std::invalid_argument("domain recovery bindings require local chip tasks");
+    }
+    for (const auto &args : args_list)
+        for (const auto &binding : args.domain_bindings)
+            RecoveryBindingPlan::validate_binding(args, binding);
     wait_recovery_gate(run);
 
     // --- Step 1: Atomically claim slot + auto-alloc any OUTPUT tensors that
