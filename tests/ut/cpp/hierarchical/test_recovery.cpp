@@ -415,7 +415,7 @@ protected:
         manager.stop();
         ring.shutdown();
     }
-    void graph(bool group = false) {
+    void graph(bool group = false, bool annotate = false) {
         run = orch.begin_run();
         orch.scope_begin();
         resource = wire_tensor(42);
@@ -430,9 +430,19 @@ protected:
         args.add_tensor(resource, TensorArgType::INPUT);
         args.add_scalar(42);
         CallConfig cfg;
-        a = group ? orch.submit_next_level_group(chip_callable(1), {args, args}, cfg, {0, 1}) :
+        TaskArgs peer = args;
+        if (annotate) {
+            RecoveryMetadata metadata{
+                91, 0, 1, 0, group ? std::vector<int32_t>{0, 1} : std::vector<int32_t>{0}, ReplaySafety::REPLAY_SAFE
+            };
+            args.set_recovery_metadata(metadata);
+            metadata.rank = 1;
+            if (group) peer.set_recovery_metadata(metadata);
+        }
+        a = group ? orch.submit_next_level_group(chip_callable(1), {args, peer}, cfg, {0, 1}) :
                     orch.submit_next_level(chip_callable(1), args, cfg, 0);
         TaskArgs successor = args;
+        successor.recovery_metadata.reset();
         successor.add_dep(a);
         b = orch.submit_next_level(chip_callable(2), successor, cfg, 0);
         successor.explicit_deps_.clear();
@@ -595,6 +605,44 @@ TEST_F(SchedulerRecoveryTest, AnotherTerminalRunErrorCancelsTheHeldEpisode) {
     EXPECT_THROW(orch.wait_run(run), std::runtime_error);
     EXPECT_TRUE(scheduler.pending_recoveries().empty());
     orch.release_run(run);
+}
+TEST_F(SchedulerRecoveryTest, ReplayAssessmentUsesRetainedMetadataWithoutDispatching) {
+    graph(true, true);
+    native_failure();
+    second->succeed();
+    auto request = held();
+    auto result = scheduler.assess_replay(request.ticket);
+    ASSERT_EQ(result.status, ReplayStatus::REPLAY_ALLOWED) << result.reason;
+    ASSERT_TRUE(result.op);
+    ASSERT_EQ(result.op->members.size(), 2u);
+    EXPECT_EQ(result.op->logical_run_id, 91u);
+    expect_graph(request);
+    auto stale = request.ticket;
+    ++stale.attempt;
+    EXPECT_THROW(scheduler.assess_replay(stale), std::invalid_argument);
+    give_up(request);
+    EXPECT_THROW(scheduler.assess_replay(request.ticket), std::invalid_argument);
+}
+TEST_F(SchedulerRecoveryTest, ReplayAssessmentWaitsForBusyGroupPeer) {
+    graph(true, true);
+    native_failure();
+    EXPECT_FALSE(scheduler.wait_for_recovery(0.03).has_value());
+    auto pending = scheduler.pending_recoveries();
+    ASSERT_EQ(pending.size(), 1u);
+    EXPECT_EQ(scheduler.assess_replay(pending[0].ticket).status, ReplayStatus::WAITING_MEMBERS);
+    second->succeed();
+    auto request = held();
+    EXPECT_EQ(scheduler.assess_replay(request.ticket).status, ReplayStatus::REPLAY_ALLOWED);
+    give_up(request);
+}
+TEST_F(SchedulerRecoveryTest, ReplayAssessmentMissingMetadataFailsClosed) {
+    graph(true);
+    native_failure();
+    second->succeed();
+    auto request = held();
+    EXPECT_EQ(scheduler.assess_replay(request.ticket).status, ReplayStatus::NACK_METADATA);
+    expect_graph(request);
+    give_up(request);
 }
 class RecoveryDisabledTest : public SchedulerRecoveryTest {
     bool enabled() const override { return false; }

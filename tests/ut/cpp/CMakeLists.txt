@@ -221,6 +221,7 @@ add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/orchestrator.cpp
     ${HIERARCHICAL_SRC_DIR}/worker_manager.cpp
     ${HIERARCHICAL_SRC_DIR}/scheduler.cpp
+    ${HIERARCHICAL_SRC_DIR}/replay_eligibility.cpp
     ${HIERARCHICAL_SRC_DIR}/worker.cpp
     ${WORKER_SRC_DIR}/chip_run_lane.cpp
     ${WORKER_SRC_DIR}/chip_worker.cpp
@@ -445,6 +446,7 @@ add_hierarchical_test(test_scope      hierarchical/test_scope.cpp)
 add_hierarchical_test(test_orchestrator hierarchical/test_orchestrator.cpp)
 add_hierarchical_test(test_scheduler hierarchical/test_scheduler.cpp CUSTOM_HOST_SPAN_ADAPTER)
 add_hierarchical_test(test_recovery hierarchical/test_recovery.cpp)
+add_hierarchical_test(test_replay_eligibility hierarchical/test_replay_eligibility.cpp)
 add_hierarchical_test(test_recovery_binding_plan hierarchical/test_recovery_binding_plan.cpp)
 add_hierarchical_test(test_chip_run_lane hierarchical/test_chip_run_lane.cpp)
 add_hierarchical_test(test_control_copy_request hierarchical/test_control_copy_request.cpp)

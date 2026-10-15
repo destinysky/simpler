@@ -72,6 +72,8 @@ struct RecoveryTaskSnapshot {
     int32_t fanout_total{0};
     int32_t fanout_released{0};
     size_t output_key_count{0};
+    bool local_chip{false};
+    std::vector<GroupMemberState> member_states;
 };
 struct RecoveryGraphSnapshot {
     RecoveryTicket ticket{};
@@ -80,6 +82,44 @@ struct RecoveryGraphSnapshot {
     uint32_t active_recoveries{0};
     std::vector<RecoveryTaskSnapshot> tasks;
 };
+
+enum class ReplayStatus : int32_t {
+    REPLAY_ALLOWED = 0,
+    WAITING_GRAPH = 1,
+    WAITING_MEMBERS = 2,
+    NEEDS_COORDINATION = 3,
+    NEEDS_RESTORE = 4,
+    NACK_METADATA = 5,
+    NACK_UNSAFE = 6,
+    NACK_ADVANCED = 7,
+    NACK_NOT_RETAINED = 8,
+    NACK_DEVICE_UNUSABLE = 9,
+};
+struct DistributedOpMember {
+    int32_t rank{-1};
+    int32_t worker_id{-1};
+    TaskHandle task{};
+    TaskState state{TaskState::FREE};
+    bool terminal{false};
+    // Zero when this member is not part of the queried native failure episode.
+    uint64_t endpoint_generation{0};
+};
+struct DistributedOpRecord {
+    uint64_t logical_run_id{0};
+    uint64_t domain_id{0};
+    uint64_t op_seq{0};
+    ReplaySafety replay_safety{ReplaySafety::UNKNOWN};
+    std::vector<int32_t> participants;
+    std::vector<DistributedOpMember> members;
+};
+struct ReplayAssessment {
+    RecoveryTicket ticket{};
+    ReplayStatus status{ReplayStatus::NACK_NOT_RETAINED};
+    std::string reason;
+    std::optional<DistributedOpRecord> op;
+    std::vector<TaskHandle> blocking_tasks;
+};
+ReplayAssessment assess_replay_eligibility(const RecoveryRequest &, const RecoveryGraphSnapshot &);
 
 // Keeps the logical episode pending until its owner explicitly gives up.
 // Neither a missing policy nor queue emptiness resolves a retained graph.
@@ -142,6 +182,29 @@ public:
         for (const auto &[id, episode] : pending_)
             if (episode.request.all_members_terminal()) return episode.request;
         return std::nullopt;
+    }
+    ReplayAssessment assess(const RecoveryTicket &ticket, const RecoveryGraphSnapshot &graph) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = pending_.find(ticket.recovery_id);
+        if (it == pending_.end() || !(it->second.request.ticket == ticket) || !it->second.reason.empty())
+            throw std::invalid_argument("stale or resolving replay eligibility ticket");
+        auto result = assess_replay_eligibility(it->second.request, graph);
+        if (result.op) {
+            for (const auto &[id, episode] : pending_) {
+                if (episode.request.ticket.run_id != ticket.run_id) continue;
+                for (const auto &member : episode.request.members) {
+                    if (member.completion.native_execution_fault.device_unusable == 0) continue;
+                    if (std::any_of(result.op->members.begin(), result.op->members.end(), [&](const auto &op_member) {
+                            return op_member.worker_id == member.worker_id;
+                        })) {
+                        result.status = ReplayStatus::NACK_DEVICE_UNUSABLE;
+                        result.reason = "a participant endpoint is confirmed unusable in a held episode";
+                        return result;
+                    }
+                }
+            }
+        }
+        return result;
     }
     bool give_up(const RecoveryTicket &ticket, const std::string &reason) {
         if (reason.empty()) throw std::invalid_argument("give up requires a reason");

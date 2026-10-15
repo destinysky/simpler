@@ -158,8 +158,8 @@ and managed-buffer references remain owned by the run. It is not a data snapshot
 
 For a local chip group, the first fault establishes one episode. Other members
 continue reporting terminal outcomes while dispatch stays frozen, including a
-healthy member that finishes before or after its peer's fault. This is local
-evidence collection, not distributed replay eligibility or L4+ coordination.
+healthy member that finishes before or after its peer's fault. This collects local
+evidence for `assess_replay`; cross-host agreement remains the owner's responsibility.
 
 The owner uses asynchronous `Worker.submit` and these explicit APIs:
 
@@ -194,6 +194,81 @@ in this mode. The old endpoint-reset/rebuild control is retired. Connecting
 explicit L2 recovery, rank authorization and fresh dispatch is a later recovery
 owner responsibility. Unlaunched downstream tasks remain in the graph during
 the hold, and must not be confused with already-retired native execution tokens.
+
+### Logical-op metadata and replay eligibility
+
+Before submitting a local chip task, the compiler/application may attach a copied
+`RecoveryMetadata` declaration to its `TaskArgs`:
+
+```python
+from simpler.task_interface import RecoveryMetadata, ReplaySafety
+
+metadata = RecoveryMetadata()
+metadata.logical_run_id = 91
+metadata.domain_id = 0
+metadata.op_seq = 1
+metadata.rank = 0
+metadata.participants = [0, 1]
+metadata.replay_safety = ReplaySafety.REPLAY_SAFE
+args.set_recovery_metadata(metadata)
+```
+
+`(logical_run_id, domain_id, op_seq)` identifies one distributed logical op;
+`rank` names its member, independently of the local worker id. Logical run ids
+are nonzero, allocated by the compiler/application, and distinct from native
+run ids. Domain ids and sequence numbers may be zero; sequence numbers increase
+within each logical run/domain. All members use the same key, sorted unique
+participant list and replay-safety contract. Each member has a distinct rank and
+local chip endpoint. A task group has metadata on every member or none. Separate
+per-rank TaskSlots with the same key are aggregated while they remain observable
+in the held native run. Metadata is host-owned and survives argument rebinding;
+it is absent from the ordinary device blob. Remote-endpoint annotations are
+refused until the control-plane metadata transport exists.
+
+`REPLAY_SAFE` is an explicit semantic promise: inputs remain valid for replay,
+and effects already produced are either private/discardable or replay-safe.
+Retaining TaskArgs or IN/OUT tags does not snapshot or restore tensor contents.
+An operation needing restored data uses `REQUIRES_RESTORE`; unknown safety is
+the default, and `FORBIDDEN` prohibits replay. Neither fault codes nor an empty
+queue infer safety. SDMA, URMA and CCU share this declaration; it does not select
+or implement a transport recovery backend.
+
+`worker.assess_replay(ticket)` reads current native Scheduler/Coordinator evidence
+and returns a copied `ReplayAssessment`: ticket, status, reason, optional
+`DistributedOpRecord`, and blocking TaskHandles. The record contains common
+identity, safety, participants, and rank-sorted member records with task/worker
+placement, current state, terminal observation and endpoint generation. A zero
+endpoint generation means that a separate rank TaskSlot was not part of the
+queried native failure episode; it is not stop or dispatch evidence.
+
+| Status | Meaning |
+| --- | --- |
+| `REPLAY_ALLOWED` | Current semantic and graph checks pass; recovery hold remains intact |
+| `WAITING_GRAPH` | Submission is still open or relevant graph metadata is being published |
+| `WAITING_MEMBERS` | A declared member still needs terminal/stop coordination |
+| `NEEDS_COORDINATION` | Declared ranks are absent locally, or advanced unannotated participant work has unknown scope |
+| `NEEDS_RESTORE` | The declared input/effect contract requires state restoration |
+| `NACK_METADATA` | Missing/inconsistent identity, contract, membership or placement |
+| `NACK_UNSAFE` | Replay semantics are unknown or forbidden |
+| `NACK_ADVANCED` | A transitive consumer or later op in this logical domain has advanced |
+| `NACK_NOT_RETAINED` | Required task, generation, failure evidence or recovery hold is unavailable |
+| `NACK_DEVICE_UNUSABLE` | Structured evidence confirms an unusable participant endpoint |
+
+The native graph must be closed and retained by the current ticket. Checks cover
+ordering-only and unannotated transitive consumers, and later same-domain ops
+even without a cross-rank DAG edge. RUNNING, COMPLETED, CONSUMED, FAILED and
+RETRY_PENDING successors count as advanced. A completed upstream producer is
+not a successor. Wrong-owner, stale, resolved or resolving tickets raise
+`ValueError`; an assessment is not a reusable authorization token.
+
+`REPLAY_ALLOWED` does **not** prove PTO quiescence, async transport stop, successful
+resource recovery, argument rebinding or cross-host agreement. It performs none
+of these actions and never releases A or dispatches B/C. Step8 must collect those
+proofs and revalidate the current ticket/graph before fresh dispatch, then commit
+the successful logical attempt before allowing its original successors to run.
+Rank-stop commands, cross-host evidence exchange, input restoration, retry
+budget/backoff, actual redispatch and global result commit are not implemented
+by this API. Unannotated ordinary execution keeps its existing behavior.
 
 ### Retained argument rebinding
 

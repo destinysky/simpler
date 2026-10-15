@@ -2602,8 +2602,29 @@ NB_MODULE(_task_interface, m) {
     nb::class_<TaskHandle>(m, "TaskHandle");
 
     // --- TaskArgs (unified vector-backed builder with per-tensor TensorArgType tags) ---
+    nb::enum_<ReplaySafety>(m, "ReplaySafety")
+        .value("UNKNOWN", ReplaySafety::UNKNOWN)
+        .value("REPLAY_SAFE", ReplaySafety::REPLAY_SAFE)
+        .value("REQUIRES_RESTORE", ReplaySafety::REQUIRES_RESTORE)
+        .value("FORBIDDEN", ReplaySafety::FORBIDDEN);
+    nb::class_<RecoveryMetadata>(m, "RecoveryMetadata")
+        .def(nb::init<>())
+        .def_rw("logical_run_id", &RecoveryMetadata::logical_run_id)
+        .def_rw("domain_id", &RecoveryMetadata::domain_id)
+        .def_rw("op_seq", &RecoveryMetadata::op_seq)
+        .def_rw("rank", &RecoveryMetadata::rank)
+        .def_rw("participants", &RecoveryMetadata::participants)
+        .def_rw("replay_safety", &RecoveryMetadata::replay_safety)
+        .def("validate", &RecoveryMetadata::validate);
     nb::class_<TaskArgs>(m, "TaskArgs", nb::is_weak_referenceable())
         .def(nb::init<>())
+        .def("set_recovery_metadata", &TaskArgs::set_recovery_metadata, nb::arg("metadata"))
+        .def_prop_ro(
+            "recovery_metadata",
+            [](const TaskArgs &args) {
+                return args.recovery_metadata;
+            }
+        )
         .def(
             "add_domain_binding",
             [](TaskArgs &self, const TaskDomainBinding &binding) {

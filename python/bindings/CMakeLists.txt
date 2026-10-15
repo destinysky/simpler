@@ -27,6 +27,7 @@ set(HIERARCHICAL_SOURCES
     ${HIERARCHICAL_SRC}/orchestrator.cpp
     ${HIERARCHICAL_SRC}/worker_manager.cpp
     ${HIERARCHICAL_SRC}/scheduler.cpp
+    ${HIERARCHICAL_SRC}/replay_eligibility.cpp
     ${HIERARCHICAL_SRC}/worker.cpp
 )
 

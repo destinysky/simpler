@@ -146,6 +146,7 @@ public:
     std::optional<RecoveryRequest> wait_for_recovery(double seconds) { return recovery_coordinator_.wait(seconds); }
     bool give_up_recovery(const RecoveryTicket &ticket, const std::string &reason);
     RecoveryGraphSnapshot recovery_graph(const RecoveryTicket &ticket);
+    ReplayAssessment assess_replay(const RecoveryTicket &ticket);
     void cancel_recoveries();
     void cancel_run_recovery(RunId run_id, const std::string &reason) {
         recovery_coordinator_.cancel_run(run_id, reason);

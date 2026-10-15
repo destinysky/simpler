@@ -655,11 +655,15 @@ RecoveryGraphSnapshot Orchestrator::recovery_graph(const RecoveryTicket &ticket)
             snapshot.tasks.push_back(std::move(item));
             continue;
         }
+        item.local_chip = task->worker_type == WorkerType::NEXT_LEVEL &&
+                          task->callable.kind == CallableKind::CHIP_CALLABLE &&
+                          task->callable.target_namespace == TargetNamespace::LOCAL_CHIP;
         item.worker_ids = task->target_worker_ids;
         {
             std::lock_guard<std::mutex> group_lk(task->group_mu);
             for (int32_t member = 0; member < task->group_size(); ++member)
                 item.args.push_back(task->args(member));
+            item.member_states = task->group_member_states;
         }
         {
             std::lock_guard<std::mutex> fanout_lk(task->fanout_mu);
@@ -909,6 +913,26 @@ SubmitResult Orchestrator::submit_impl(
     validate_remote_sidecars(args_list, remote_sidecars, eligible_worker_ids);
     validate_explicit_deps(run->id, args_list);
     validate_submit_args(args_list);
+    const RecoveryMetadata *op_metadata = nullptr;
+    std::vector<int32_t> op_ranks;
+    size_t annotated_members = 0;
+    for (const auto &args : args_list) {
+        if (!args.recovery_metadata) continue;
+        if (worker_type != WorkerType::NEXT_LEVEL || callable.kind != CallableKind::CHIP_CALLABLE ||
+            callable.target_namespace != TargetNamespace::LOCAL_CHIP)
+            throw std::invalid_argument("recovery metadata requires local chip tasks");
+        const auto &metadata = *args.recovery_metadata;
+        metadata.validate();
+        if (op_metadata && !op_metadata->same_contract(metadata))
+            throw std::invalid_argument("group recovery metadata must describe one logical op and contract");
+        if (std::find(op_ranks.begin(), op_ranks.end(), metadata.rank) != op_ranks.end())
+            throw std::invalid_argument("duplicate recovery rank in task group");
+        op_metadata = &metadata;
+        op_ranks.push_back(metadata.rank);
+        ++annotated_members;
+    }
+    if (annotated_members != 0 && annotated_members != args_list.size())
+        throw std::invalid_argument("partial recovery metadata in task group");
     if (worker_type != WorkerType::NEXT_LEVEL || callable.target_namespace != TargetNamespace::LOCAL_CHIP) {
         for (const auto &args : args_list)
             if (!args.domain_bindings.empty())

@@ -483,6 +483,38 @@ inline void bind_worker(nb::module_ &m) {
         .def_ro("active_recoveries", &RecoveryGraphSnapshot::active_recoveries)
         .def_ro("tasks", &RecoveryGraphSnapshot::tasks);
 
+    nb::enum_<ReplayStatus>(m, "ReplayStatus")
+        .value("REPLAY_ALLOWED", ReplayStatus::REPLAY_ALLOWED)
+        .value("WAITING_GRAPH", ReplayStatus::WAITING_GRAPH)
+        .value("WAITING_MEMBERS", ReplayStatus::WAITING_MEMBERS)
+        .value("NEEDS_COORDINATION", ReplayStatus::NEEDS_COORDINATION)
+        .value("NEEDS_RESTORE", ReplayStatus::NEEDS_RESTORE)
+        .value("NACK_METADATA", ReplayStatus::NACK_METADATA)
+        .value("NACK_UNSAFE", ReplayStatus::NACK_UNSAFE)
+        .value("NACK_ADVANCED", ReplayStatus::NACK_ADVANCED)
+        .value("NACK_NOT_RETAINED", ReplayStatus::NACK_NOT_RETAINED)
+        .value("NACK_DEVICE_UNUSABLE", ReplayStatus::NACK_DEVICE_UNUSABLE);
+    nb::class_<DistributedOpMember>(m, "DistributedOpMember")
+        .def_ro("rank", &DistributedOpMember::rank)
+        .def_ro("worker_id", &DistributedOpMember::worker_id)
+        .def_ro("task", &DistributedOpMember::task)
+        .def_ro("state", &DistributedOpMember::state)
+        .def_ro("terminal", &DistributedOpMember::terminal)
+        .def_ro("endpoint_generation", &DistributedOpMember::endpoint_generation);
+    nb::class_<DistributedOpRecord>(m, "DistributedOpRecord")
+        .def_ro("logical_run_id", &DistributedOpRecord::logical_run_id)
+        .def_ro("domain_id", &DistributedOpRecord::domain_id)
+        .def_ro("op_seq", &DistributedOpRecord::op_seq)
+        .def_ro("participants", &DistributedOpRecord::participants)
+        .def_ro("replay_safety", &DistributedOpRecord::replay_safety)
+        .def_ro("members", &DistributedOpRecord::members);
+    nb::class_<ReplayAssessment>(m, "ReplayAssessment")
+        .def_ro("ticket", &ReplayAssessment::ticket)
+        .def_ro("status", &ReplayAssessment::status)
+        .def_ro("reason", &ReplayAssessment::reason)
+        .def_ro("op", &ReplayAssessment::op)
+        .def_ro("blocking_tasks", &ReplayAssessment::blocking_tasks);
+
     // --- Worker ---
     // Bound as `_Worker` because the Python user-facing `Worker` factory
     // (simpler.worker.Worker) wraps this C++ class.
@@ -532,6 +564,7 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def("give_up_recovery", &Worker::give_up_recovery, nb::arg("ticket"), nb::arg("reason"))
         .def("recovery_graph", &Worker::recovery_graph, nb::arg("ticket"), nb::call_guard<nb::gil_scoped_release>())
+        .def("assess_replay", &Worker::assess_replay, nb::arg("ticket"), nb::call_guard<nb::gil_scoped_release>())
         .def("cancel_recoveries", &Worker::cancel_recoveries)
         .def(
             "add_sub_worker",

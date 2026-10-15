@@ -28,6 +28,9 @@ from simpler.task_interface import (
     ChipCallable,
     CoreCallable,
     DataType,
+    RecoveryMetadata,
+    ReplaySafety,
+    ReplayStatus,
     TaskArgs,
     TaskState,
     TensorArgType,
@@ -101,22 +104,37 @@ def test_a5_retained_l3_graph(st_device_ids, close_held):  # noqa: PLR0915 -- on
                     config = CallConfig()
                     config.aicpu_thread_num = 2
 
-                    def args_for(fault, dependency=None):
+                    def args_for(fault, rank, op_seq, dependency=None):
                         args = TaskArgs()
                         args.add_tensor(buffer.tensor((4,), DataType.UINT32), TensorArgType.INPUT)
                         args.add_scalar(fault)
+                        metadata = RecoveryMetadata()
+                        metadata.logical_run_id = 91
+                        metadata.domain_id = 0
+                        metadata.op_seq = op_seq
+                        metadata.rank = rank
+                        metadata.participants = [0, 1]
+                        # Managed input is read-only; only a private scratch output is written.
+                        metadata.replay_safety = ReplaySafety.REPLAY_SAFE
+                        args.set_recovery_metadata(metadata)
                         if dependency is not None:
                             args.add_dep(dependency)
                         return args
 
                     handles["A"] = orch.submit_next_level_group(
-                        chip_callable, [args_for(1), args_for(0)], config, workers=[0, 1]
+                        chip_callable, [args_for(1, 0, 1), args_for(0, 1, 1)], config, workers=[0, 1]
                     )
                     handles["B"] = orch.submit_next_level_group(
-                        chip_callable, [args_for(0, handles["A"]), args_for(0, handles["A"])], config, workers=[0, 1]
+                        chip_callable,
+                        [args_for(0, 0, 2, handles["A"]), args_for(0, 1, 2, handles["A"])],
+                        config,
+                        workers=[0, 1],
                     )
                     handles["C"] = orch.submit_next_level_group(
-                        chip_callable, [args_for(0, handles["B"]), args_for(0, handles["B"])], config, workers=[0, 1]
+                        chip_callable,
+                        [args_for(0, 0, 3, handles["B"]), args_for(0, 1, 3, handles["B"])],
+                        config,
+                        workers=[0, 1],
                     )
             finally:
                 # Release before Worker.submit can wait for cancellation cleanup.
@@ -145,6 +163,13 @@ def test_a5_retained_l3_graph(st_device_ids, close_held):  # noqa: PLR0915 -- on
         assert [member.worker_id for member in episode.members] == [0, 1]
         assert episode.members[0].runtime_status != 0 or episode.members[0].raw_rc != 0
         assert episode.members[1].raw_rc == episode.members[1].runtime_status == 0
+        assessment = worker.assess_replay(episode.ticket)
+        assert assessment.status == ReplayStatus.REPLAY_ALLOWED, assessment.reason
+        assert assessment.op.logical_run_id == 91
+        assert assessment.op.domain_id == 0 and assessment.op.op_seq == 1
+        assert [member.rank for member in assessment.op.members] == [0, 1]
+        assert all(member.terminal and member.endpoint_generation > 0 for member in assessment.op.members)
+        print("[PTO_RECOVERY_TEST] REPLAY_ELIGIBILITY_ALLOWED ranks=0,1 op_seq=1", flush=True)
         snapshot = worker.recovery_graph(episode.ticket)
         assert not snapshot.run_failed and snapshot.submission_closed and snapshot.active_recoveries == 1
         selected = {

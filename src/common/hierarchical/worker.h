@@ -115,6 +115,7 @@ public:
         return scheduler_.give_up_recovery(ticket, reason);
     }
     RecoveryGraphSnapshot recovery_graph(const RecoveryTicket &ticket) { return scheduler_.recovery_graph(ticket); }
+    ReplayAssessment assess_replay(const RecoveryTicket &ticket) { return scheduler_.assess_replay(ticket); }
     void cancel_recoveries() { scheduler_.cancel_recoveries(); }
 
     // Accessor: the Orchestrator handle used by the user's orch fn. Valid

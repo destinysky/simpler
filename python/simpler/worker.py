@@ -7953,6 +7953,12 @@ class Worker:
             self._require_retained_recovery()
             return self._worker.recovery_graph(ticket)
 
+    def assess_replay(self, ticket):
+        """Assess current logical-op eligibility; this grants no dispatch or resource-recovery permission."""
+        with self._operation_lease("assess_replay"):
+            self._require_retained_recovery()
+            return self._worker.assess_replay(ticket)
+
     def give_up_recovery(self, ticket, reason: str) -> bool:
         """End a terminal-member episode through the ordinary failure lifecycle."""
         with self._operation_lease("give_up_recovery"):

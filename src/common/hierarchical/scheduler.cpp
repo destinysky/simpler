@@ -354,6 +354,11 @@ RecoveryGraphSnapshot Scheduler::recovery_graph(const RecoveryTicket &ticket) {
     if (!cfg_.recovery_graph_cb) throw std::logic_error("recovery graph snapshots unavailable");
     return cfg_.recovery_graph_cb(ticket);
 }
+ReplayAssessment Scheduler::assess_replay(const RecoveryTicket &ticket) {
+    std::lock_guard<std::mutex> lk(loop_mu_);
+    if (!cfg_.recovery_graph_cb) throw std::logic_error("recovery graph snapshots unavailable");
+    return recovery_coordinator_.assess(ticket, cfg_.recovery_graph_cb(ticket));
+}
 void Scheduler::progress_recovery() {
     RecoveryRequest request;
     std::string reason;

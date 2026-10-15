@@ -63,8 +63,12 @@ TaskArgs retained() {
 TEST(RecoveryBindingPlanTest, PreservedAddressesAdvanceGenerationAndRemainIdempotent) {
     RecoveryBindingPlan plan(11);
     plan.add_domain(0, original(), committed());
-    const auto source = retained();
+    auto source = retained();
+    source.set_recovery_metadata(RecoveryMetadata{91, 0, 1, 0, {0, 1}, ReplaySafety::REPLAY_SAFE});
     auto bound = plan.rebind(source, 0);
+    ASSERT_TRUE(bound.recovery_metadata);
+    EXPECT_TRUE(source.recovery_metadata->same_contract(*bound.recovery_metadata));
+    EXPECT_EQ(bound.recovery_metadata->rank, 0);
     EXPECT_EQ(source.domain_bindings[0].domain.generation, 1u);
     EXPECT_EQ(bound.domain_bindings[0].domain.generation, 2u);
     EXPECT_EQ(bound.tensor(0).buffer.identity, source.tensor(0).buffer.identity);
@@ -72,6 +76,7 @@ TEST(RecoveryBindingPlanTest, PreservedAddressesAdvanceGenerationAndRemainIdempo
     EXPECT_EQ(bound.explicit_dep(0).task_slot, 8);
     EXPECT_EQ(bound.scalar(2), 0x1000u);
     EXPECT_EQ(plan.rebind(bound, 0).domain_bindings[0].domain.generation, 2u);
+    EXPECT_EQ(plan.rebind(bound, 0).recovery_metadata->op_seq, 1u);
 }
 TEST(RecoveryBindingPlanTest, WireRelocationRequiresFreshRegisteredDescriptor) {
     RecoveryBindingPlan plan(11);

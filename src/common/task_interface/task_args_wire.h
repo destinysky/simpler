@@ -38,6 +38,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -45,6 +46,7 @@
 #include "buffer.h"  // Tensor wire type, AccessMode, validate_tensor, tensors_overlap
 #include "task_args.h"
 #include "recovery_domain_binding.h"
+#include "recovery_metadata.h"
 
 // ============================================================================
 // Type aliases
@@ -58,10 +60,17 @@
 struct TaskArgs : TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType> {
     // Parent-owned metadata. The ordinary mailbox blob and L2 POD stay unchanged.
     std::vector<TaskDomainBinding> domain_bindings;
+    std::optional<RecoveryMetadata> recovery_metadata;
+
+    void set_recovery_metadata(const RecoveryMetadata &metadata) {
+        metadata.validate();
+        recovery_metadata = metadata;
+    }
 
     void clear() {
         TaskArgsTpl<Tensor, uint64_t, 0, 0, TensorArgType>::clear();
         domain_bindings.clear();
+        recovery_metadata.reset();
     }
 };
 
