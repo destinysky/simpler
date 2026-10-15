@@ -102,6 +102,7 @@ nav:
           - Debug a failed run: user/how-to/debug-a-failed-run.md
       - Reference:
           - Python API: user/reference/python-api.md
+          - Operator recovery: user/reference/operator-recovery.md
           - Command line and tools: user/reference/cli.md
           - Generated API:
               - simpler.worker: user/reference/api/worker.md

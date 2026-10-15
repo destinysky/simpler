@@ -116,6 +116,12 @@ public:
     }
     RecoveryGraphSnapshot recovery_graph(const RecoveryTicket &ticket) { return scheduler_.recovery_graph(ticket); }
     ReplayAssessment assess_replay(const RecoveryTicket &ticket) { return scheduler_.assess_replay(ticket); }
+    bool retry_recovery(
+        const RecoveryTicket &ticket, uint32_t max_retries, double backoff_s, DomainRecoveryImpact impact,
+        double control_timeout_s
+    ) {
+        return scheduler_.retry_recovery(ticket, max_retries, backoff_s, impact, control_timeout_s);
+    }
     void cancel_recoveries() { scheduler_.cancel_recoveries(); }
 
     // Accessor: the Orchestrator handle used by the user's orch fn. Valid

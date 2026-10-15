@@ -237,10 +237,10 @@ static constexpr uint64_t CTRL_COMMITTED_DEVICE_MEMORY = 18;
 // snapshot; the child writes one DeviceMemoryInfo at CTRL_OFF_RESULT.
 static constexpr uint64_t CTRL_DEVICE_MEMORY_INFO = 25;
 // Recovery controls carry a transaction identity and the endpoint generation
-// on which the fault was observed. The child writes the newly committed
-// endpoint generation to CTRL_OFF_RESULT after a successful rebuild.
+// on which the fault was observed. Soft recovery preserves endpoint identity.
 // Control id 27 is retired; do not reuse wire command ids.
 static constexpr uint64_t CTRL_RELEASE_FAULTED_ENDPOINT = 28;
+static constexpr uint64_t CTRL_RECOVER_ENDPOINT = 29;
 // 26 is reserved by the Python delegated-region control. It carries the DRCT
 // envelope on control_payload at every hop of the recursive single-owner
 // region protocol, so no C++ endpoint method claims it.
@@ -357,6 +357,7 @@ struct WorkerDispatch {
     int32_t group_index{0};
     uint64_t dispatch_id{0};
     bool prepare_only{false};
+    bool recovery{false};
 };
 
 enum class WorkerProgressKind : int32_t {

@@ -87,6 +87,7 @@ from typing import Any, NoReturn, cast
 
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
+    _RECOVERY_BINDING_BYTES,
     HOST_STRACE_ENABLED,
     MAX_REGISTERED_CALLABLE_IDS,
     PTO_PIPELINE_MAX_DEPTH,
@@ -96,11 +97,16 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _mailbox_load_i32,
     _mailbox_store_i32,
     _read_control_copy_request,
+    _read_recovery_binding,
+    _read_recovery_control,
+    _RecoveryControlPhase,
     _set_host_span_level_prefix,
     _worker_host_mapped_region_ack_cleanup_error,
     _worker_host_mapped_region_import_onboard,
     _worker_host_mapped_region_import_sim,
     _worker_host_mapped_region_peek_cleanup_error,
+    _write_recovery_binding,
+    _write_recovery_control,
     get_element_size,
     materialize_task_args,
     read_args_from_blob,
@@ -113,6 +119,7 @@ from _task_interface import (
 )
 
 from . import _log as _simpler_log
+from ._recovery import EndpointRecoverySession, capture_binding
 from .buffer import (
     OWNER_INSTANCE_ID_BYTES,
     AccessMode,
@@ -277,6 +284,7 @@ from .task_interface import (
     CommBufferSpec,
     CommDomainHandle,
     DeviceMemoryInfo,
+    DomainRecoveryImpact,
     GlobalCommDomainHandle,
     GlobalCommDomainView,
     ProvenanceTable,
@@ -638,6 +646,7 @@ _CTRL_GLOBAL_DOMAIN_NODE = 24
 _CTRL_DEVICE_MEMORY_INFO = 25
 # Control id 27 is retired; do not reuse wire command ids.
 _CTRL_RELEASE_FAULTED_ENDPOINT = 28
+_CTRL_RECOVER_ENDPOINT = 29
 _CTRL_OP_NAMES[_CTRL_DEVICE_MEMORY_INFO] = "device_memory_info"
 _CTRL_DELEGATED_REGION = 26
 _LOCAL_GLOBAL_CONTROL_HEADER = struct.Struct("<IIQ")
@@ -2237,7 +2246,7 @@ def _reexport_args_from_mailbox(buf, worker: Worker) -> TaskArgs:
 _PARENT_LIVENESS_POLL_INTERVAL = 1000
 
 
-def _run_mailbox_loop(
+def _run_mailbox_loop(  # noqa: PLR0912 -- task/control/held-fault ownership share one loop
     buf,
     state_addr: int,
     *,
@@ -2297,14 +2306,18 @@ def _run_mailbox_loop(
                     faulted_wait_decision = raw_rc != 0 or runtime_status != 0
             elif state == _CONTROL_REQUEST:
                 sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-                if faulted_wait_decision and sub_cmd != _CTRL_RELEASE_FAULTED_ENDPOINT:
+                if faulted_wait_decision and sub_cmd not in (_CTRL_RELEASE_FAULTED_ENDPOINT, _CTRL_RECOVER_ENDPOINT):
                     code, msg = 1, "faulted endpoint awaits L3 recovery decision"
                 else:
                     code, msg = handle_control(int(sub_cmd))
                 _write_error(buf, code, msg)
                 _mailbox_store_i32(state_addr, _CONTROL_DONE)
-                if sub_cmd == _CTRL_RELEASE_FAULTED_ENDPOINT and faulted_wait_decision and code == 0:
+                if sub_cmd == _CTRL_RELEASE_FAULTED_ENDPOINT and code == 0:
                     break
+                if sub_cmd == _CTRL_RECOVER_ENDPOINT and code == 0:
+                    armed = struct.unpack_from("Q", buf, _CTRL_OFF_RESULT)[0]
+                    if armed:
+                        faulted_wait_decision = False
             else:
                 liveness_countdown -= 1
                 if liveness_countdown <= 0:
@@ -2453,6 +2466,12 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
         _DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, 1, int(device_ctx), int(local_window_base), int(buffer_count))
         if buffer_ptrs:
             struct.pack_into(f"<{len(buffer_ptrs)}Q", reply_buf, _DOMAIN_REPLY_HEADER.size, *buffer_ptrs)
+        binding_offset = _DOMAIN_REPLY_HEADER.size + buffer_count * 8
+        if len(reply_buf) > binding_offset:
+            if len(reply_buf) - binding_offset != _RECOVERY_BINDING_BYTES:
+                raise RuntimeError("invalid allocation recovery trailer")
+            binding = capture_binding(cw._impl, int(handle), int(allocation_id), int(window_size))
+            _write_recovery_binding(_buffer_field_addr(reply_buf, binding_offset), binding)
     finally:
         reply_buf.release()
         reply_shm.close()
@@ -2954,6 +2973,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     faulted = [False]
     held_endpoint_generation = [0]
     held_recovery_id = [0]
+    recovery_session = EndpointRecoverySession(cw._impl, lambda: _comm_base_handle(cw)) if hold_native_fault else None
+    replay_armed = [False]
 
     def read_task_config(
         task_buf: memoryview,
@@ -2983,6 +3004,9 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         return cfg
 
     def handle_task(task_buf) -> tuple[int, str]:
+        if replay_armed[0]:
+            replay_armed[0] = faulted[0] = False
+            held_endpoint_generation[0] = held_recovery_id[0] = 0
         task_addr = ctypes.addressof(ctypes.c_char.from_buffer(task_buf))
         digest = _read_task_digest(task_buf)
         frame_identity = _read_task_frame_identity(task_buf)
@@ -3072,7 +3096,28 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         code = 0
         msg = ""
         try:
-            if sub_cmd == _CTRL_RELEASE_FAULTED_ENDPOINT:
+            if sub_cmd == _CTRL_RECOVER_ENDPOINT:
+                staged, staged_buf, size = _open_ctrl_payload(buf, what="Endpoint recovery")
+                try:
+                    address = _buffer_field_addr(staged_buf, 0)
+                    packet = _read_recovery_control(address, size)
+                    if not hold_native_fault:
+                        raise RuntimeError("operator recovery is disabled")
+                    assert recovery_session is not None
+                    if faulted[0]:
+                        if packet.endpoint_generation != held_endpoint_generation[0]:
+                            raise RuntimeError("stale held endpoint generation")
+                        if held_recovery_id[0] not in (0, packet.recovery_id):
+                            raise RuntimeError("wrong held recovery transaction")
+                        held_recovery_id[0] = packet.recovery_id
+                    execution, domain, was_faulted = recovery_session.handle(packet, faulted[0], endpoint_generation)
+                    _write_recovery_control(address, size, execution, domain, was_faulted)
+                    replay_armed[0] = packet.phase == _RecoveryControlPhase.ARM
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, int(replay_armed[0]))
+                finally:
+                    staged_buf.release()
+                    staged.close()
+            elif sub_cmd == _CTRL_RELEASE_FAULTED_ENDPOINT:
                 bind_held_recovery_action()
                 faulted[0] = False
                 held_endpoint_generation[0] = 0
@@ -4093,6 +4138,8 @@ class _RunResources:
     # admission depth; a run that acquires any of these degrades itself to
     # depth one. Set, never cleared.
     requires_ordered_cleanup: bool = False
+    # Failed local recovery hands domain ownership to whole-tree teardown.
+    terminal_recovery_cleanup: bool = False
 
 
 @dataclass
@@ -4172,6 +4219,13 @@ class _AbandonedRunKeepaliveCursor:
                 if not self._handles:
                     return
                 handle = self._handles[-1]
+                resources = getattr(handle, "_resources", None)
+                if resources is not None and getattr(resources, "terminal_recovery_cleanup", False):
+                    with resources.domain_lock:
+                        for domain in resources.pending_release_domains:
+                            domain._freed = True
+                        resources.pending_release_domains.clear()
+                        resources.retired = True
                 handle._keepalive = None
                 self._handles.pop()
             except BaseException as exc:  # noqa: BLE001
@@ -7959,6 +8013,19 @@ class Worker:
             self._require_retained_recovery()
             return self._worker.assess_replay(ticket)
 
+    def retry_recovery(
+        self, ticket, *, max_retries: int = 1, backoff_s: float = 0.0,
+        impact=None, control_timeout_s: float = 30.0,
+    ) -> bool:
+        """Recover one terminal local group and dispatch a fresh attempt on its original slot."""
+        if impact is None:
+            impact = DomainRecoveryImpact.DOMAIN_TRANSPORT
+        with self._operation_lease("retry_recovery"):
+            self._require_retained_recovery()
+            if self._live_domains:
+                raise RuntimeError("replay requires run-scoped domains released by the closed graph")
+            return self._worker.retry_recovery(ticket, max_retries, backoff_s, impact, control_timeout_s)
+
     def give_up_recovery(self, ticket, reason: str) -> bool:
         """End a terminal-member episode through the ordinary failure lifecycle."""
         with self._operation_lease("give_up_recovery"):
@@ -9064,6 +9131,8 @@ class Worker:
         buffer_count = len(buffers)
         req_size = _DOMAIN_REQ_HEADER.size + buffer_count * 8 + len(workers) * 4
         reply_size = _DOMAIN_REPLY_HEADER.size + buffer_count * 8
+        if self._effective_operator_recovery:
+            reply_size += _RECOVERY_BINDING_BYTES
         # Precompute worker → dense rank for O(1) lookup in the staging /
         # context loops below (and again in _release_domain_handle).  Without
         # this, `workers.index(chip_idx)` makes the hot path quadratic.
@@ -9151,8 +9220,14 @@ class Worker:
                         ptrs: list[int] = []
                         if buffer_count:
                             ptrs = list(struct.unpack_from(f"<{buffer_count}Q", reply_buf, _DOMAIN_REPLY_HEADER.size))
+                        recovery_binding = None
+                        if self._effective_operator_recovery:
+                            recovery_binding = _read_recovery_binding(
+                                _buffer_field_addr(reply_buf, _DOMAIN_REPLY_HEADER.size + buffer_count * 8)
+                            )
                         contexts[chip_idx] = ChipDomainContext(
                             name=name,
+                            recovery_binding=recovery_binding,
                             domain_rank=worker_to_rank[chip_idx],
                             domain_size=len(workers),
                             device_ctx=int(device_ctx),
@@ -11448,7 +11523,7 @@ class Worker:
     def _abandon_unsettled_run(
         self, handle: RunHandle, message: str, cause: BaseException | None = None
     ) -> RuntimeError:
-        """Retire a run whose native cancellation fence could not be settled.
+        """Retain a run whose native fence or collective cleanup cannot settle safely.
 
         Waiting would be an unbounded operation because native never promised a
         terminal fence. Retain every run-owned Python reference until whole-tree
@@ -11770,6 +11845,26 @@ class Worker:
                 self._chip_run_touched_identities.pop(run_id, None)
         if was_l2_run:
             return native_error
+
+        resources = handle._resources
+        if self._effective_operator_recovery and native_error is not None:
+            with resources.domain_lock:
+                domains = list(resources.live_domains.values()) + list(resources.pending_release_domains)
+                if domains:
+                    resources.terminal_recovery_cleanup = True
+                    for domain in domains:
+                        domain._released = True
+                        if not any(candidate is domain for candidate in resources.pending_release_domains):
+                            resources.pending_release_domains.append(domain)
+                        if self._live_domains.get(domain.name) is domain:
+                            self._live_domains.pop(domain.name)
+                    resources.live_domains.clear()
+            if domains:
+                # A failed child can already be exiting. No business collective free
+                # runs here; native teardown remains the physical reclamation owner.
+                return self._abandon_unsettled_run(
+                    handle, f"operator recovery requires terminal cleanup: {native_error}", native_error
+                )
 
         # Two different failures, deliberately not merged. A task that failed is
         # this run's business and says nothing about the worker; a cleanup that

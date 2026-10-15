@@ -215,6 +215,12 @@ void Worker::init() {
     cfg.recovery_graph_cb = [this](const RecoveryTicket &ticket) {
         return orchestrator_.recovery_graph(ticket);
     };
+    cfg.rebind_recovery_graph_cb = [this](const RecoveryTicket &ticket, const RecoveryBindingPlan &plan) {
+        orchestrator_.rebind_recovery_graph(ticket, plan);
+    };
+    cfg.start_task_replay_cb = [this](const RecoveryTicket &ticket) {
+        orchestrator_.start_task_replay(ticket);
+    };
     cfg.reservation_stall_sink = report_reservation_stall;
 
     orchestrator_.set_recovery_cancel_callback([this](RunId run_id, const std::string &reason) {

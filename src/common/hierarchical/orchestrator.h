@@ -207,6 +207,8 @@ public:
     }
     // Mutate only held argument bindings; logical DAG identity and admission stay held.
     void rebind_task_args(const TaskHandle &task, const RecoveryBindingPlan &plan);
+    void rebind_recovery_graph(const RecoveryTicket &, const RecoveryBindingPlan &);
+    void start_task_replay(const RecoveryTicket &);
     void set_global_recovery_freeze(bool frozen);
 
     // Called once for each dispatched group member after its endpoint has

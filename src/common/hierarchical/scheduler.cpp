@@ -22,6 +22,7 @@
 #include "ring.h"
 #include "types.h"
 #include "worker_manager.h"
+#include "host_log.h"
 
 namespace {
 
@@ -133,6 +134,7 @@ void Scheduler::start(const Config &cfg) {
     recovery_coordinator_.reset();
     recovery_frozen_.store(false, std::memory_order_release);
     active_recovery_ids_.clear();
+    replaying_.clear();
 
     {
         // run()'s observed generation restarts at zero, so any advance here
@@ -291,6 +293,8 @@ bool Scheduler::try_intercept_recovery(WorkerCompletion &completion) {
         request.pipeline_lease = task->pipeline_lease;
         request.callable = task->callable;
         request.failure = completion;
+        const auto replay = replaying_.find(completion.task_slot);
+        request.original_failure = replay == replaying_.end() ? completion : replay->second.original_failure;
         for (int32_t worker_id : task->target_worker_ids) {
             auto *worker = cfg_.manager->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
             if (worker == nullptr || worker->endpoint_generation() == 0) return false;
@@ -310,6 +314,17 @@ bool Scheduler::try_intercept_recovery(WorkerCompletion &completion) {
         request.ticket.attempt = *attempt;
         recovery_coordinator_.submit(std::move(request));
         active_recovery_ids_.insert(recovery_id);
+        if (replay != replaying_.end()) {
+            const uint64_t previous_id = replay->second.ticket.recovery_id;
+            HostLogger::get_instance().log(
+                simpler::log::LogLevel::WARN, __func__,
+                "[PTO_RECOVERY] REPLAY_FAULT previous_recovery_id=%llu recovery_id=%llu attempt=%u",
+                static_cast<unsigned long long>(previous_id), static_cast<unsigned long long>(recovery_id),
+                task->recovery_attempt
+            );
+            replaying_.erase(replay);
+            finish_recovery_episode(previous_id);
+        }
         if (!recovery_frozen_.exchange(true, std::memory_order_acq_rel) && cfg_.on_global_recovery_freeze_cb)
             cfg_.on_global_recovery_freeze_cb(true);
     }
@@ -336,12 +351,21 @@ bool Scheduler::try_intercept_recovery(WorkerCompletion &completion) {
 }
 
 bool Scheduler::give_up_recovery(const RecoveryTicket &ticket, const std::string &reason) {
-    const bool accepted = recovery_coordinator_.give_up(ticket, reason);
+    bool accepted;
+    {
+        std::lock_guard<std::mutex> lk(recovery_owner_mu_);
+        accepted = recovery_coordinator_.give_up(ticket, reason);
+    }
+    recovery_owner_cv_.notify_all();
     if (accepted) notify_ready();
     return accepted;
 }
 void Scheduler::cancel_recoveries() {
-    recovery_coordinator_.cancel_all();
+    {
+        std::lock_guard<std::mutex> lk(recovery_owner_mu_);
+        recovery_coordinator_.cancel_all();
+    }
+    recovery_owner_cv_.notify_all();
     notify_ready();
 }
 RecoveryGraphSnapshot Scheduler::recovery_graph(const RecoveryTicket &ticket) {
@@ -374,6 +398,8 @@ void Scheduler::on_recovery_resolution(RecoveryRequest request, const std::strin
         return;
     }
     WorkerCompletion completion = std::move(request.failure);
+    if (request.ticket.attempt != 0)
+        completion.error_message += " [original fault: " + request.original_failure.error_message + "]";
     for (const auto &member : request.members) {
         const auto &fault = member.completion.native_execution_fault;
         if (member.completion.outcome != EndpointOutcome::TASK_FAILURE ||
@@ -532,6 +558,13 @@ void Scheduler::on_task_complete(const WorkerCompletion &completion) {
     TaskSlot slot = completion.task_slot;
     TaskSlotState &s = *cfg_.ring->slot_state(slot);
     bool failed = is_failure(completion.outcome);
+    uint64_t replay_id = 0;
+    const auto replay = replaying_.find(slot);
+    if (replay != replaying_.end()) {
+        replay_id = replay->second.ticket.recovery_id;
+        cfg_.finish_task_recovery_cb(slot, replay_id);
+        replaying_.erase(replay);
+    }
 
     std::string failure_message;
     if (failed) failure_message = completion.error_message;
@@ -572,6 +605,13 @@ void Scheduler::on_task_complete(const WorkerCompletion &completion) {
     // Deferred release: release one fanout ref on each producer this task consumed.
     for (TaskSlot prod : producers) {
         try_consume(prod);
+    }
+    if (replay_id != 0) {
+        HostLogger::get_instance().log(
+            simpler::log::LogLevel::WARN, __func__, "[PTO_RECOVERY] REPLAY_%s recovery_id=%llu task_slot=%d",
+            failed ? "TERMINAL_FAILURE" : "COMMIT", static_cast<unsigned long long>(replay_id), slot
+        );
+        finish_recovery_episode(replay_id);
     }
 }
 

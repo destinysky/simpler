@@ -3548,6 +3548,52 @@ NB_MODULE(_task_interface, m) {
         .def_ro("execution_context", &ExecutionRecoveryResult::execution_context)
         .def_ro("aicpu_stream", &ExecutionRecoveryResult::aicpu_stream)
         .def_ro("aicore_stream", &ExecutionRecoveryResult::aicore_stream);
+    nb::enum_<RecoveryControlPhase>(m, "_RecoveryControlPhase")
+        .value("INSPECT", RecoveryControlPhase::INSPECT)
+        .value("PREPARE", RecoveryControlPhase::PREPARE)
+        .value("COMMIT", RecoveryControlPhase::COMMIT)
+        .value("REARM", RecoveryControlPhase::REARM)
+        .value("ARM", RecoveryControlPhase::ARM)
+        .value("ABORT", RecoveryControlPhase::ABORT);
+    nb::class_<RecoveryControlPacket>(m, "_RecoveryControlPacket")
+        .def_ro("recovery_id", &RecoveryControlPacket::recovery_id)
+        .def_ro("endpoint_generation", &RecoveryControlPacket::endpoint_generation)
+        .def_ro("phase", &RecoveryControlPacket::phase)
+        .def_ro("impact", &RecoveryControlPacket::impact)
+        .def_ro("has_domain", &RecoveryControlPacket::has_domain)
+        .def_ro("before", &RecoveryControlPacket::before);
+    m.attr("_RECOVERY_BINDING_BYTES") = sizeof(RecoveryDomainBinding);
+    m.def("_read_recovery_binding", [](uint64_t address) {
+        RecoveryDomainBinding binding;
+        std::memcpy(&binding, reinterpret_cast<const void *>(address), sizeof(binding));
+        return binding;
+    });
+    m.def("_write_recovery_binding", [](uint64_t address, const RecoveryDomainBinding &binding) {
+        std::memcpy(reinterpret_cast<void *>(address), &binding, sizeof(binding));
+    });
+    m.def("_read_recovery_control", [](uint64_t address, size_t size) {
+        if (address == 0 || size != sizeof(RecoveryControlPacket))
+            throw std::invalid_argument("invalid recovery payload");
+        RecoveryControlPacket packet;
+        std::memcpy(&packet, reinterpret_cast<const void *>(address), sizeof(packet));
+        if (packet.abi_version != 1 || packet.struct_bytes != sizeof(packet) || packet.has_domain > 1)
+            throw std::invalid_argument("invalid recovery payload ABI");
+        return packet;
+    });
+    m.def(
+        "_write_recovery_control",
+        [](uint64_t address, size_t size, const ExecutionRecoveryResult &execution,
+           const std::optional<DomainRecoveryResult> &domain, bool faulted) {
+            if (address == 0 || size != sizeof(RecoveryControlPacket))
+                throw std::invalid_argument("invalid recovery reply");
+            RecoveryControlPacket packet;
+            std::memcpy(&packet, reinterpret_cast<const void *>(address), sizeof(packet));
+            packet.execution = execution;
+            if (domain) packet.domain = *domain;
+            packet.faulted = faulted ? 1 : 0;
+            std::memcpy(reinterpret_cast<void *>(address), &packet, sizeof(packet));
+        }
+    );
 
     nb::class_<ChipWorker>(m, "_ChipWorker")
         .def(nb::init<>())

@@ -564,7 +564,7 @@ void WorkerThread::release_lane_unconditional(LaneKind kind) {
 
 void WorkerThread::complete_unpublished(WorkerDispatch dispatch, const std::string &error_message) {
     try {
-        if (on_accept_) on_accept_(dispatch);
+        if (on_accept_ && !dispatch.recovery) on_accept_(dispatch);
     } catch (...) {
         // The endpoint-publication error remains the primary task failure.
     }
@@ -675,7 +675,7 @@ void WorkerThread::finish_progress_dispatch(const WorkerEndpointProgress &progre
     if (progress.kind == WorkerProgressKind::ACCEPTED) {
         if (!accepted_dispatch_ids_.insert(dispatch.dispatch_id).second) return;
         try {
-            if (on_accept_) on_accept_(dispatch);
+            if (on_accept_ && !dispatch.recovery) on_accept_(dispatch);
         } catch (const std::exception &e) {
             accept_errors_[dispatch.dispatch_id] = std::string("WorkerThread accept fence failed: ") + e.what();
         } catch (...) {
@@ -701,7 +701,7 @@ void WorkerThread::finish_progress_dispatch(const WorkerEndpointProgress &progre
         // result. It does not manufacture the per-frame launch marker: that
         // sticky word is published exclusively by the native launch path.
         try {
-            if (on_accept_) on_accept_(dispatch);
+            if (on_accept_ && !dispatch.recovery) on_accept_(dispatch);
         } catch (const std::exception &e) {
             accept_errors_[dispatch.dispatch_id] = std::string("WorkerThread accept fence failed: ") + e.what();
         } catch (...) {

@@ -45,6 +45,7 @@
 #include <unordered_set>
 
 #include "recovery_coordinator.h"
+#include "../task_interface/recovery_binding_plan.h"
 #include "types.h"
 
 class WorkerManager;  // forward decl
@@ -111,6 +112,8 @@ public:
         std::function<void(bool)> on_global_recovery_freeze_cb;
         // Called with loop_mutex held; returns retained run metadata only.
         std::function<RecoveryGraphSnapshot(const RecoveryTicket &)> recovery_graph_cb;
+        std::function<void(const RecoveryTicket &)> start_task_replay_cb;
+        std::function<void(const RecoveryTicket &, const RecoveryBindingPlan &)> rebind_recovery_graph_cb;
         // Diagnostic-only reservation stall reporting. The sink must not
         // block: it runs on the scheduler dispatch path.
         std::chrono::milliseconds reservation_stall_warn_after{std::chrono::seconds(5)};
@@ -147,9 +150,17 @@ public:
     bool give_up_recovery(const RecoveryTicket &ticket, const std::string &reason);
     RecoveryGraphSnapshot recovery_graph(const RecoveryTicket &ticket);
     ReplayAssessment assess_replay(const RecoveryTicket &ticket);
+    bool retry_recovery(
+        const RecoveryTicket &, uint32_t max_retries, double backoff_s, DomainRecoveryImpact impact,
+        double control_timeout_s
+    );
     void cancel_recoveries();
     void cancel_run_recovery(RunId run_id, const std::string &reason) {
-        recovery_coordinator_.cancel_run(run_id, reason);
+        {
+            std::lock_guard<std::mutex> lk(recovery_owner_mu_);
+            recovery_coordinator_.cancel_run(run_id, reason);
+        }
+        recovery_owner_cv_.notify_all();
         notify_ready();
     }
 
@@ -183,6 +194,10 @@ private:
     // recovery lifecycle signal; only removing a terminal/stale episode here
     // can release the global freeze.
     std::unordered_set<uint64_t> active_recovery_ids_;
+    // In-flight attempts retain the original logical hold until all-member commit.
+    std::unordered_map<TaskSlot, RecoveryRequest> replaying_;
+    std::mutex recovery_owner_mu_;
+    std::condition_variable recovery_owner_cv_;
     struct NextLevelGroupDispatchResult {
         std::unordered_set<int32_t> reserved_worker_ids;
         TaskSlot blocked_group_slot{INVALID_SLOT};

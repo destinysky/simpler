@@ -633,6 +633,69 @@ void Orchestrator::rebind_task_args(const TaskHandle &handle, const RecoveryBind
     else task->task_args = std::move(staged.front());
 }
 
+void Orchestrator::start_task_replay(const RecoveryTicket &ticket) {
+    auto run = find_run(ticket.run_id);
+    if (!run) throw std::invalid_argument("unknown replay run");
+    std::lock_guard<std::mutex> lk(run->completion_mu);
+    auto *task = allocator_->slot_state(ticket.task_slot);
+    if (!task || task->run_id != ticket.run_id || run->first_error || run->submission_failed ||
+        is_terminal(run->phase.load()) || task->state.load() != TaskState::RETRY_PENDING ||
+        task->active_recovery_id.load() != ticket.recovery_id || task->recovery_attempt != ticket.attempt)
+        throw std::logic_error("replay task or run is no longer held");
+    std::lock_guard<std::mutex> group_lk(task->group_mu);
+    if (task->is_group()) {
+        std::fill(task->group_member_states.begin(), task->group_member_states.end(), GroupMemberState::RUNNING);
+        std::fill(task->group_member_outcomes.begin(), task->group_member_outcomes.end(), EndpointOutcome::SKIPPED);
+        for (auto &completion : task->group_member_completions)
+            completion = WorkerCompletion{};
+        task->group_terminal_count.store(0);
+        task->group_failed = false;
+        task->group_first_failure_index = -1;
+        task->group_first_failure_message.clear();
+    }
+    task->state.store(TaskState::RUNNING, std::memory_order_release);
+}
+
+void Orchestrator::rebind_recovery_graph(const RecoveryTicket &ticket, const RecoveryBindingPlan &plan) {
+    auto run = find_run(ticket.run_id);
+    if (!run) throw std::invalid_argument("unknown recovery run");
+    std::lock_guard<std::mutex> lk(run->completion_mu);
+    auto *root = allocator_->slot_state(ticket.task_slot);
+    if (!root || root->run_id != ticket.run_id || run->first_error || run->submission_failed ||
+        !run->submission_closed || root->state.load() != TaskState::RETRY_PENDING ||
+        root->active_recovery_id.load() != ticket.recovery_id || root->recovery_attempt != ticket.attempt ||
+        plan.recovery_id() != ticket.recovery_id)
+        throw std::logic_error("graph rebinding requires the current closed recovery hold");
+    struct Staged {
+        TaskSlotState *task;
+        std::vector<TaskArgs> args;
+    };
+    std::vector<Staged> staged;
+    for (const auto slot : run->task_slots) {
+        auto *task = allocator_->slot_state(slot);
+        if (!task || task->run_id != run->id || task->worker_type != WorkerType::NEXT_LEVEL) continue;
+        const auto state = task->state.load();
+        if (state != TaskState::PENDING && state != TaskState::READY && task != root) continue;
+        std::lock_guard<std::mutex> group_lk(task->group_mu);
+        Staged item{task, {}};
+        for (int32_t member = 0; member < task->group_size(); ++member) {
+            const auto &source = task->args(member);
+            auto next = source.domain_bindings.empty() ? source : plan.rebind(source, task->target_worker_id(member));
+            for (int32_t index = 0; index < source.tensor_count(); ++index)
+                if (!(next.tensor(index).buffer.identity == source.tensor(index).buffer.identity))
+                    throw std::logic_error("graph recovery cannot migrate canonical tensor backing identities");
+            item.args.push_back(std::move(next));
+        }
+        staged.push_back(std::move(item));
+    }
+    // All validation precedes publication, including bindings on unlaunched consumers.
+    static_assert(std::is_nothrow_move_assignable_v<TaskArgs>);
+    for (auto &item : staged) {
+        if (item.task->is_group()) item.task->task_args_list.swap(item.args);
+        else item.task->task_args = std::move(item.args.front());
+    }
+}
+
 RecoveryGraphSnapshot Orchestrator::recovery_graph(const RecoveryTicket &ticket) {
     auto run = find_run(ticket.run_id);
     if (run == nullptr) throw std::invalid_argument("unknown recovery run");

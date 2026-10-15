@@ -25,6 +25,10 @@
 #include "recovery_coordinator.h"
 #include "ring.h"
 #include "scheduler.h"
+#include "recovery_dispatch.h"
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include "scope.h"
 #include "tensormap.h"
 #include "types.h"
@@ -90,6 +94,7 @@ public:
     void submit_progress(Ring *, const WorkerDispatch &dispatch) override {
         std::lock_guard<std::mutex> lk(mu_);
         dispatch_ = dispatch;
+        history_.push_back(dispatch);
         submitted_ = true;
         outstanding_ = true;
         cv_.notify_all();
@@ -119,6 +124,70 @@ public:
         releases_.fetch_add(1, std::memory_order_relaxed);
     }
     uint32_t releases() const { return releases_.load(std::memory_order_relaxed); }
+
+    std::optional<RecoveryControlPhase> fail_phase;
+    bool stale_reply{false};
+    std::vector<RecoveryControlPhase> phases;
+    bool wait_count(size_t count) {
+        std::unique_lock<std::mutex> lk(mu_);
+        return cv_.wait_for(lk, std::chrono::seconds(3), [&] {
+            return history_.size() >= count;
+        });
+    }
+    std::vector<WorkerDispatch> history() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return history_;
+    }
+    void control_generic(uint64_t command, const char *name, size_t size, double, const uint8_t *) override {
+        if (command != CTRL_RECOVER_ENDPOINT || size != sizeof(RecoveryControlPacket))
+            throw std::runtime_error("unexpected recovery command");
+        const int fd = shm_open(name, O_RDWR, 0);
+        if (fd < 0) throw std::runtime_error("test control shm open failed");
+        void *address = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        if (address == MAP_FAILED) throw std::runtime_error("test control shm map failed");
+        RecoveryControlPacket packet;
+        std::memcpy(&packet, address, size);
+        bool fail = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            phases.push_back(packet.phase);
+            fail = fail_phase && *fail_phase == packet.phase;
+            packet.faulted = faulted_ ? 1 : 0;
+            packet.execution.communication_context = 0x100;
+            packet.execution.execution_context = 0x200;
+            packet.execution.aicpu_stream = 0x300;
+            packet.execution.aicore_stream = 0x400;
+            packet.execution.quiesced = 1;
+            packet.execution.failed_run_epoch = 1;
+            packet.execution.status = packet.phase == RecoveryControlPhase::INSPECT && faulted_ ?
+                                          ExecutionRecoveryStatus::RECOVERY_REQUIRED :
+                                          ExecutionRecoveryStatus::RECOVERED;
+            if (packet.has_domain) {
+                auto &domain = packet.domain;
+                domain.recovery_id = packet.recovery_id;
+                domain.allocation_id = packet.before.allocation_id;
+                domain.previous_generation = packet.before.generation;
+                domain.generation = packet.before.generation;
+                domain.device_ctx = packet.before.device_ctx;
+                domain.local_window_base = packet.before.local_window_base;
+                domain.window_size = packet.before.window_size;
+                domain.workspace = packet.before.workspace;
+                domain.domain_preserved = 1;
+                if (packet.impact == DomainRecoveryImpact::DOMAIN_TRANSPORT) {
+                    domain.status = packet.phase == RecoveryControlPhase::PREPARE ? DomainRecoveryStatus::PREPARED :
+                                                                                    DomainRecoveryStatus::REARMED;
+                    if (packet.phase != RecoveryControlPhase::PREPARE) ++domain.generation;
+                    domain.rebind_required = domain.transport_stopped = 1;
+                    domain.transport_channel_count = domain.stopped_channel_count = 48;
+                } else domain.status = DomainRecoveryStatus::PRESERVED;
+            }
+        }
+        if (stale_reply && packet.phase == RecoveryControlPhase::PREPARE) ++packet.endpoint_generation;
+        std::memcpy(address, &packet, size);
+        munmap(address, size);
+        if (fail) throw std::runtime_error("injected resource control failure");
+    }
 
     void request_progress_stop() noexcept override {
         std::lock_guard<std::mutex> lk(mu_);
@@ -160,6 +229,7 @@ public:
         progress.completion.error_message = message;
         progress.completion.launch_accepted = launch_accepted;
         progress.completion.native_execution_fault = fault;
+        faulted_ = fault.raw_rc != 0 || fault.runtime_status != 0;
         events_.push_back(std::move(progress));
     }
 
@@ -170,6 +240,8 @@ public:
     void succeed() { emit_completion(EndpointOutcome::SUCCESS, NativeExecutionFault{}, true, ""); }
 
 private:
+    bool faulted_{false};
+    std::vector<WorkerDispatch> history_;
     WorkerEndpointCaps caps_{};
     std::mutex mu_;
     std::condition_variable cv_;
@@ -403,6 +475,12 @@ protected:
         };
         cfg.recovery_graph_cb = [this](const RecoveryTicket &ticket) {
             return orch.recovery_graph(ticket);
+        };
+        cfg.start_task_replay_cb = [this](const RecoveryTicket &ticket) {
+            orch.start_task_replay(ticket);
+        };
+        cfg.rebind_recovery_graph_cb = [this](const RecoveryTicket &ticket, const RecoveryBindingPlan &plan) {
+            orch.rebind_recovery_graph(ticket, plan);
         };
         orch.set_recovery_cancel_callback([this](RunId run_id, const std::string &reason) {
             scheduler.cancel_run_recovery(run_id, reason);
@@ -643,6 +721,155 @@ TEST_F(SchedulerRecoveryTest, ReplayAssessmentMissingMetadataFailsClosed) {
     EXPECT_EQ(scheduler.assess_replay(request.ticket).status, ReplayStatus::NACK_METADATA);
     expect_graph(request);
     give_up(request);
+}
+TEST_F(SchedulerRecoveryTest, ReplayCommitsOriginalAThenOriginalBandCExactlyOnce) {
+    graph(true, true);
+    native_failure();
+    second->succeed();
+    const auto request = held();
+    ASSERT_TRUE(scheduler.retry_recovery(request.ticket, 1, 0, DomainRecoveryImpact::EXECUTION_ONLY, 3));
+    ASSERT_TRUE(first->wait_count(2));
+    ASSERT_TRUE(second->wait_count(2));
+    EXPECT_TRUE(first->history()[1].recovery);
+    EXPECT_GT(first->history()[1].dispatch_id, first->history()[0].dispatch_id);
+    EXPECT_EQ(first->history()[1].task_slot, a.task_slot);
+    EXPECT_EQ(ring.slot_state(b.task_slot)->state.load(), TaskState::PENDING);
+    EXPECT_EQ(ring.slot_state(c.task_slot)->state.load(), TaskState::PENDING);
+    EXPECT_THROW(
+        scheduler.retry_recovery(request.ticket, 1, 0, DomainRecoveryImpact::EXECUTION_ONLY, 3), std::invalid_argument
+    );
+    first->succeed();
+    EXPECT_FALSE(orch.wait_run_for(run, 0.03));
+    EXPECT_EQ(ring.slot_state(b.task_slot)->state.load(), TaskState::PENDING);
+    second->succeed();
+    ASSERT_TRUE(first->wait_count(3));
+    EXPECT_EQ(first->history()[2].task_slot, b.task_slot);
+    first->succeed();
+    ASSERT_TRUE(first->wait_count(4));
+    EXPECT_EQ(first->history()[3].task_slot, c.task_slot);
+    first->succeed();
+    ASSERT_TRUE(orch.wait_run_for(run, 3));
+    EXPECT_FALSE(orch.run_failed(run));
+    EXPECT_EQ(first->history().size(), 4u);
+    EXPECT_EQ(second->history().size(), 2u);
+    orch.release_run(run);
+}
+TEST_F(SchedulerRecoveryTest, PersistentFailureIsReportedWithNewTicketAndExternalBudget) {
+    graph(true, true);
+    native_failure();
+    second->succeed();
+    const auto one = held();
+    ASSERT_TRUE(scheduler.retry_recovery(one.ticket, 1, 0, DomainRecoveryImpact::EXECUTION_ONLY, 3));
+    ASSERT_TRUE(first->wait_count(2));
+    ASSERT_TRUE(second->wait_count(2));
+    native_failure();
+    second->succeed();
+    const auto two = held();
+    EXPECT_EQ(two.ticket.attempt, 1u);
+    EXPECT_NE(two.ticket.recovery_id, one.ticket.recovery_id);
+    EXPECT_THROW(scheduler.assess_replay(one.ticket), std::invalid_argument);
+    EXPECT_FALSE(scheduler.retry_recovery(two.ticket, 1, 0, DomainRecoveryImpact::EXECUTION_ONLY, 3));
+    EXPECT_THROW(orch.wait_run_for(run, 3), std::runtime_error);
+    EXPECT_EQ(first->history().size(), 2u);
+    EXPECT_EQ(second->history().size(), 2u);
+    EXPECT_TRUE(scheduler.pending_recoveries().empty());
+    orch.release_run(run);
+}
+TEST_F(SchedulerRecoveryTest, PartialResourceFailureNeverArmsOrDispatches) {
+    graph(true, true);
+    native_failure();
+    second->succeed();
+    auto request = held();
+    second->fail_phase = RecoveryControlPhase::PREPARE;
+    EXPECT_THROW(
+        scheduler.retry_recovery(request.ticket, 1, 0, DomainRecoveryImpact::EXECUTION_ONLY, 3), std::runtime_error
+    );
+    EXPECT_THROW(orch.wait_run_for(run, 3), std::runtime_error);
+    EXPECT_EQ(first->history().size(), 1u);
+    EXPECT_EQ(second->history().size(), 1u);
+    EXPECT_EQ(std::count(first->phases.begin(), first->phases.end(), RecoveryControlPhase::ARM), 0);
+    EXPECT_EQ(std::count(second->phases.begin(), second->phases.end(), RecoveryControlPhase::ARM), 0);
+    orch.release_run(run);
+}
+TEST_F(SchedulerRecoveryTest, TransportCommitRebindsUnlaunchedConsumersBeforeReplay) {
+    graph(true, true);
+    native_failure();
+    second->succeed();
+    auto request = held();
+    for (auto handle : {a, b, c}) {
+        auto *task = ring.slot_state(handle.task_slot);
+        TaskDomainBinding binding;
+        binding.domain = {0, 1, 42, 0x2000, 0x1000, 0x4000};
+        binding.arguments = {{RecoveryArgKind::COMM_CONTEXT, 0, 0}};
+        if (task->is_group())
+            for (auto &args : task->task_args_list)
+                args.domain_bindings = {binding};
+        else task->task_args.domain_bindings = {binding};
+    }
+    ASSERT_TRUE(scheduler.retry_recovery(request.ticket, 1, 0, DomainRecoveryImpact::DOMAIN_TRANSPORT, 3));
+    EXPECT_EQ(ring.slot_state(b.task_slot)->task_args.domain_bindings[0].domain.generation, 2u);
+    EXPECT_EQ(ring.slot_state(c.task_slot)->task_args.domain_bindings[0].domain.generation, 2u);
+    ASSERT_TRUE(first->wait_count(2));
+    ASSERT_TRUE(second->wait_count(2));
+    scheduler.request_stop();
+    EXPECT_THROW(orch.wait_run_for(run, 3), std::runtime_error);
+    scheduler.stop();
+    orch.release_run(run);
+}
+
+TEST_F(SchedulerRecoveryTest, StaleRecoveryControlReplyCannotArmOrDispatch) {
+    graph(true, true);
+    native_failure();
+    second->succeed();
+    const auto request = held();
+    second->stale_reply = true;
+    EXPECT_THROW(
+        scheduler.retry_recovery(request.ticket, 1, 0, DomainRecoveryImpact::EXECUTION_ONLY, 3), std::runtime_error
+    );
+    EXPECT_THROW(orch.wait_run_for(run, 3), std::runtime_error);
+    EXPECT_EQ(first->history().size(), 1u);
+    EXPECT_EQ(second->history().size(), 1u);
+    orch.release_run(run);
+}
+TEST_F(SchedulerRecoveryTest, CloseCancelsOwnerBackoffWithoutWaitingForTheDelay) {
+    graph(true, true);
+    native_failure();
+    second->succeed();
+    const auto request = held();
+    auto owner = std::async(std::launch::async, [&] {
+        try {
+            scheduler.retry_recovery(request.ticket, 1, 30, DomainRecoveryImpact::EXECUTION_ONLY, 3);
+        } catch (const std::exception &) {
+            return true;
+        }
+        return false;
+    });
+    EXPECT_EQ(owner.wait_for(std::chrono::milliseconds(30)), std::future_status::timeout);
+    scheduler.request_stop();
+    ASSERT_EQ(owner.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    EXPECT_TRUE(owner.get());
+    EXPECT_THROW(orch.wait_run_for(run, 3), std::runtime_error);
+    scheduler.stop();
+    orch.release_run(run);
+}
+TEST_F(SchedulerRecoveryTest, CallerCanBudgetMoreThanOneRetryWithoutAnL2Credit) {
+    graph(true, true);
+    for (uint32_t attempt = 0; attempt <= 2; ++attempt) {
+        native_failure();
+        second->succeed();
+        auto request = held();
+        EXPECT_EQ(request.ticket.attempt, attempt);
+        const bool dispatched = scheduler.retry_recovery(request.ticket, 2, 0, DomainRecoveryImpact::EXECUTION_ONLY, 3);
+        EXPECT_EQ(dispatched, attempt < 2);
+        if (dispatched) {
+            ASSERT_TRUE(first->wait_count(attempt + 2));
+            ASSERT_TRUE(second->wait_count(attempt + 2));
+        }
+    }
+    EXPECT_THROW(orch.wait_run_for(run, 3), std::runtime_error);
+    EXPECT_EQ(first->history().size(), 3u);
+    EXPECT_EQ(second->history().size(), 3u);
+    orch.release_run(run);
 }
 class RecoveryDisabledTest : public SchedulerRecoveryTest {
     bool enabled() const override { return false; }

@@ -52,6 +52,7 @@ struct RecoveryRequest {
     CallableIdentity callable{};
     std::vector<RecoveryMember> members;
     WorkerCompletion failure{};
+    WorkerCompletion original_failure{};
     bool all_members_terminal() const {
         return !members.empty() && std::all_of(members.begin(), members.end(), [](const auto &m) {
             return m.terminal;
@@ -205,6 +206,21 @@ public:
             }
         }
         return result;
+    }
+    RecoveryRequest take_for_replay(const RecoveryTicket &ticket) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = pending_.find(ticket.recovery_id);
+        if (it == pending_.end() || !(it->second.request.ticket == ticket) || !it->second.reason.empty() ||
+            cancelling_ || !it->second.request.all_members_terminal())
+            throw std::invalid_argument("stale, cancelled or nonterminal replay ticket");
+        RecoveryRequest request = std::move(it->second.request);
+        pending_.erase(it);
+        return request;
+    }
+    bool is_pending(const RecoveryTicket &ticket) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        const auto it = pending_.find(ticket.recovery_id);
+        return it != pending_.end() && it->second.request.ticket == ticket && it->second.reason.empty();
     }
     bool give_up(const RecoveryTicket &ticket, const std::string &reason) {
         if (reason.empty()) throw std::invalid_argument("give up requires a reason");

@@ -41,6 +41,7 @@
 #include "types.h"
 #include "worker.h"
 #include "worker_manager.h"
+#include "recovery_dispatch.h"
 
 namespace nb = nanobind;
 
@@ -447,7 +448,8 @@ inline void bind_worker(nb::module_ &m) {
         .def_ro("members", &RecoveryRequest::members)
         .def_prop_ro("all_members_terminal", &RecoveryRequest::all_members_terminal)
         .def_prop_ro("original_error", [](const RecoveryRequest &s) {
-            return s.failure.error_message;
+            return s.original_failure.error_message.empty() ? s.failure.error_message :
+                                                              s.original_failure.error_message;
         });
     nb::class_<RecoveryTaskSnapshot>(m, "RecoveryTaskSnapshot")
         .def(
@@ -565,6 +567,10 @@ inline void bind_worker(nb::module_ &m) {
         .def("give_up_recovery", &Worker::give_up_recovery, nb::arg("ticket"), nb::arg("reason"))
         .def("recovery_graph", &Worker::recovery_graph, nb::arg("ticket"), nb::call_guard<nb::gil_scoped_release>())
         .def("assess_replay", &Worker::assess_replay, nb::arg("ticket"), nb::call_guard<nb::gil_scoped_release>())
+        .def(
+            "retry_recovery", &Worker::retry_recovery, nb::arg("ticket"), nb::arg("max_retries"), nb::arg("backoff_s"),
+            nb::arg("impact"), nb::arg("control_timeout_s"), nb::call_guard<nb::gil_scoped_release>()
+        )
         .def("cancel_recoveries", &Worker::cancel_recoveries)
         .def(
             "add_sub_worker",

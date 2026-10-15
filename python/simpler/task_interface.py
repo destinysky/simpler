@@ -1092,6 +1092,7 @@ class ChipDomainContext:
     # Each named window slice as a device ``VMM_WINDOW`` Buffer owned by this chip. Name a task
     # arg with ``buffers[name].tensor(shapes, dtype)`` and dispatch it only to this chip (``domain_rank``).
     buffers: dict[str, Buffer]
+    recovery_binding: RecoveryDomainBinding | None = None
 
 
 class CommDomainHandle:
