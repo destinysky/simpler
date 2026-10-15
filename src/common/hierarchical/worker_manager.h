@@ -239,7 +239,7 @@ static constexpr uint64_t CTRL_DEVICE_MEMORY_INFO = 25;
 // Recovery controls carry a transaction identity and the endpoint generation
 // on which the fault was observed. The child writes the newly committed
 // endpoint generation to CTRL_OFF_RESULT after a successful rebuild.
-static constexpr uint64_t CTRL_REBUILD_ENDPOINT = 27;
+// Control id 27 is retired; do not reuse wire command ids.
 static constexpr uint64_t CTRL_RELEASE_FAULTED_ENDPOINT = 28;
 // 26 is reserved by the Python delegated-region control. It carries the DRCT
 // envelope on control_payload at every hop of the recursive single-owner
@@ -413,7 +413,6 @@ public:
     virtual bool report_submission_error(const WorkerDispatch &dispatch, const std::string &reason);
 
     virtual void shutdown_child() {}
-    virtual EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request);
     virtual void release_faulted_endpoint(const EndpointRecoveryRequest &request);
     virtual uint64_t endpoint_generation() const { return 0; }
     virtual uint64_t control_malloc(size_t size);
@@ -479,7 +478,6 @@ public:
     bool report_submission_error(const WorkerDispatch &dispatch, const std::string &reason) override;
 
     void shutdown_child() override;
-    EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request) override;
     void release_faulted_endpoint(const EndpointRecoveryRequest &request) override;
     uint64_t endpoint_generation() const override { return endpoint_generation_.load(std::memory_order_acquire); }
     uint64_t control_malloc(size_t size) override;
@@ -632,7 +630,6 @@ public:
     // Write SHUTDOWN to the mailbox so the child process exits its loop.
     // Does NOT waitpid — the Python facade owns the child PID.
     void shutdown_child();
-    EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request);
     void release_faulted_endpoint(const EndpointRecoveryRequest &request);
     uint64_t endpoint_generation() const { return endpoint_ ? endpoint_->endpoint_generation() : 0; }
 
@@ -788,7 +785,6 @@ public:
     bool any_busy() const;
     bool has_staged_run(RunId run_id) const;
     bool activate_prepared_run(RunId run_id);
-    EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request);
     void release_faulted_endpoint(const EndpointRecoveryRequest &request);
 
     // Forward CTRL_PREPARE to a specific NEXT_LEVEL worker. Thin wrapper

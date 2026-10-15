@@ -109,6 +109,13 @@ public:
 
     // Shut down the Scheduler thread and release resources.
     void close();
+    std::vector<RecoveryRequest> pending_recoveries() const { return scheduler_.pending_recoveries(); }
+    std::optional<RecoveryRequest> wait_for_recovery(double seconds) { return scheduler_.wait_for_recovery(seconds); }
+    bool give_up_recovery(const RecoveryTicket &ticket, const std::string &reason) {
+        return scheduler_.give_up_recovery(ticket, reason);
+    }
+    RecoveryGraphSnapshot recovery_graph(const RecoveryTicket &ticket) { return scheduler_.recovery_graph(ticket); }
+    void cancel_recoveries() { scheduler_.cancel_recoveries(); }
 
     // Accessor: the Orchestrator handle used by the user's orch fn. Valid
     // only between init() and close().

@@ -96,7 +96,6 @@ public:
     int poll_execution(const ActiveExecution &active) override;
     int drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
-    int recovery_finalize() override;
     bool execution_admission_open() const override {
         return can_accept_run() && !execution_recovery_required_.load(std::memory_order_acquire);
     }
@@ -172,11 +171,6 @@ private:
     // execution remains retryable, so keep those lifetimes in distinct Runtime
     // Contexts. Other onboard backends retain the base single-Context policy.
     bool use_separate_execution_context() const override { return true; }
-
-    enum class TeardownReason : uint8_t {
-        FatalDeviceFailure,
-        OperatorRecovery,
-    };
 
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
     // worker_count_, executor + dispatcher bytes, aicore_bin_handle_,
@@ -266,7 +260,7 @@ private:
     // unconditionally.
     int force_reset_device();
     int finalize_healthy();
-    int retire_execution_generation(TeardownReason reason);
+    int retire_execution_generation();
 
     /**
      * Initialize performance profiling device buffers

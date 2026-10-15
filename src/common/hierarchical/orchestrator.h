@@ -53,6 +53,7 @@
 #include "scope.h"
 #include "tensormap.h"
 #include "types.h"
+#include "recovery_coordinator.h"
 
 class WorkerManager;
 
@@ -199,6 +200,11 @@ public:
     // releases that hold; Scheduler still owns the eventual FAILED commit.
     std::optional<uint32_t> begin_task_recovery(TaskSlot slot, uint64_t recovery_id);
     bool finish_task_recovery(TaskSlot slot, uint64_t recovery_id);
+    // Caller holds the scheduler loop mutex to keep terminal slots from reuse.
+    RecoveryGraphSnapshot recovery_graph(const RecoveryTicket &ticket);
+    void set_recovery_cancel_callback(std::function<void(RunId, const std::string &)> callback) {
+        recovery_cancel_cb_ = std::move(callback);
+    }
     // Mutate only held argument bindings; logical DAG identity and admission stay held.
     void rebind_task_args(const TaskHandle &task, const RecoveryBindingPlan &plan);
     void set_global_recovery_freeze(bool frozen);
@@ -227,6 +233,7 @@ public:
     size_t begin_run_waiter_count_for_test() const;
 
 private:
+    std::function<void(RunId, const std::string &)> recovery_cancel_cb_;
     TensorMap *tensormap_ = nullptr;
     Ring *allocator_ = nullptr;
     Scope *scope_ = nullptr;

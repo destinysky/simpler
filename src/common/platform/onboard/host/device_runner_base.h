@@ -716,11 +716,6 @@ public:
      */
     virtual int finalize() = 0;
 
-    // Reclaim an exclusively owned program-mode execution environment for an
-    // endpoint rebuild. Implementations use the fatal reset/probe path even
-    // when the execution fault did not mark the device unusable.
-    virtual int recovery_finalize() { return PTO_RUNTIME_ERR_UNSUPPORTED; }
-
     // Admission fencing is separate from confirmed device-wide unusability.
     virtual bool execution_admission_open() const { return can_accept_run(); }
 

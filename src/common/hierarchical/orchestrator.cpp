@@ -253,6 +253,7 @@ void Orchestrator::fail_run_submission(RunId run_id, std::exception_ptr error) {
     // The FIFO head may already be executing while graph construction is
     // open. Cancel only slots that have not started; concurrently running work
     // remains part of the failed run's terminal fence.
+    if (recovery_cancel_cb_) recovery_cancel_cb_(run_id, message);
     cancel_unstarted_run(run, message);
     run->completion_cv.notify_all();
     finish_run_if_ready(run);
@@ -565,6 +566,7 @@ size_t Orchestrator::begin_run_waiter_count_for_test() const {
 void Orchestrator::report_task_error(TaskSlot slot, const std::string &message) {
     TaskSlotState &task = slot_state(slot);
     record_run_error(task.run_id, std::make_exception_ptr(std::runtime_error(message)));
+    if (recovery_cancel_cb_) recovery_cancel_cb_(task.run_id, message);
 }
 
 std::optional<uint32_t> Orchestrator::begin_task_recovery(TaskSlot slot, uint64_t recovery_id) {
@@ -629,6 +631,49 @@ void Orchestrator::rebind_task_args(const TaskHandle &handle, const RecoveryBind
     // TensorMap keys, callable, slot lease and recovery hold remain untouched.
     if (task->is_group()) task->task_args_list.swap(staged);
     else task->task_args = std::move(staged.front());
+}
+
+RecoveryGraphSnapshot Orchestrator::recovery_graph(const RecoveryTicket &ticket) {
+    auto run = find_run(ticket.run_id);
+    if (run == nullptr) throw std::invalid_argument("unknown recovery run");
+    std::lock_guard<std::mutex> lk(run->completion_mu);
+    RecoveryGraphSnapshot snapshot;
+    snapshot.ticket = ticket;
+    snapshot.run_failed = static_cast<bool>(run->first_error);
+    snapshot.submission_closed = run->submission_closed;
+    snapshot.active_recoveries = run->active_recoveries;
+    for (TaskSlot slot : run->task_slots) {
+        auto *task = allocator_->slot_state(slot);
+        if (task == nullptr || task->run_id != run->id) continue;
+        RecoveryTaskSnapshot item;
+        item.handle = TaskHandle{run->id, slot};
+        item.state = task->state.load(std::memory_order_acquire);
+        item.pipeline_generation = task->pipeline_lease.generation;
+        item.active_recovery_id = task->active_recovery_id.load(std::memory_order_acquire);
+        // BUILDING belongs to the submitter until its graph metadata is published.
+        if (item.state == TaskState::BUILDING) {
+            snapshot.tasks.push_back(std::move(item));
+            continue;
+        }
+        item.worker_ids = task->target_worker_ids;
+        {
+            std::lock_guard<std::mutex> group_lk(task->group_mu);
+            for (int32_t member = 0; member < task->group_size(); ++member)
+                item.args.push_back(task->args(member));
+        }
+        {
+            std::lock_guard<std::mutex> fanout_lk(task->fanout_mu);
+            item.producers = task->fanin_producers;
+            item.consumers = task->fanout_consumers;
+            item.fanin_count = task->fanin_count.load(std::memory_order_acquire);
+            item.fanin_released = task->fanin_released.load(std::memory_order_acquire);
+            item.fanout_total = task->fanout_total;
+            item.fanout_released = task->fanout_released.load(std::memory_order_acquire);
+        }
+        item.output_key_count = task->output_keys.size();
+        snapshot.tasks.push_back(std::move(item));
+    }
+    return snapshot;
 }
 
 bool Orchestrator::finish_task_recovery(TaskSlot slot, uint64_t recovery_id) {
@@ -955,6 +1000,7 @@ SubmitResult Orchestrator::submit_impl(
     // rather than at submit time.
     std::vector<GroupMemberState> group_member_states;
     std::vector<EndpointOutcome> group_member_outcomes;
+    std::vector<WorkerCompletion> group_member_completions;
     if (args_list.size() > 1) {
         // Scheduler dispatch must not allocate after it publishes RUNNING: a
         // failure there would leave neither dispatch nor cancellation owning
@@ -963,6 +1009,7 @@ SubmitResult Orchestrator::submit_impl(
         group_member_states.assign(args_list.size(), GroupMemberState::NOT_DISPATCHED);
         if (test_hook_) test_hook_(OrchestratorTestPoint::GROUP_MEMBER_STATES_PREPARED);
         group_member_outcomes.assign(args_list.size(), EndpointOutcome::SKIPPED);
+        group_member_completions.resize(args_list.size());
     }
     if (args_list.size() == 1) {
         s.is_group_ = false;
@@ -975,6 +1022,7 @@ SubmitResult Orchestrator::submit_impl(
         s.remote_sidecars = std::move(remote_sidecars);
         s.group_member_states.swap(group_member_states);
         s.group_member_outcomes.swap(group_member_outcomes);
+        s.group_member_completions.swap(group_member_completions);
     }
     s.target_worker_ids = std::move(target_worker_ids);
 

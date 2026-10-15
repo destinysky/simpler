@@ -1043,14 +1043,6 @@ int DeviceRunner::force_reset_device() {
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.
 
-int DeviceRunner::recovery_finalize() {
-    if (device_id_ < 0 || !execution_mode_latch().is_latched() ||
-        execution_mode_latch().latched_mode() != SIMPLER_MODE_PROGRAM) {
-        return PTO_RUNTIME_ERR_UNSUPPORTED;
-    }
-    return retire_execution_generation(TeardownReason::OperatorRecovery);
-}
-
 int DeviceRunner::finalize() {
     if (device_id_ == -1) {
         return 0;
@@ -1060,17 +1052,16 @@ int DeviceRunner::finalize() {
         // An unresolved operator fault reaches terminal cleanup; reset does
         // not participate in the in-place recovery success/failure contract.
         device_unusable_.store(true, std::memory_order_release);
-        return retire_execution_generation(TeardownReason::FatalDeviceFailure);
+        return retire_execution_generation();
     }
     return finalize_healthy();
 }
 
-int DeviceRunner::retire_execution_generation(TeardownReason reason) {
+int DeviceRunner::retire_execution_generation() {
     if (device_id_ == -1) return 0;
     // Fatal cleanup must not walk poisoned streams, mappings, or allocations.
     // Stop collector threads locally, drain and force-reset the card, then
-    // forget the old generation's handles. Operator recovery deliberately uses
-    // this identical path without changing the device_unusable fault fact.
+    // forget the old generation's handles.
     finalize_collectors(true);
 
     // Each attempt is the complete force-reset + post-reset stream/HBM probe
@@ -1085,7 +1076,7 @@ int DeviceRunner::retire_execution_generation(TeardownReason reason) {
         sdma_provisioned ? 1 : kFatalResetAttempts
     );
     const bool reset_confirmed = reset_rc == 0;
-    const char *reason_name = reason == TeardownReason::OperatorRecovery ? "Operator recovery" : "Fatal teardown";
+    const char *reason_name = "Fatal teardown";
     if (!reset_confirmed) {
         LOG_ERROR(
             "%s: force reset of device %d did not confirm clean (rc=%d); "

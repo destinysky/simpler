@@ -236,7 +236,6 @@ void ChipWorker::init(
         get_run_stream_set_create_count_fn_ =
             load_symbol<GetAicpuDlopenCountFn>(handle, "get_run_stream_set_create_count");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
-        recovery_finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "recovery_finalize_device");
         // Optional capabilities permit backends without in-place recovery.
         execution_recovery_state_fn_ =
             reinterpret_cast<decltype(execution_recovery_state_fn_)>(dlsym(handle, "get_execution_recovery_state_ctx"));
@@ -388,7 +387,6 @@ void ChipWorker::init(
         get_host_dlopen_count_fn_ = nullptr;
         get_run_stream_set_create_count_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
-        recovery_finalize_device_fn_ = nullptr;
         execution_recovery_state_fn_ = nullptr;
         recover_execution_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
@@ -454,7 +452,6 @@ void ChipWorker::init(
         get_host_dlopen_count_fn_ = nullptr;
         get_run_stream_set_create_count_fn_ = nullptr;
         finalize_device_fn_ = nullptr;
-        recovery_finalize_device_fn_ = nullptr;
         execution_recovery_state_fn_ = nullptr;
         recover_execution_fn_ = nullptr;
         ensure_acl_ready_fn_ = nullptr;
@@ -496,16 +493,7 @@ void ChipWorker::init(
     run_lane_ = std::make_unique<ChipRunLane>(*this);
 }
 
-void ChipWorker::recovery_finalize() {
-    if (!initialized_ || recovery_finalize_device_fn_ == nullptr) {
-        throw std::runtime_error("endpoint rebuild requires an initialized onboard program-mode ChipWorker");
-    }
-    finalize_impl(true);
-}
-
-void ChipWorker::finalize() { finalize_impl(false); }
-
-void ChipWorker::finalize_impl(bool recovery) {
+void ChipWorker::finalize() {
     if (run_lane_ != nullptr) {
         try {
             run_lane_->close();
@@ -515,10 +503,10 @@ void ChipWorker::finalize_impl(bool recovery) {
         }
         run_lane_.reset();
     }
-    if (!recovery) cleanup_native_runs_noexcept();
+    cleanup_native_runs_noexcept();
     // Global domains are independent of the legacy communicator sessions.
     // Release them while the host runtime and device context are still alive.
-    if (!recovery && comm_global_domain_release_fn_ != nullptr) {
+    if (comm_global_domain_release_fn_ != nullptr) {
         for (uint64_t domain_id : global_domain_ids_) {
             comm_global_domain_release_fn_(domain_id);
         }
@@ -527,22 +515,8 @@ void ChipWorker::finalize_impl(bool recovery) {
 
     // Defensive: if the user never called comm_destroy, reclaim all owned
     // communicator handles and streams before tearing down the device context.
-    if (recovery) {
-        comm_sessions_.clear();
-        comm_session_index_.clear();
-        base_comm_handle_ = 0;
-    } else {
-        clear_comm_sessions();
-    }
-
-    int recovery_rc = 0;
-    if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) {
-        if (recovery) {
-            recovery_rc = recovery_finalize_device_fn_(device_ctx_);
-        } else {
-            finalize_device_fn_(device_ctx_);
-        }
-    }
+    clear_comm_sessions();
+    if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) finalize_device_fn_(device_ctx_);
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
@@ -576,7 +550,6 @@ void ChipWorker::finalize_impl(bool recovery) {
     get_host_dlopen_count_fn_ = nullptr;
     get_run_stream_set_create_count_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
-    recovery_finalize_device_fn_ = nullptr;
     execution_recovery_state_fn_ = nullptr;
     recover_execution_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
@@ -605,9 +578,6 @@ void ChipWorker::finalize_impl(bool recovery) {
     initialized_ = false;
     device_id_ = -1;
     finalized_ = true;
-    if (recovery_rc != 0) {
-        throw std::runtime_error("recovery reset/probe failed with code " + std::to_string(recovery_rc));
-    }
 }
 
 void ChipWorker::register_callable(int32_t callable_id, const void *callable) {

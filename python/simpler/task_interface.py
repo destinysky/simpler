@@ -82,6 +82,11 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     RecoveryArgKind,
     RecoveryBindingPlan,
     RecoveryDomainBinding,
+    RecoveryGraphSnapshot,
+    RecoveryMember,
+    RecoveryRequest,
+    RecoveryTaskSnapshot,
+    RecoveryTicket,
     RuntimeEnv,
     TaskArgs,
     TaskDomainBinding,
@@ -204,6 +209,11 @@ __all__ = [
     "RecoveryDomainBinding",
     "TaskDomainBinding",
     "RecoveryBindingPlan",
+    "RecoveryTicket",
+    "RecoveryTaskSnapshot",
+    "RecoveryRequest",
+    "RecoveryMember",
+    "RecoveryGraphSnapshot",
     "MaterializedRecoveryBinding",
     "ExecutionRecoveryResult",
     "ExecutionRecoveryScope",
@@ -1566,20 +1576,6 @@ class ChipWorker:
             return self._impl.recover_execution(failed_run_epoch, scope)
         finally:
             _flush_host_log_or_warn("ChipWorker.recover_execution()")
-
-    def recovery_finalize(self):
-        """Retire this program-mode endpoint after a confirmed reset and probe."""
-        with self._lifecycle_lock:
-            if self._init_owner_thread is not threading.current_thread() or self._init_in_progress:
-                raise RuntimeError("ChipWorker.recovery_finalize() requires the init owner thread")
-        try:
-            self._impl.recovery_finalize()
-        finally:
-            _flush_host_log_or_warn("ChipWorker.recovery_finalize()")
-            with self._registry_lock:
-                self._callable_registry.clear()
-                self._identity_registry.clear()
-                self._live_handles.clear()
 
     def _allocate_slot_locked(self) -> int:
         for slot_id in range(MAX_REGISTERED_CALLABLE_IDS):

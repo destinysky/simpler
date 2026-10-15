@@ -33,8 +33,8 @@ bool is_native_recovery_candidate(const TaskSlotState &task, const WorkerComplet
     const NativeExecutionFault &fault = completion.native_execution_fault;
     const bool has_native_execution_fault = fault.raw_rc != 0 || fault.runtime_status != 0;
     return completion.outcome == EndpointOutcome::TASK_FAILURE && has_native_execution_fault &&
-           task.worker_type == WorkerType::NEXT_LEVEL && !task.is_group() &&
-           task.callable.target_namespace == TargetNamespace::LOCAL_CHIP && task.target_worker_ids.size() == 1;
+           task.worker_type == WorkerType::NEXT_LEVEL &&
+           task.callable.target_namespace == TargetNamespace::LOCAL_CHIP && !task.target_worker_ids.empty();
 }
 
 bool is_terminal_group_state(GroupMemberState state) {
@@ -45,6 +45,7 @@ bool is_terminal_group_state(GroupMemberState state) {
 struct PreparedGroupVectors {
     std::vector<GroupMemberState> member_states;
     std::vector<EndpointOutcome> member_outcomes;
+    std::vector<WorkerCompletion> member_completions;
     int32_t terminal_count{0};
 
     bool replaces_existing() const noexcept { return !member_states.empty(); }
@@ -53,7 +54,9 @@ struct PreparedGroupVectors {
 PreparedGroupVectors
 prepare_group_vectors_locked(const TaskSlotState &state, int32_t group_size, GroupMemberState initial_member_state) {
     const size_t size = static_cast<size_t>(group_size);
-    if (state.group_member_states.size() == size && state.group_member_outcomes.size() == size) return {};
+    if (state.group_member_states.size() == size && state.group_member_outcomes.size() == size &&
+        state.group_member_completions.size() == size)
+        return {};
 
     // Prepare both allocations before changing either shared vector. Dispatch
     // does this while the slot is still READY, so even a second-allocation
@@ -63,6 +66,7 @@ prepare_group_vectors_locked(const TaskSlotState &state, int32_t group_size, Gro
     PreparedGroupVectors prepared;
     prepared.member_states.assign(size, initial_member_state);
     prepared.member_outcomes.assign(size, EndpointOutcome::SKIPPED);
+    prepared.member_completions.resize(size);
     std::copy_n(
         state.group_member_states.begin(), std::min(size, state.group_member_states.size()),
         prepared.member_states.begin()
@@ -70,6 +74,10 @@ prepare_group_vectors_locked(const TaskSlotState &state, int32_t group_size, Gro
     std::copy_n(
         state.group_member_outcomes.begin(), std::min(size, state.group_member_outcomes.size()),
         prepared.member_outcomes.begin()
+    );
+    std::copy_n(
+        state.group_member_completions.begin(), std::min(size, state.group_member_completions.size()),
+        prepared.member_completions.begin()
     );
     prepared.terminal_count = static_cast<int32_t>(
         std::count_if(prepared.member_states.begin(), prepared.member_states.end(), is_terminal_group_state)
@@ -87,6 +95,7 @@ void commit_group_vectors_locked(TaskSlotState &state, PreparedGroupVectors &pre
     if (!prepared.replaces_existing()) return;
     state.group_member_states.swap(prepared.member_states);
     state.group_member_outcomes.swap(prepared.member_outcomes);
+    state.group_member_completions.swap(prepared.member_completions);
     state.group_terminal_count.store(prepared.terminal_count, std::memory_order_relaxed);
 }
 
@@ -96,6 +105,8 @@ void reset_group_state_locked(TaskSlotState &state, GroupMemberState initial_mem
     // no-allocation commit.
     std::fill(state.group_member_states.begin(), state.group_member_states.end(), initial_member_state);
     std::fill(state.group_member_outcomes.begin(), state.group_member_outcomes.end(), EndpointOutcome::SKIPPED);
+    for (auto &completion : state.group_member_completions)
+        completion = WorkerCompletion{};
     state.group_terminal_count.store(0, std::memory_order_relaxed);
     state.group_failed = false;
     state.group_first_failure_index = -1;
@@ -120,7 +131,6 @@ void Scheduler::start(const Config &cfg) {
     }
     cfg_ = cfg;
     recovery_coordinator_.reset();
-    recovery_coordinator_.set_eligibility_decision(cfg.recovery_eligibility_cb);
     recovery_frozen_.store(false, std::memory_order_release);
     active_recovery_ids_.clear();
 
@@ -139,8 +149,7 @@ void Scheduler::start(const Config &cfg) {
 
 void Scheduler::request_stop() {
     stop_requested_.store(true, std::memory_order_release);
-    if (recovery_frozen_.exchange(false, std::memory_order_acq_rel) &&
-        cfg_.on_global_recovery_freeze_cb) cfg_.on_global_recovery_freeze_cb(false);
+    cancel_recoveries();
     if (running_.load(std::memory_order_acquire)) cfg_.manager->stop_workers();
     {
         std::lock_guard<std::mutex> lk(completion_mu_);
@@ -205,6 +214,7 @@ void Scheduler::worker_done(WorkerCompletion completion) {
                     }
                     s.group_failed = true;
                 }
+                s.group_member_completions[static_cast<size_t>(index)] = terminal;
                 s.group_member_outcomes[static_cast<size_t>(index)] = terminal.outcome;
                 s.group_terminal_count.fetch_add(1, std::memory_order_acq_rel);
             } else {
@@ -261,115 +271,116 @@ void Scheduler::worker_done(WorkerCompletion completion) {
 }
 
 bool Scheduler::try_intercept_recovery(WorkerCompletion &completion) {
-    if (!cfg_.operator_recovery_enabled || stop_requested_.load(std::memory_order_acquire)) return false;
     TaskSlotState *task = cfg_.ring->slot_state(completion.task_slot);
-    if (task == nullptr || !is_native_recovery_candidate(*task, completion)) return false;
+    const uint64_t existing = task->active_recovery_id.load(std::memory_order_acquire);
+    const bool retained = task->state.load(std::memory_order_acquire) == TaskState::RETRY_PENDING && existing != 0;
+    if (!retained && (!cfg_.operator_recovery_enabled || stop_requested_.load(std::memory_order_acquire) ||
+                      !is_native_recovery_candidate(*task, completion)))
+        return false;
+    const int32_t index = task->is_group() ? completion.group_index : 0;
+    if (index < 0 || index >= task->group_size()) return false;
 
-    const int32_t worker_id = task->target_worker_ids.front();
-    WorkerThread *worker = cfg_.manager->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
-    if (worker == nullptr) return false;
-    const uint64_t expected_endpoint_generation = worker->endpoint_generation();
-    if (expected_endpoint_generation == 0) return false;
-
-    uint64_t recovery_id = next_recovery_id_.fetch_add(1, std::memory_order_relaxed);
-    if (recovery_id == 0) recovery_id = next_recovery_id_.fetch_add(1, std::memory_order_relaxed);
-    std::optional<uint32_t> attempt = cfg_.begin_task_recovery_cb(completion.task_slot, recovery_id);
-    if (!attempt.has_value()) return false;
-
-    RecoveryRequest request;
-    request.ticket.run_id = task->run_id;
-    request.ticket.task_slot = completion.task_slot;
-    request.ticket.recovery_id = recovery_id;
-    request.ticket.attempt = *attempt;
-    request.ticket.expected_endpoint_generation = expected_endpoint_generation;
-    request.worker_id = worker_id;
-    request.pipeline_lease = task->pipeline_lease;
-    request.callable = task->callable;
-    request.failure = std::move(completion);
-    recovery_coordinator_.submit(std::move(request));
-    active_recovery_ids_.insert(recovery_id);
-    if (!recovery_frozen_.exchange(true, std::memory_order_acq_rel) && cfg_.on_global_recovery_freeze_cb) {
-        cfg_.on_global_recovery_freeze_cb(true);
+    uint64_t recovery_id = existing;
+    if (!retained) {
+        RecoveryRequest request;
+        request.ticket.run_id = task->run_id;
+        request.ticket.task_slot = completion.task_slot;
+        recovery_id = next_recovery_id_.fetch_add(1, std::memory_order_relaxed);
+        if (recovery_id == 0) recovery_id = next_recovery_id_.fetch_add(1, std::memory_order_relaxed);
+        request.ticket.recovery_id = recovery_id;
+        request.pipeline_lease = task->pipeline_lease;
+        request.callable = task->callable;
+        request.failure = completion;
+        for (int32_t worker_id : task->target_worker_ids) {
+            auto *worker = cfg_.manager->get_worker_by_id(WorkerType::NEXT_LEVEL, worker_id);
+            if (worker == nullptr || worker->endpoint_generation() == 0) return false;
+            request.members.push_back(RecoveryMember{worker_id, worker->endpoint_generation(), false, {}});
+        }
+        if (task->is_group()) {
+            std::lock_guard<std::mutex> lk(task->group_mu);
+            for (size_t member = 0; member < request.members.size(); ++member) {
+                if (is_terminal_group_state(task->group_member_states[member])) {
+                    request.members[member].terminal = true;
+                    request.members[member].completion = task->group_member_completions[member];
+                }
+            }
+        }
+        auto attempt = cfg_.begin_task_recovery_cb(completion.task_slot, recovery_id);
+        if (!attempt.has_value()) return false;
+        request.ticket.attempt = *attempt;
+        recovery_coordinator_.submit(std::move(request));
+        active_recovery_ids_.insert(recovery_id);
+        if (!recovery_frozen_.exchange(true, std::memory_order_acq_rel) && cfg_.on_global_recovery_freeze_cb)
+            cfg_.on_global_recovery_freeze_cb(true);
     }
-
-    // RecoveryCoordinator progresses on the next scheduler pass. This makes
-    // RETRY_PENDING a real ownership state instead of an in-function label.
+    if (task->is_group()) {
+        std::lock_guard<std::mutex> lk(task->group_mu);
+        auto &member_state = task->group_member_states[static_cast<size_t>(index)];
+        if (is_terminal_group_state(member_state)) return true;
+        task->group_member_completions[static_cast<size_t>(index)] = completion;
+        task->group_member_outcomes[static_cast<size_t>(index)] = completion.outcome;
+        member_state =
+            completion.outcome == EndpointOutcome::SUCCESS ? GroupMemberState::SUCCESS : GroupMemberState::FAILED;
+        task->group_terminal_count.fetch_add(1, std::memory_order_acq_rel);
+        if (is_failure(completion.outcome)) {
+            task->group_failed = true;
+            if (task->group_first_failure_index < 0) {
+                task->group_first_failure_index = index;
+                task->group_first_failure_message = completion.error_message;
+            }
+        }
+    }
+    recovery_coordinator_.complete_member(recovery_id, index, completion);
     notify_ready();
     return true;
 }
 
-void Scheduler::progress_recovery() {
-    recovery_coordinator_.progress();
-    RecoveryResolution resolution;
-    while (recovery_coordinator_.try_pop_resolution(resolution)) {
-        on_recovery_resolution(std::move(resolution));
-    }
+bool Scheduler::give_up_recovery(const RecoveryTicket &ticket, const std::string &reason) {
+    const bool accepted = recovery_coordinator_.give_up(ticket, reason);
+    if (accepted) notify_ready();
+    return accepted;
 }
-
-void Scheduler::on_recovery_resolution(RecoveryResolution resolution) {
-    const RecoveryTicket &ticket = resolution.request.ticket;
-    TaskSlotState *task = cfg_.ring->slot_state(ticket.task_slot);
-    if (task == nullptr || task->run_id != ticket.run_id ||
-        task->state.load(std::memory_order_acquire) != TaskState::RETRY_PENDING ||
-        task->active_recovery_id.load(std::memory_order_acquire) != ticket.recovery_id) {
-        // A delayed policy/action resolution may belong to an older episode.
-        // It must never release or reset an endpoint now owned by another one.
+void Scheduler::cancel_recoveries() {
+    recovery_coordinator_.cancel_all();
+    notify_ready();
+}
+RecoveryGraphSnapshot Scheduler::recovery_graph(const RecoveryTicket &ticket) {
+    std::lock_guard<std::mutex> lk(loop_mu_);
+    const auto episodes = recovery_coordinator_.pending();
+    if (std::none_of(episodes.begin(), episodes.end(), [&](const auto &e) {
+            return e.ticket == ticket;
+        }))
+        throw std::invalid_argument("stale recovery graph ticket");
+    if (!cfg_.recovery_graph_cb) throw std::logic_error("recovery graph snapshots unavailable");
+    return cfg_.recovery_graph_cb(ticket);
+}
+void Scheduler::progress_recovery() {
+    RecoveryRequest request;
+    std::string reason;
+    while (recovery_coordinator_.try_pop_resolution(request, reason))
+        on_recovery_resolution(std::move(request), reason);
+}
+void Scheduler::on_recovery_resolution(RecoveryRequest request, const std::string &reason) {
+    const auto &ticket = request.ticket;
+    auto *task = cfg_.ring->slot_state(ticket.task_slot);
+    if (task == nullptr || task->run_id != ticket.run_id || task->state.load() != TaskState::RETRY_PENDING ||
+        task->active_recovery_id.load() != ticket.recovery_id) {
         finish_recovery_episode(ticket.recovery_id);
         return;
     }
-
-    const EndpointRecoveryRequest request{
-        resolution.request.worker_id, ticket.recovery_id, ticket.expected_endpoint_generation};
-    if (resolution.kind == RecoveryResolutionKind::REBUILD_ENDPOINT) {
-        EndpointRecoveryResult result;
+    WorkerCompletion completion = std::move(request.failure);
+    for (const auto &member : request.members) {
+        const auto &fault = member.completion.native_execution_fault;
+        if (member.completion.outcome != EndpointOutcome::TASK_FAILURE ||
+            (fault.raw_rc == 0 && fault.runtime_status == 0))
+            continue;
         try {
-            result = cfg_.manager->rebuild_endpoint(request);
+            cfg_.manager->release_faulted_endpoint({member.worker_id, ticket.recovery_id, member.endpoint_generation});
         } catch (const std::exception &e) {
-            result = {request.worker_id, request.recovery_id, false, request.expected_endpoint_generation, e.what()};
-        }
-        // The coordinator, not a side-channel callback, owns the action result
-        // and the ENDPOINT_REBUILD -> ENDPOINT_READY/GIVE_UP transition.
-        recovery_coordinator_.submit_endpoint_result(std::move(resolution.request), std::move(result));
-        notify_ready();
-        return;
-    }
-
-    WorkerCompletion completion = std::move(resolution.request.failure);
-    const bool endpoint_ready = resolution.endpoint_result.has_value() && resolution.endpoint_result->ok;
-    if (resolution.endpoint_result.has_value()) {
-        const EndpointRecoveryResult &result = *resolution.endpoint_result;
-        if (!completion.error_message.empty()) completion.error_message.push_back(' ');
-        completion.error_message += result.ok
-                                        ? "[endpoint rebuild succeeded; ENDPOINT_READY generation=" +
-                                              std::to_string(result.endpoint_generation) +
-                                              "; replay pipeline not implemented]"
-                                        : "[endpoint rebuild failed: " + result.error_message + "]";
-    }
-
-    // A successful rebuild already cleared the old hold and committed the new
-    // generation. Eligibility denial or rebuild failure leaves the old child
-    // held and must use the same transaction/generation fence to release it.
-    if (!endpoint_ready) {
-        try {
-            cfg_.manager->release_faulted_endpoint(request);
-        } catch (const std::exception &e) {
-            if (!completion.error_message.empty()) completion.error_message.push_back(' ');
-            completion.error_message += "[faulted endpoint release failed: " + std::string(e.what()) + "]";
+            completion.error_message += " [faulted endpoint release failed: " + std::string(e.what()) + "]";
         }
     }
-    if (!completion.error_message.empty()) completion.error_message.push_back(' ');
-    completion.error_message +=
-        "[recovery id=" + std::to_string(ticket.recovery_id) + " attempt=" + std::to_string(ticket.attempt) +
-        " expected_endpoint_generation=" + std::to_string(ticket.expected_endpoint_generation) +
-        " trace=DETECTED->ELIGIBILITY_CHECK->" +
-        (resolution.endpoint_result.has_value()
-             ? (endpoint_ready ? "ENDPOINT_REBUILD->ENDPOINT_READY->GIVE_UP]"
-                               : "ENDPOINT_REBUILD->GIVE_UP]")
-             : "GIVE_UP(recovery-not-authorized)]");
-
-    // Preserve the old fatal ordering after GIVE_UP: publish the run's first
-    // error before releasing the recovery hold, then reuse the unchanged
-    // FAILED/poison/consume path.
+    completion.error_message += " [recovery id=" + std::to_string(ticket.recovery_id) + " GIVE_UP: " + reason + "]";
     if (cfg_.on_task_failed_cb) cfg_.on_task_failed_cb(ticket.task_slot, completion.error_message);
     cfg_.finish_task_recovery_cb(ticket.task_slot, ticket.recovery_id);
     on_task_complete(completion);

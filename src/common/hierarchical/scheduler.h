@@ -103,14 +103,14 @@ public:
         std::function<void(TaskSlot, const std::string &)> on_task_failed_cb;
         // Scheduler only intercepts a structured local
         // chip TASK_FAILURE; Orchestrator owns the RUNNING -> RETRY_PENDING
-        // transition and the run-level hold. Policy lives in RecoveryCoordinator.
+        // transition and the run-level hold. The coordinator retains evidence
+        // until the external owner resolves the episode.
         bool operator_recovery_enabled{false};
         std::function<std::optional<uint32_t>(TaskSlot, uint64_t)> begin_task_recovery_cb;
         std::function<void(TaskSlot, uint64_t)> finish_task_recovery_cb;
         std::function<void(bool)> on_global_recovery_freeze_cb;
-        // Production leaves eligibility unset until distributed replay safety
-        // is available. Tests may authorize endpoint rebuilding without replay.
-        RecoveryCoordinator::EligibilityDecision recovery_eligibility_cb;
+        // Called with loop_mutex held; returns retained run metadata only.
+        std::function<RecoveryGraphSnapshot(const RecoveryTicket &)> recovery_graph_cb;
         // Diagnostic-only reservation stall reporting. The sink must not
         // block: it runs on the scheduler dispatch path.
         std::chrono::milliseconds reservation_stall_warn_after{std::chrono::seconds(5)};
@@ -142,6 +142,15 @@ public:
 
     // Called by WorkerManager after endpoint progress reaches a terminal outcome.
     void worker_done(WorkerCompletion completion);
+    std::vector<RecoveryRequest> pending_recoveries() const { return recovery_coordinator_.pending(); }
+    std::optional<RecoveryRequest> wait_for_recovery(double seconds) { return recovery_coordinator_.wait(seconds); }
+    bool give_up_recovery(const RecoveryTicket &ticket, const std::string &reason);
+    RecoveryGraphSnapshot recovery_graph(const RecoveryTicket &ticket);
+    void cancel_recoveries();
+    void cancel_run_recovery(RunId run_id, const std::string &reason) {
+        recovery_coordinator_.cancel_run(run_id, reason);
+        notify_ready();
+    }
 
     // Called by Orchestrator after it pushes a newly-ready root task. ReadyQueue
     // has its own condition variable, but the Scheduler waits on completion_cv_.
@@ -202,7 +211,7 @@ private:
     void run();
     bool try_intercept_recovery(WorkerCompletion &completion);
     void progress_recovery();
-    void on_recovery_resolution(RecoveryResolution resolution);
+    void on_recovery_resolution(RecoveryRequest request, const std::string &reason);
     void finish_recovery_episode(uint64_t recovery_id);
     void on_task_complete(const WorkerCompletion &completion);
     void poison_task(TaskSlot slot, const std::string &root_message);

@@ -445,6 +445,8 @@ struct TaskSlotState {
     std::mutex group_mu;
     std::vector<GroupMemberState> group_member_states;
     std::vector<EndpointOutcome> group_member_outcomes;
+    // Retains each member's completion evidence even if success precedes a peer fault.
+    std::vector<WorkerCompletion> group_member_completions;
     std::atomic<int32_t> group_terminal_count{0};
     bool group_failed{false};
     int32_t group_first_failure_index{-1};

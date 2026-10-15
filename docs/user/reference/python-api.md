@@ -147,6 +147,54 @@ Domain recovery never clears execution admission poison. Failures return no
 dispatchable binding and permanently fence soft recovery. Unproved DMA/query
 resources belong to terminal device cleanup; the primitive never resets a device.
 
+### Retained local recovery graphs
+
+Local A5 L3 workers may opt into `enable_operator_recovery=True` before `init`.
+The default is false, and other platforms/endpoints keep their ordinary failure
+handling. This mode intercepts a structured native TASK_FAILURE before terminal
+propagation, places the original TaskSlot in RETRY_PENDING, and freezes new
+dispatch/admission. The submitted graph, TaskArgs, dependencies, TensorMap keys
+and managed-buffer references remain owned by the run. It is not a data snapshot.
+
+For a local chip group, the first fault establishes one episode. Other members
+continue reporting terminal outcomes while dispatch stays frozen, including a
+healthy member that finishes before or after its peer's fault. This is local
+evidence collection, not distributed replay eligibility or L4+ coordination.
+
+The owner uses asynchronous `Worker.submit` and these explicit APIs:
+
+- `pending_recoveries()` returns copied episode/member records, including groups
+  with a member still executing.
+- `wait_for_recovery(timeout)` returns a copied episode once all its members are
+  terminal, or None on timeout/cancellation. Host completion is not a PTO/transport
+  quiescence proof and does not authorize rearm or replay.
+- `recovery_graph(ticket)` copies the retained run's task states, arguments,
+  references and dependency metadata; a stale ticket is rejected. BUILDING slots
+  expose only their identity/state until the submitter publishes their metadata.
+  A task snapshot's `is_task(handle)` and `depends_on(handle)` preserve the opaque
+  TaskHandle API while allowing the owner to inspect graph relationships.
+- `give_up_recovery(ticket, reason)` explicitly ends an episode once every member
+  is terminal. Wrong/stale/duplicate tickets return false; a live peer is refused.
+  Original fault diagnostics are retained, held failed children enter terminal
+  cleanup, and ordinary failure propagation reclaims the graph.
+  Tickets also identify their local coordinator owner, so matching numeric run,
+  slot and recovery ids from another Worker cannot resolve this episode.
+
+Without an owner decision the graph remains held. Synchronous `run` therefore
+requires a separate recovery owner; it cannot resolve its own wait. `close`
+cancels held episodes before draining run fences and releases leased recovery
+waiters. A remaining active peer still needs endpoint terminalization; timeout
+does not justify freeing its resources. Terminal cleanup may reset a failed
+device under the existing lifecycle, but no hold/rebind primitive resets one.
+Graph-construction cancellation or another terminal run error also ends its
+held episodes, so a failed submission cannot leave an orphaned recovery hold.
+
+There is no automatic retry, successful replay resolution or endpoint recreation
+in this mode. The old endpoint-reset/rebuild control is retired. Connecting
+explicit L2 recovery, rank authorization and fresh dispatch is a later recovery
+owner responsibility. Unlaunched downstream tasks remain in the graph during
+the hold, and must not be confused with already-retired native execution tokens.
+
 ### Retained argument rebinding
 
 `RecoveryBindingPlan` is a host-side mechanism. It consumes successful committed

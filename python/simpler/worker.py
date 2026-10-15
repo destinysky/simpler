@@ -262,13 +262,13 @@ from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
 from .task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_FRAME_SIZE,
+    MAILBOX_NATIVE_EXECUTION_FAULT_SIZE,
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_OFF_NATIVE_EXECUTION_FAULT,
-    MAILBOX_NATIVE_EXECUTION_FAULT_SIZE,
     MAILBOX_PREPARATION_DISPOSITION_VALUES,
     MAILBOX_SIZE,
-    MAILBOX_TASK_PROTOCOL_VERSION,
     MAILBOX_STATE_VALUES,
+    MAILBOX_TASK_PROTOCOL_VERSION,
     PROV_NOT_LIVE,
     CallConfig,
     ChipCallable,
@@ -636,7 +636,7 @@ _CTRL_COMMITTED_DEVICE_MEMORY = 18
 # chip-child controls.
 _CTRL_GLOBAL_DOMAIN_NODE = 24
 _CTRL_DEVICE_MEMORY_INFO = 25
-_CTRL_REBUILD_ENDPOINT = 27
+# Control id 27 is retired; do not reuse wire command ids.
 _CTRL_RELEASE_FAULTED_ENDPOINT = 28
 _CTRL_OP_NAMES[_CTRL_DEVICE_MEMORY_INFO] = "device_memory_info"
 _CTRL_DELEGATED_REGION = 26
@@ -696,9 +696,9 @@ _CTRL_OFF_RESULT = 40
 _CTRL_U64_SIZE = struct.calcsize("<Q")
 
 _CTRL_OFF_RECOVERY_ID = _CTRL_OFF_ARG0
-_CTRL_OFF_EXPECTED_ENDPOINT_GENERATION = (_CTRL_OFF_RECOVERY_ID + _CTRL_U64_SIZE)
+_CTRL_OFF_EXPECTED_ENDPOINT_GENERATION = _CTRL_OFF_RECOVERY_ID + _CTRL_U64_SIZE
 
-assert (_CTRL_OFF_EXPECTED_ENDPOINT_GENERATION + _CTRL_U64_SIZE <= _CTRL_OFF_RESULT)
+assert _CTRL_OFF_EXPECTED_ENDPOINT_GENERATION + _CTRL_U64_SIZE <= _CTRL_OFF_RESULT
 _DEVICE_MEMORY_INFO = struct.Struct("<QQ")
 
 
@@ -2297,17 +2297,12 @@ def _run_mailbox_loop(
                     faulted_wait_decision = raw_rc != 0 or runtime_status != 0
             elif state == _CONTROL_REQUEST:
                 sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-                if faulted_wait_decision and sub_cmd not in (
-                    _CTRL_REBUILD_ENDPOINT,
-                    _CTRL_RELEASE_FAULTED_ENDPOINT,
-                ):
+                if faulted_wait_decision and sub_cmd != _CTRL_RELEASE_FAULTED_ENDPOINT:
                     code, msg = 1, "faulted endpoint awaits L3 recovery decision"
                 else:
                     code, msg = handle_control(int(sub_cmd))
                 _write_error(buf, code, msg)
                 _mailbox_store_i32(state_addr, _CONTROL_DONE)
-                if faulted_wait_decision and sub_cmd == _CTRL_REBUILD_ENDPOINT and code == 0:
-                    faulted_wait_decision = False
                 if sub_cmd == _CTRL_RELEASE_FAULTED_ENDPOINT and faulted_wait_decision and code == 0:
                     break
             else:
@@ -2918,8 +2913,6 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     prepared: set[int] | None = None,
     task_frame_count: int = 1,
     chip_rank: int | None = None,
-    rebuild_worker=None,
-    on_worker_replaced=None,
     hold_native_fault: bool = False,
 ) -> None:
     """Chip-process handlers for `_run_mailbox_loop`.
@@ -2961,7 +2954,6 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     faulted = [False]
     held_endpoint_generation = [0]
     held_recovery_id = [0]
-    recovery_reset_unconfirmed = [False]
 
     def read_task_config(
         task_buf: memoryview,
@@ -3077,53 +3069,10 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     def handle_control(  # noqa: PLR0912, PLR0915 -- one branch per control sub-command
         sub_cmd: int,
     ) -> tuple[int, str]:
-        nonlocal cw, import_registry, provider_region_store, provider_transaction_table, global_domain_store
-        nonlocal endpoint_generation
         code = 0
         msg = ""
         try:
-            if sub_cmd == _CTRL_REBUILD_ENDPOINT:
-                _recovery_id, expected_generation = bind_held_recovery_action()
-                if expected_generation != endpoint_generation:
-                    raise RuntimeError("held endpoint generation no longer matches current generation")
-                if (
-                    endpoint_generation == (1 << 64) - 1
-                    or environment is not RegionEnvironmentKind.ONBOARD
-                    or chip_platform != "a5"
-                    or task_frame_count != 1
-                ):
-                    raise RuntimeError("endpoint rebuild is limited to A5 onboard single-frame program mode")
-                if rebuild_worker is None or on_worker_replaced is None:
-                    raise RuntimeError("endpoint recovery is unavailable in this child")
-                import_registry.close()
-                try:
-                    cw.recovery_finalize()
-                except BaseException:  # noqa: BLE001
-                    recovery_reset_unconfirmed[0] = True
-                    raise
-                global_domain_store.domains.clear()
-                provider_region_store.abandon_after_device_reset()
-                replacement = rebuild_worker()
-                cw = replacement
-                on_worker_replaced(replacement)
-                prepared.clear()
-                for cid, target in registry.items():
-                    if isinstance(target, ChipCallable):
-                        _ensure_prepared(cw, registry, prepared, int(cid), device_id=device_id)
-                import_registry = ImportRegistry(
-                    ImportContext(deployment=DEVICE_AICPU, device_owner_instance_id=owner_instance_id)
-                )
-                provider_region_store = ProviderRegionStore(
-                    RegionAllocationContext(environment_kind=environment, target=DeviceAllocationTarget(int(device_id)))
-                )
-                provider_transaction_table = ProviderTransactionTable()
-                global_domain_store = _L2GlobalDomainStore()
-                endpoint_generation += 1
-                struct.pack_into("<Q", buf, _CTRL_OFF_RESULT, endpoint_generation)
-                faulted[0] = False
-                held_endpoint_generation[0] = 0
-                held_recovery_id[0] = 0
-            elif sub_cmd == _CTRL_RELEASE_FAULTED_ENDPOINT:
+            if sub_cmd == _CTRL_RELEASE_FAULTED_ENDPOINT:
                 bind_held_recovery_action()
                 faulted[0] = False
                 held_endpoint_generation[0] = 0
@@ -3511,12 +3460,14 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             run_two_frame_loop()
         else:
             _run_mailbox_loop(
-                buf, state_addr, handle_task=handle_task, handle_control=handle_control,
+                buf,
+                state_addr,
+                handle_task=handle_task,
+                handle_control=handle_control,
                 hold_native_fault=hold_native_fault,
             )
     finally:
-        if not recovery_reset_unconfirmed[0]:
-            _teardown_chip_process_resources(import_registry, cw, global_domain_store, provider_region_store)
+        _teardown_chip_process_resources(import_registry, cw, global_domain_store, provider_region_store)
 
 
 def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins, identity tables, log config, prewarm sizing) must cross the fork as explicit COW args; the child cannot read parent state after os.fork
@@ -3596,20 +3547,6 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
     sys.stderr.flush()
 
-    current_worker = cw
-
-    def rebuild_worker():
-        replacement = ChipWorker()
-        replacement.init(
-            device_id, bins, log_level=log_level, prewarm_config=prewarm_config,
-            enable_sdma=enable_sdma,
-        )
-        return replacement
-
-    def on_worker_replaced(replacement):
-        nonlocal current_worker
-        current_worker = replacement
-
     try:
         _run_chip_main_loop(
             cw,
@@ -3626,12 +3563,10 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             prepared=prepared,
             task_frame_count=_local_task_frame_count(platform, runtime, int(cw.pipeline_depth)),
             chip_rank=chip_rank,
-            rebuild_worker=rebuild_worker,
-            on_worker_replaced=on_worker_replaced,
             hold_native_fault=enable_operator_recovery,
         )
     finally:
-        current_worker.finalize()
+        cw.finalize()
 
 
 def _read_config_from_mailbox(
@@ -8000,6 +7935,34 @@ class Worker:
                     self._hierarchical_start_cv.notify_all()
             raise
 
+    def pending_recoveries(self):
+        """Read held local L3 episodes, including groups with a peer still executing."""
+        with self._operation_lease("pending_recoveries"):
+            self._require_retained_recovery()
+            return self._worker.pending_recoveries()
+
+    def wait_for_recovery(self, timeout: float = 0.0):
+        """Wait for a held episode with terminal members; this is not a device-stop proof."""
+        with self._operation_lease("wait_for_recovery"):
+            self._require_retained_recovery()
+            return self._worker.wait_for_recovery(float(timeout))
+
+    def recovery_graph(self, ticket):
+        """Copy the retained run's task metadata without dispatching or releasing resources."""
+        with self._operation_lease("recovery_graph"):
+            self._require_retained_recovery()
+            return self._worker.recovery_graph(ticket)
+
+    def give_up_recovery(self, ticket, reason: str) -> bool:
+        """End a terminal-member episode through the ordinary failure lifecycle."""
+        with self._operation_lease("give_up_recovery"):
+            self._require_retained_recovery()
+            return bool(self._worker.give_up_recovery(ticket, reason))
+
+    def _require_retained_recovery(self) -> None:
+        if not self._effective_operator_recovery or self._worker is None:
+            raise RuntimeError("retained recovery requires enabled A5 local L3 operator recovery")
+
     def _resolve_effective_operator_recovery(self) -> None:
         requested = bool(self._config.get("enable_operator_recovery", False))
         platform = str(self._config.get("platform", ""))
@@ -8013,9 +7976,7 @@ class Worker:
             and not self._remote_worker_specs
             and not self._mpi_l3_groups
         )
-        # Direct A5 ChipWorker.init uses simpler_init(), which latches PROGRAM
-        # mode before mutating runner state. recovery_finalize() repeats the
-        # mode check as the final L2 safety boundary.
+        # Only local single-frame chip endpoints provide the held-fault mailbox contract.
         self._effective_operator_recovery = bool(
             requested and platform == "a5" and local_only_hierarchy and local_single_frame
         )
@@ -12167,6 +12128,9 @@ class Worker:
                 attempt = _CloseAttempt()
                 self._close_completion = attempt
                 self._hierarchical_start_cv.notify_all()
+                if self._effective_operator_recovery and self._worker is not None:
+                    # Wake recovery owners before draining their leased waits and run handles.
+                    self._worker.cancel_recoveries()
                 # One absolute budget covers both kinds of admitted work. A
                 # lease that consumes most of it must not be followed by a
                 # fresh full-budget wait on an accepted run fence.

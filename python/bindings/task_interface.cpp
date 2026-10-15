@@ -3559,7 +3559,6 @@ NB_MODULE(_task_interface, m) {
             "kernels can use get_dma_workspace; init raises if the platform lacks support for the requested workspace."
         )
         .def("finalize", &ChipWorker::finalize)
-        .def("recovery_finalize", &ChipWorker::recovery_finalize)
         .def(
             "register_callable",
             [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {

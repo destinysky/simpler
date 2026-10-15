@@ -226,15 +226,17 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
             events.append(("finalize",))
 
     def fake_run_chip_main_loop(
-        cw, *_args, chip_platform, chip_runtime, prepared=None, task_frame_count=1, chip_rank=None, rebuild_worker=None,
-        on_worker_replaced=None, hold_native_fault=False
+        cw,
+        *_args,
+        chip_platform,
+        chip_runtime,
+        prepared=None,
+        task_frame_count=1,
+        chip_rank=None,
+        hold_native_fault=False,
     ):
         assert chip_rank is None
 
-        # This case does not enable operator recovery, but _chip_process_loop
-        # still supplies the recovery construction callbacks to the main loop.
-        assert callable(rebuild_worker)
-        assert callable(on_worker_replaced)
         assert hold_native_fault is False
 
         published_depths.append(worker_mod._PIPELINE_LEASE_FMT.unpack_from(_args[0], worker_mod._OFF_PIPELINE_LEASE)[0])
@@ -639,7 +641,7 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(
     assert fake_parent.configured_depths == [1]
     assert fake_parent.operator_recovery_values == [expected_operator_recovery]
     assert [call[1:] for call in fake_parent.next_level_calls] == [
-        (12001, expected_frame_counts[0]), 
+        (12001, expected_frame_counts[0]),
         (12002, expected_frame_counts[1]),
         ]
     assert fake_parent.initialized

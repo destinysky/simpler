@@ -451,17 +451,6 @@ int finalize_device(DeviceContextHandle ctx) {
     }
 }
 
-int recovery_finalize_device(DeviceContextHandle ctx) {
-    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
-    try {
-        DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
-        if (runner->native_runs_outstanding()) return PTO_RUNTIME_ERR_INVALID_STATE;
-        return runner->recovery_finalize();
-    } catch (...) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-}
-
 int get_execution_recovery_state_ctx(DeviceContextHandle ctx, ExecutionRecoveryResult *result) {
     if (ctx == nullptr || result == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     try {

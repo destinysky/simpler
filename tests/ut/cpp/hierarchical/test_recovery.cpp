@@ -100,7 +100,11 @@ public:
         if (events_.empty()) return false;
         progress = std::move(events_.front());
         events_.pop_front();
-        if (progress.kind == WorkerProgressKind::COMPLETED) outstanding_ = false;
+        if (progress.kind == WorkerProgressKind::COMPLETED) {
+            outstanding_ = false;
+            completed_ = true;
+            cv_.notify_all();
+        }
         return true;
     }
 
@@ -108,27 +112,12 @@ public:
 
     uint64_t endpoint_generation() const override { return generation_.load(std::memory_order_acquire); }
 
-    EndpointRecoveryResult rebuild_endpoint(const EndpointRecoveryRequest &request) override {
-        recovery_calls_.fetch_add(1, std::memory_order_relaxed);
-        uint64_t current = generation_.load(std::memory_order_acquire);
-        if (request.recovery_id == 0 || request.expected_endpoint_generation != current) {
-            return {request.worker_id, request.recovery_id, false, current, "stale generation"};
-        }
-        if (fail_recovery_) {
-            return {request.worker_id, request.recovery_id, false, current, "injected reset/probe failure"};
-        }
-        generation_.store(current + 1, std::memory_order_release);
-        return {request.worker_id, request.recovery_id, true, current + 1, {}};
-    }
-
     void release_faulted_endpoint(const EndpointRecoveryRequest &request) override {
         if (request.recovery_id == 0 || request.expected_endpoint_generation != endpoint_generation()) {
             throw std::runtime_error("stale release transaction");
         }
         releases_.fetch_add(1, std::memory_order_relaxed);
     }
-    void set_recovery_failure(bool fail) { fail_recovery_ = fail; }
-    uint32_t recovery_calls() const { return recovery_calls_.load(std::memory_order_relaxed); }
     uint32_t releases() const { return releases_.load(std::memory_order_relaxed); }
 
     void request_progress_stop() noexcept override {
@@ -146,7 +135,16 @@ public:
 
     bool wait_submitted(std::chrono::milliseconds timeout = std::chrono::seconds(3)) {
         std::unique_lock<std::mutex> lk(mu_);
-        return cv_.wait_for(lk, timeout, [this] { return submitted_; });
+        return cv_.wait_for(lk, timeout, [this] {
+            return submitted_;
+        });
+    }
+
+    bool wait_completed() {
+        std::unique_lock<std::mutex> lk(mu_);
+        return cv_.wait_for(lk, std::chrono::seconds(3), [this] {
+            return completed_;
+        });
     }
 
     void emit_completion(
@@ -166,9 +164,7 @@ public:
     }
 
     void fail_native(const NativeExecutionFault &fault, bool launch_accepted) {
-        emit_completion(
-            EndpointOutcome::TASK_FAILURE, fault, launch_accepted, "injected native execution fault"
-        );
+        emit_completion(EndpointOutcome::TASK_FAILURE, fault, launch_accepted, "injected native execution fault");
     }
 
     void succeed() { emit_completion(EndpointOutcome::SUCCESS, NativeExecutionFault{}, true, ""); }
@@ -180,79 +176,85 @@ private:
     WorkerDispatch dispatch_{};
     bool submitted_{false};
     bool outstanding_{false};
+    bool completed_{false};
     std::deque<WorkerEndpointProgress> events_;
     std::atomic<uint64_t> generation_{1};
-    std::atomic<uint32_t> recovery_calls_{0};
     std::atomic<uint32_t> releases_{0};
-    bool fail_recovery_{false};
 };
 
-TEST(RecoveryCoordinatorTest, RequestResolutionIsAsynchronousAndEndsInGiveUp) {
-    RecoveryCoordinator coordinator;
-    RecoveryRequest request;
-    request.ticket.run_id = 7;
-    request.ticket.task_slot = 3;
-    request.ticket.recovery_id = 11;
-    request.ticket.attempt = 0;
-    request.worker_id = 2;
-    request.failure.outcome = EndpointOutcome::TASK_FAILURE;
-    request.failure.launch_accepted = false;
-    request.failure.native_execution_fault.runtime_status = -9;
-
-    coordinator.submit(std::move(request));
-    RecoveryResolution resolution;
-    EXPECT_FALSE(coordinator.try_pop_resolution(resolution));
-
-    coordinator.progress();
-    ASSERT_TRUE(coordinator.try_pop_resolution(resolution));
-    EXPECT_EQ(resolution.kind, RecoveryResolutionKind::GIVE_UP);
-    EXPECT_EQ(resolution.request.stage, RecoveryStage::GIVE_UP);
-    EXPECT_EQ(resolution.request.ticket.recovery_id, 11u);
-    EXPECT_EQ(resolution.request.ticket.attempt, 0u);
-    EXPECT_FALSE(resolution.request.failure.launch_accepted);
-    EXPECT_EQ(resolution.request.failure.native_execution_fault.runtime_status, -9);
-    EXPECT_FALSE(coordinator.has_work());
+RecoveryRequest episode(bool group = false) {
+    RecoveryRequest r;
+    r.ticket = {7, 3, 11, 0};
+    r.failure.outcome = EndpointOutcome::TASK_FAILURE;
+    r.failure.error_message = "original native fault";
+    r.members.push_back({0, 1, true, r.failure});
+    if (group) r.members.push_back({1, 1, false, {}});
+    return r;
 }
-
-TEST(RecoveryCoordinatorTest, EligibleRequestProducesEndpointActionWithoutReplay) {
-    RecoveryCoordinator coordinator;
-    coordinator.set_eligibility_decision([](const RecoveryRequest &) { return true; });
-    RecoveryRequest request;
-    request.ticket.recovery_id = 51;
-    request.ticket.expected_endpoint_generation = 1;
-    coordinator.submit(request);
-    coordinator.progress();
-    RecoveryResolution resolution;
-    ASSERT_TRUE(coordinator.try_pop_resolution(resolution));
-    EXPECT_EQ(resolution.kind, RecoveryResolutionKind::REBUILD_ENDPOINT);
-    EXPECT_EQ(resolution.request.stage, RecoveryStage::ENDPOINT_REBUILD);
-    EXPECT_EQ(resolution.request.ticket.recovery_id, 51u);
-
-    EndpointRecoveryResult result{resolution.request.worker_id, 51, true, 2, {}};
-    coordinator.submit_endpoint_result(std::move(resolution.request), std::move(result));
-    coordinator.progress();
-    ASSERT_TRUE(coordinator.try_pop_resolution(resolution));
-    EXPECT_EQ(resolution.kind, RecoveryResolutionKind::GIVE_UP);
-    ASSERT_TRUE(resolution.endpoint_result.has_value());
-    EXPECT_TRUE(resolution.endpoint_result->ok);
+TEST(RecoveryCoordinatorTest, HoldsUntilExplicitGiveUpAndRejectsStaleTickets) {
+    RecoveryCoordinator c;
+    auto r = episode();
+    r.ticket = c.submit(r);
+    ASSERT_TRUE(c.wait(0).has_value());
+    EXPECT_TRUE(c.has_work());
+    RecoveryRequest out;
+    std::string reason;
+    EXPECT_FALSE(c.try_pop_resolution(out, reason));
+    auto stale = r.ticket;
+    ++stale.run_id;
+    EXPECT_FALSE(c.give_up(stale, "owner gives up"));
+    EXPECT_TRUE(c.give_up(r.ticket, "owner gives up"));
+    EXPECT_FALSE(c.give_up(r.ticket, "duplicate"));
+    EXPECT_TRUE(c.try_pop_resolution(out, reason));
+    EXPECT_EQ(reason, "owner gives up");
+    EXPECT_EQ(out.failure.error_message, "original native fault");
+    EXPECT_FALSE(c.has_work());
 }
-
-TEST(EndpointRecoveryCommandTest, StaleGenerationDoesNotPublishResetCommand) {
+TEST(RecoveryCoordinatorTest, BusyPeerBlocksResolutionAndCancellationWaitsForTerminal) {
+    RecoveryCoordinator c;
+    auto r = episode(true);
+    r.ticket = c.submit(r);
+    EXPECT_FALSE(c.wait(0).has_value());
+    EXPECT_THROW(c.give_up(r.ticket, "unsafe"), std::logic_error);
+    c.cancel_all();
+    RecoveryRequest out;
+    std::string reason;
+    EXPECT_FALSE(c.try_pop_resolution(out, reason));
+    WorkerCompletion peer;
+    peer.outcome = EndpointOutcome::SUCCESS;
+    c.complete_member(11, 1, peer);
+    EXPECT_TRUE(c.try_pop_resolution(out, reason));
+    EXPECT_TRUE(out.all_members_terminal());
+    EXPECT_EQ(out.members[1].completion.outcome, EndpointOutcome::SUCCESS);
+}
+TEST(RecoveryCoordinatorTest, RejectsInvalidWaitAndDuplicateEpisode) {
+    RecoveryCoordinator c;
+    auto r = episode();
+    r.ticket = c.submit(r);
+    EXPECT_THROW(c.submit(r), std::logic_error);
+    EXPECT_THROW(c.wait(-1), std::invalid_argument);
+    EXPECT_THROW(c.wait(std::numeric_limits<double>::infinity()), std::invalid_argument);
+}
+TEST(EndpointRecoveryCommandTest, StaleReleaseDoesNotPublishControl) {
     std::vector<char> mailbox(MAILBOX_SIZE, 0);
     LocalMailboxEndpoint endpoint(4, mailbox.data());
-    const EndpointRecoveryResult result = endpoint.rebuild_endpoint({4, 91, 0});
-    EXPECT_FALSE(result.ok);
-    EXPECT_EQ(result.endpoint_generation, 1u);
-    EXPECT_EQ(endpoint.endpoint_generation(), 1u);
-    uint64_t command = 0;
-    std::memcpy(&command, mailbox.data() + MAILBOX_OFF_CALLABLE, sizeof(command));
-    EXPECT_NE(command, CTRL_REBUILD_ENDPOINT);
-
     EXPECT_THROW(endpoint.release_faulted_endpoint({4, 91, 0}), std::runtime_error);
+    uint64_t command = 0;
     std::memcpy(&command, mailbox.data() + MAILBOX_OFF_CALLABLE, sizeof(command));
     EXPECT_NE(command, CTRL_RELEASE_FAULTED_ENDPOINT);
 }
-
+TEST(RecoveryCoordinatorTest, AnotherWorkerTicketCannotResolveMatchingNumericIds) {
+    RecoveryCoordinator one;
+    RecoveryCoordinator two;
+    auto first = one.submit(episode());
+    auto second = two.submit(episode());
+    EXPECT_EQ(first.recovery_id, second.recovery_id);
+    EXPECT_NE(first.owner_id, second.owner_id);
+    EXPECT_FALSE(two.give_up(first, "foreign owner"));
+    EXPECT_TRUE(two.has_work());
+    EXPECT_TRUE(two.give_up(second, "own decision"));
+    EXPECT_TRUE(one.give_up(first, "own decision"));
+}
 TEST(OrchestratorRecoveryTest, GlobalFreezeBlocksNewRunAdmissionUntilThaw) {
     TensorMap tensor_map;
     Ring allocator;
@@ -265,7 +267,9 @@ TEST(OrchestratorRecoveryTest, GlobalFreezeBlocksNewRunAdmissionUntilThaw) {
     orch.init(&tensor_map, &allocator, &scope, &ready_sub, &ready_next);
     orch.set_global_recovery_freeze(true);
 
-    auto begin = std::async(std::launch::async, [&] { return orch.begin_run(); });
+    auto begin = std::async(std::launch::async, [&] {
+        return orch.begin_run();
+    });
     EXPECT_EQ(begin.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
     orch.set_global_recovery_freeze(false);
     ASSERT_EQ(begin.wait_for(std::chrono::seconds(1)), std::future_status::ready);
@@ -331,306 +335,282 @@ TEST(OrchestratorRecoveryTest, RecoveryHoldBlocksSubmitUntilGiveUpReleasesEpisod
 
 class SchedulerRecoveryTest : public ::testing::Test {
 protected:
-    virtual bool allow_endpoint_recovery() const { return false; }
-    virtual bool fail_endpoint_recovery() const { return false; }
-    TensorMap tensor_map;
-    Ring allocator;
+    TensorMap map;
+    Ring ring;
     Scope scope;
-    ReadyQueue ready_sub;
-    NextLevelReadyQueues ready_next;
+    ReadyQueue sub;
+    NextLevelReadyQueues next;
     Orchestrator orch;
     WorkerManager manager;
     Scheduler scheduler;
-    RecoveryEndpoint *endpoint{nullptr};
-    std::atomic<uint32_t> recovery_begin_calls{0};
-
+    RecoveryEndpoint *first{nullptr};
+    RecoveryEndpoint *second{nullptr};
+    RunId run{INVALID_RUN_ID};
+    TaskHandle a{}, b{}, c{};
+    uint64_t backing{0};
+    Tensor resource{};
+    virtual bool enabled() const { return true; }
     void SetUp() override {
-        allocator.init(/*heap_bytes=*/1ULL << 20);
-        auto owned_endpoint = std::make_unique<RecoveryEndpoint>();
-        endpoint = owned_endpoint.get();
-        endpoint->set_recovery_failure(fail_endpoint_recovery());
-        manager.add_next_level_endpoint(std::move(owned_endpoint));
+        ring.init(1ULL << 20);
+        auto one = std::make_unique<RecoveryEndpoint>(0);
+        auto two = std::make_unique<RecoveryEndpoint>(1);
+        first = one.get();
+        second = two.get();
+        manager.add_next_level_endpoint(std::move(one));
+        manager.add_next_level_endpoint(std::move(two));
         manager.start(
-            &allocator,
-            [this](WorkerCompletion completion) { scheduler.worker_done(std::move(completion)); },
-            [this](WorkerDispatch dispatch) { orch.mark_task_accepted(dispatch.task_slot); }
+            &ring,
+            [this](WorkerCompletion event) {
+                scheduler.worker_done(std::move(event));
+            },
+            [this](WorkerDispatch dispatch) {
+                orch.mark_task_accepted(dispatch.task_slot);
+            }
         );
-        ready_next.reset(manager.next_level_worker_ids());
-        orch.init(&tensor_map, &allocator, &scope, &ready_sub, &ready_next, &manager, [this] {
+        next.reset({0, 1});
+        orch.init(&map, &ring, &scope, &sub, &next, &manager, [this] {
             scheduler.notify_ready();
         });
-
-        Scheduler::Config config;
-        config.ring = &allocator;
-        config.ready_sub_queue = &ready_sub;
-        config.ready_next_level_queues = &ready_next;
-        config.manager = &manager;
-        config.enqueue_ready_cb = [this](TaskSlot slot) { orch.enqueue_ready(slot); };
-        config.active_run_cb = [this] { return orch.dispatchable_run_id(); };
-        config.preparable_run_cb = [this] { return orch.preparable_run_id(); };
-        config.on_consumed_cb = [this](TaskSlot slot) { (void)orch.on_consumed(slot); };
-        config.on_task_failed_cb = [this](TaskSlot slot, const std::string &message) {
+        Scheduler::Config cfg{};
+        cfg.ring = &ring;
+        cfg.ready_sub_queue = &sub;
+        cfg.ready_next_level_queues = &next;
+        cfg.manager = &manager;
+        cfg.enqueue_ready_cb = [this](TaskSlot slot) {
+            orch.enqueue_ready(slot);
+        };
+        cfg.active_run_cb = [this] {
+            return orch.dispatchable_run_id();
+        };
+        cfg.preparable_run_cb = [this] {
+            return orch.preparable_run_id();
+        };
+        cfg.on_consumed_cb = [this](TaskSlot slot) {
+            orch.on_consumed(slot);
+        };
+        cfg.on_task_failed_cb = [this](TaskSlot slot, const std::string &message) {
             orch.report_task_error(slot, message);
         };
-        config.operator_recovery_enabled = true;
-        config.begin_task_recovery_cb = [this](TaskSlot slot, uint64_t recovery_id) {
-            recovery_begin_calls.fetch_add(1, std::memory_order_relaxed);
-            return orch.begin_task_recovery(slot, recovery_id);
+        cfg.operator_recovery_enabled = enabled();
+        cfg.begin_task_recovery_cb = [this](TaskSlot slot, uint64_t id) {
+            return orch.begin_task_recovery(slot, id);
         };
-        config.finish_task_recovery_cb = [this](TaskSlot slot, uint64_t recovery_id) {
-            (void)orch.finish_task_recovery(slot, recovery_id);
+        cfg.finish_task_recovery_cb = [this](TaskSlot slot, uint64_t id) {
+            orch.finish_task_recovery(slot, id);
         };
-        config.recovery_eligibility_cb = [this](const RecoveryRequest &) { return allow_endpoint_recovery(); };
-        config.on_global_recovery_freeze_cb = [this](bool frozen) {
+        cfg.on_global_recovery_freeze_cb = [this](bool frozen) {
             orch.set_global_recovery_freeze(frozen);
         };
-        scheduler.start(config);
+        cfg.recovery_graph_cb = [this](const RecoveryTicket &ticket) {
+            return orch.recovery_graph(ticket);
+        };
+        orch.set_recovery_cancel_callback([this](RunId run_id, const std::string &reason) {
+            scheduler.cancel_run_recovery(run_id, reason);
+        });
+        scheduler.start(cfg);
         orch.set_scheduler_loop_mutex(&scheduler.loop_mutex());
     }
-
     void TearDown() override {
-        scheduler.request_stop();
-        manager.stop_workers();
         scheduler.stop();
         manager.stop();
-        allocator.shutdown();
+        ring.shutdown();
     }
-
-    std::string run_failure(
-        const CallableIdentity &callable, EndpointOutcome outcome, const NativeExecutionFault &fault,
-        bool launch_accepted, const std::string &error_message
-    ) {
-        RunId run = orch.begin_run();
-        CallConfig config;
-        auto task = orch.submit_next_level(callable, single_tensor_args(0x2000 + run), config, 0);
+    void graph(bool group = false) {
+        run = orch.begin_run();
+        orch.scope_begin();
+        resource = wire_tensor(42);
+        resource.buffer.backend_kind = static_cast<uint8_t>(BackendKind::FORK_SHM);
+        resource.buffer.nbytes = 4;
+        resource.shapes[0] = 4;
+        resource.buffer.body_len = 8;
+        backing = orch.alloc({4}, DataType::UINT8, resource.buffer.identity);
+        std::memcpy(resource.buffer.body, &backing, 8);
+        *reinterpret_cast<uint32_t *>(backing) = 0x1234abcd;
+        TaskArgs args;
+        args.add_tensor(resource, TensorArgType::INPUT);
+        args.add_scalar(42);
+        CallConfig cfg;
+        a = group ? orch.submit_next_level_group(chip_callable(1), {args, args}, cfg, {0, 1}) :
+                    orch.submit_next_level(chip_callable(1), args, cfg, 0);
+        TaskArgs successor = args;
+        successor.add_dep(a);
+        b = orch.submit_next_level(chip_callable(2), successor, cfg, 0);
+        successor.explicit_deps_.clear();
+        successor.add_dep(b);
+        c = orch.submit_next_level(chip_callable(3), successor, cfg, 0);
+        orch.scope_end();
         orch.close_run_submission(run);
-        if (!endpoint->wait_submitted()) {
-            ADD_FAILURE() << "timed out waiting for recovery test dispatch";
+        ASSERT_TRUE(first->wait_submitted());
+        if (group) ASSERT_TRUE(second->wait_submitted());
+    }
+    void native_failure(RecoveryEndpoint *endpoint = nullptr) {
+        NativeExecutionFault fault{};
+        fault.raw_rc = -12345;
+        fault.runtime_status = -9;
+        (endpoint ? endpoint : first)->fail_native(fault, false);
+    }
+    RecoveryRequest held() {
+        auto r = scheduler.wait_for_recovery(3);
+        if (!r) {
+            ADD_FAILURE() << "no retained episode";
             return {};
         }
-        endpoint->emit_completion(outcome, fault, launch_accepted, error_message);
-
-        std::string message;
-        try {
-            orch.wait_run(run);
-            ADD_FAILURE() << "injected failure unexpectedly completed successfully";
-        } catch (const std::runtime_error &e) {
-            message = e.what();
-        }
+        return *r;
+    }
+    void expect_graph(const RecoveryRequest &request) {
+        const auto snapshot = scheduler.recovery_graph(request.ticket);
+        EXPECT_FALSE(snapshot.run_failed);
+        EXPECT_EQ(snapshot.active_recoveries, 1u);
+        EXPECT_TRUE(snapshot.submission_closed);
+        auto find = [&](TaskHandle h) -> const RecoveryTaskSnapshot * {
+            for (const auto &item : snapshot.tasks)
+                if (item.handle.task_slot == h.task_slot) return &item;
+            return nullptr;
+        };
+        auto *aa = find(a);
+        auto *bb = find(b);
+        auto *cc = find(c);
+        ASSERT_NE(aa, nullptr);
+        ASSERT_NE(bb, nullptr);
+        ASSERT_NE(cc, nullptr);
+        EXPECT_EQ(aa->state, TaskState::RETRY_PENDING);
+        EXPECT_EQ(bb->state, TaskState::PENDING);
+        EXPECT_EQ(cc->state, TaskState::PENDING);
+        EXPECT_NE(std::find(bb->producers.begin(), bb->producers.end(), a.task_slot), bb->producers.end());
+        EXPECT_NE(std::find(cc->producers.begin(), cc->producers.end(), b.task_slot), cc->producers.end());
+        EXPECT_EQ(aa->args[0].scalar(0), 42u);
+        EXPECT_EQ(bb->args[0].tensor(0).buffer.identity, resource.buffer.identity);
+        EXPECT_EQ(bb->fanin_released, 0);
+        EXPECT_EQ(cc->fanin_released, 0);
+        EXPECT_EQ(scheduler.dispatched_total(), request.members.size());
+        EXPECT_EQ(*reinterpret_cast<uint32_t *>(backing), 0x1234abcdu);
+        EXPECT_FALSE(orch.wait_run_for(run, 0.03));
+        EXPECT_FALSE(orch.run_failed(run));
+    }
+    void give_up(const RecoveryRequest &request) {
+        EXPECT_TRUE(scheduler.give_up_recovery(request.ticket, "owner rejects replay"));
+        EXPECT_FALSE(scheduler.give_up_recovery(request.ticket, "duplicate"));
+        EXPECT_THROW(orch.wait_run(run), std::runtime_error);
         EXPECT_TRUE(orch.run_failed(run));
-        TaskSlotState *state = allocator.slot_state(task.task_slot);
-        EXPECT_NE(state, nullptr);
-        if (state != nullptr) {
-            EXPECT_EQ(state->state.load(std::memory_order_acquire), TaskState::CONSUMED);
-        }
+        EXPECT_EQ(ring.slot_state(a.task_slot)->state.load(), TaskState::CONSUMED);
+        EXPECT_EQ(ring.slot_state(b.task_slot)->state.load(), TaskState::CONSUMED);
+        EXPECT_EQ(ring.slot_state(c.task_slot)->state.load(), TaskState::CONSUMED);
+        EXPECT_THROW(scheduler.recovery_graph(request.ticket), std::invalid_argument);
         orch.release_run(run);
-        return message;
-    }
-
-    std::string run_fault(const NativeExecutionFault &fault, bool launch_accepted) {
-        return run_failure(
-            chip_callable(9), EndpointOutcome::TASK_FAILURE, fault, launch_accepted,
-            "injected native execution fault"
-        );
     }
 };
-
-class SchedulerEndpointRebuildTest : public SchedulerRecoveryTest {
-protected:
-    bool allow_endpoint_recovery() const override { return true; }
-};
-
-class SchedulerEndpointRebuildFailureTest : public SchedulerEndpointRebuildTest {
-protected:
-    bool fail_endpoint_recovery() const override { return true; }
-};
-
-TEST_F(SchedulerEndpointRebuildTest, RebuildCommitsGenerationAndStillFailsOriginalTask) {
-    NativeExecutionFault fault{};
-    fault.raw_rc = 507018;
-    fault.device_unusable = 1;
-    const std::string message = run_fault(fault, /*launch_accepted=*/true);
-    EXPECT_EQ(endpoint->recovery_calls(), 1u);
-    EXPECT_EQ(endpoint->releases(), 0u);
-    EXPECT_EQ(endpoint->endpoint_generation(), 2u);
-    EXPECT_NE(message.find("ENDPOINT_READY generation=2"), std::string::npos);
-    EXPECT_NE(message.find("ENDPOINT_REBUILD->ENDPOINT_READY->GIVE_UP"), std::string::npos);
+TEST_F(SchedulerRecoveryTest, HoldsOriginalGraphArgsDependenciesAndManagedBufferUntilGiveUp) {
+    graph();
+    native_failure();
+    auto r = held();
+    expect_graph(r);
+    give_up(r);
+    EXPECT_EQ(first->releases(), 1u);
 }
-
-TEST_F(SchedulerEndpointRebuildFailureTest, FailedResetKeepsGenerationAndReleasesHeldChild) {
-    NativeExecutionFault fault{};
-    fault.runtime_status = -9;
-    const std::string message = run_fault(fault, /*launch_accepted=*/true);
-    EXPECT_EQ(endpoint->recovery_calls(), 1u);
-    EXPECT_EQ(endpoint->releases(), 1u);
-    EXPECT_EQ(endpoint->endpoint_generation(), 1u);
-    EXPECT_NE(message.find("injected reset/probe failure"), std::string::npos);
-    EXPECT_NE(message.find("ENDPOINT_REBUILD->GIVE_UP"), std::string::npos);
+TEST_F(SchedulerRecoveryTest, GroupHealthyPeerEvidenceBeforeFaultIsPreserved) {
+    graph(true);
+    second->succeed();
+    ASSERT_TRUE(second->wait_completed());
+    native_failure();
+    auto r = held();
+    ASSERT_EQ(r.members.size(), 2u);
+    EXPECT_TRUE(r.members[1].terminal);
+    EXPECT_EQ(r.members[1].completion.outcome, EndpointOutcome::SUCCESS);
+    EXPECT_TRUE(r.members[1].completion.launch_accepted);
+    expect_graph(r);
+    give_up(r);
+    EXPECT_EQ(first->releases(), 1u);
+    EXPECT_EQ(second->releases(), 0u);
 }
-
-TEST_F(SchedulerRecoveryTest, SemanticOnlyFaultWithUnacceptedLaunchStillUsesRecoveryPath) {
-    NativeExecutionFault fault{};
-    fault.runtime_status = -9;
-    fault.device_unusable = 1;
-    std::string message = run_fault(fault, /*launch_accepted=*/false);
-    EXPECT_NE(message.find("injected native execution fault"), std::string::npos);
-    EXPECT_NE(message.find("[recovery id="), std::string::npos);
-    EXPECT_NE(message.find("attempt=0"), std::string::npos);
-    EXPECT_NE(message.find("trace=DETECTED->ELIGIBILITY_CHECK->GIVE_UP"), std::string::npos);
-    EXPECT_EQ(recovery_begin_calls.load(std::memory_order_relaxed), 1u);
+TEST_F(SchedulerRecoveryTest, GroupFaultFreezesGraphWhilePeerIsStillRunning) {
+    graph(true);
+    native_failure();
+    EXPECT_FALSE(scheduler.wait_for_recovery(0.03).has_value());
+    auto pending = scheduler.pending_recoveries();
+    ASSERT_EQ(pending.size(), 1u);
+    EXPECT_FALSE(pending[0].all_members_terminal());
+    auto snapshot = scheduler.recovery_graph(pending[0].ticket);
+    EXPECT_FALSE(snapshot.run_failed);
+    EXPECT_THROW(scheduler.give_up_recovery(pending[0].ticket, "unsafe"), std::logic_error);
+    second->succeed();
+    auto r = held();
+    expect_graph(r);
+    give_up(r);
 }
-
-TEST_F(SchedulerRecoveryTest, RawRcOnlyFaultAlsoUsesRecoveryPath) {
-    NativeExecutionFault fault{};
-    fault.raw_rc = 507018;
-    fault.device_unusable = 1;
-    std::string message = run_fault(fault, /*launch_accepted=*/true);
-    EXPECT_NE(message.find("[recovery id="), std::string::npos);
-    EXPECT_NE(message.find("trace=DETECTED->ELIGIBILITY_CHECK->GIVE_UP"), std::string::npos);
-    EXPECT_EQ(recovery_begin_calls.load(std::memory_order_relaxed), 1u);
+TEST_F(SchedulerRecoveryTest, GroupBothFaultsReleaseBothHeldChildrenExactlyOnce) {
+    graph(true);
+    native_failure();
+    native_failure(second);
+    auto r = held();
+    expect_graph(r);
+    give_up(r);
+    EXPECT_EQ(first->releases(), 1u);
+    EXPECT_EQ(second->releases(), 1u);
 }
-
-TEST_F(SchedulerRecoveryTest, EndpointFailureWithNativeFaultDoesNotEnterRecovery) {
-    NativeExecutionFault fault{};
-    fault.raw_rc = 507018;
-    fault.runtime_status = -9;
-    fault.device_unusable = 1;
-    std::string message = run_failure(
-        chip_callable(10), EndpointOutcome::ENDPOINT_FAILURE, fault, /*launch_accepted=*/true,
-        "injected endpoint failure"
-    );
-    EXPECT_NE(message.find("injected endpoint failure"), std::string::npos);
-    EXPECT_EQ(message.find("[recovery id="), std::string::npos);
-    EXPECT_EQ(recovery_begin_calls.load(std::memory_order_relaxed), 0u);
+TEST_F(SchedulerRecoveryTest, StaleTicketCannotEndCurrentEpisode) {
+    graph();
+    native_failure();
+    auto r = held();
+    auto stale = r.ticket;
+    ++stale.attempt;
+    EXPECT_FALSE(scheduler.give_up_recovery(stale, "stale"));
+    expect_graph(r);
+    give_up(r);
 }
-
-TEST_F(SchedulerRecoveryTest, TaskFailureWithoutRawOrRuntimeStatusDoesNotEnterRecovery) {
-    NativeExecutionFault fault{};
-    // detail_code and device_unusable are recovery facts, but they do not make
-    // a NativeExecutionFault exist without raw_rc or runtime_status.
-    fault.detail_code = 1;
-    fault.device_unusable = 1;
-    std::string message = run_failure(
-        chip_callable(11), EndpointOutcome::TASK_FAILURE, fault, /*launch_accepted=*/true,
-        "injected task failure without raw or runtime status"
-    );
-    EXPECT_NE(message.find("without raw or runtime status"), std::string::npos);
-    EXPECT_EQ(message.find("[recovery id="), std::string::npos);
-    EXPECT_EQ(recovery_begin_calls.load(std::memory_order_relaxed), 0u);
-}
-
-TEST_F(SchedulerRecoveryTest, NonLocalChipTaskFailureDoesNotEnterRecovery) {
-    NativeExecutionFault fault{};
-    fault.runtime_status = -9;
-    fault.device_unusable = 1;
-    std::string message = run_failure(
-        non_local_chip_callable(12), EndpointOutcome::TASK_FAILURE, fault, /*launch_accepted=*/true,
-        "injected non-local-chip native fault"
-    );
-    EXPECT_NE(message.find("non-local-chip"), std::string::npos);
-    EXPECT_EQ(message.find("[recovery id="), std::string::npos);
-    EXPECT_EQ(recovery_begin_calls.load(std::memory_order_relaxed), 0u);
-}
-
-class SchedulerRecoveryGroupNegativeTest : public ::testing::Test {
-protected:
-    TensorMap tensor_map;
-    Ring allocator;
-    Scope scope;
-    ReadyQueue ready_sub;
-    NextLevelReadyQueues ready_next;
-    Orchestrator orch;
-    WorkerManager manager;
-    Scheduler scheduler;
-    RecoveryEndpoint *endpoint0{nullptr};
-    RecoveryEndpoint *endpoint1{nullptr};
-    std::atomic<uint32_t> recovery_begin_calls{0};
-
-    void SetUp() override {
-        allocator.init(/*heap_bytes=*/1ULL << 20);
-        auto first = std::make_unique<RecoveryEndpoint>(0);
-        auto second = std::make_unique<RecoveryEndpoint>(1);
-        endpoint0 = first.get();
-        endpoint1 = second.get();
-        manager.add_next_level_endpoint(std::move(first));
-        manager.add_next_level_endpoint(std::move(second));
-        manager.start(
-            &allocator,
-            [this](WorkerCompletion completion) { scheduler.worker_done(std::move(completion)); },
-            [this](WorkerDispatch dispatch) { orch.mark_task_accepted(dispatch.task_slot); }
-        );
-        ready_next.reset(manager.next_level_worker_ids());
-        orch.init(&tensor_map, &allocator, &scope, &ready_sub, &ready_next, &manager, [this] {
-            scheduler.notify_ready();
-        });
-
-        Scheduler::Config config;
-        config.ring = &allocator;
-        config.ready_sub_queue = &ready_sub;
-        config.ready_next_level_queues = &ready_next;
-        config.manager = &manager;
-        config.enqueue_ready_cb = [this](TaskSlot slot) { orch.enqueue_ready(slot); };
-        config.active_run_cb = [this] { return orch.dispatchable_run_id(); };
-        config.preparable_run_cb = [this] { return orch.preparable_run_id(); };
-        config.on_consumed_cb = [this](TaskSlot slot) { (void)orch.on_consumed(slot); };
-        config.on_task_failed_cb = [this](TaskSlot slot, const std::string &message) {
-            orch.report_task_error(slot, message);
-        };
-        config.operator_recovery_enabled = true;
-        config.begin_task_recovery_cb = [this](TaskSlot slot, uint64_t recovery_id) {
-            recovery_begin_calls.fetch_add(1, std::memory_order_relaxed);
-            return orch.begin_task_recovery(slot, recovery_id);
-        };
-        config.finish_task_recovery_cb = [this](TaskSlot slot, uint64_t recovery_id) {
-            (void)orch.finish_task_recovery(slot, recovery_id);
-        };
-        scheduler.start(config);
-        orch.set_scheduler_loop_mutex(&scheduler.loop_mutex());
-    }
-
-    void TearDown() override {
-        scheduler.request_stop();
-        manager.stop_workers();
-        scheduler.stop();
-        manager.stop();
-        allocator.shutdown();
-    }
-};
-
-TEST_F(SchedulerRecoveryGroupNegativeTest, GroupTaskFailureDoesNotEnterRecovery) {
-    RunId run = orch.begin_run();
-    CallConfig config;
-    auto group = orch.submit_next_level_group(
-        chip_callable(13),
-        {single_tensor_args(0x3101), single_tensor_args(0x3102)},
-        config,
-        {0, 1}
-    );
-    orch.close_run_submission(run);
-    ASSERT_TRUE(endpoint0->wait_submitted());
-    ASSERT_TRUE(endpoint1->wait_submitted());
-
-    NativeExecutionFault fault{};
-    fault.runtime_status = -9;
-    fault.device_unusable = 1;
-    endpoint0->fail_native(fault, /*launch_accepted=*/true);
-    endpoint1->succeed();
-
-    std::string message;
-    try {
-        orch.wait_run(run);
-        ADD_FAILURE() << "group native failure unexpectedly completed successfully";
-    } catch (const std::runtime_error &e) {
-        message = e.what();
-    }
-    EXPECT_NE(message.find("injected native execution fault"), std::string::npos);
-    EXPECT_EQ(message.find("[recovery id="), std::string::npos);
-    EXPECT_EQ(recovery_begin_calls.load(std::memory_order_relaxed), 0u);
-    EXPECT_TRUE(orch.run_failed(run));
-    TaskSlotState *state = allocator.slot_state(group.task_slot);
-    ASSERT_NE(state, nullptr);
-    EXPECT_EQ(state->state.load(std::memory_order_acquire), TaskState::CONSUMED);
+TEST_F(SchedulerRecoveryTest, StopCancelsHeldEpisodeAndReleasesTheRun) {
+    graph();
+    native_failure();
+    auto r = held();
+    expect_graph(r);
+    scheduler.request_stop();
+    EXPECT_THROW(orch.wait_run(run), std::runtime_error);
+    scheduler.stop();
     orch.release_run(run);
 }
-
+TEST_F(SchedulerRecoveryTest, StopWithLiveGroupPeerWaitsForItsTerminalCompletion) {
+    graph(true);
+    native_failure();
+    EXPECT_FALSE(scheduler.wait_for_recovery(0.03).has_value());
+    scheduler.request_stop();
+    EXPECT_THROW(orch.wait_run(run), std::runtime_error);
+    scheduler.stop();
+    orch.release_run(run);
+}
+TEST_F(SchedulerRecoveryTest, GraphSubmissionFailureCancelsTheHeldEpisode) {
+    graph();
+    native_failure();
+    auto request = held();
+    expect_graph(request);
+    orch.fail_run_submission(run, std::make_exception_ptr(std::runtime_error("graph construction cancelled")));
+    EXPECT_THROW(orch.wait_run(run), std::runtime_error);
+    EXPECT_TRUE(scheduler.pending_recoveries().empty());
+    orch.release_run(run);
+}
+TEST_F(SchedulerRecoveryTest, AnotherTerminalRunErrorCancelsTheHeldEpisode) {
+    graph();
+    native_failure();
+    auto request = held();
+    expect_graph(request);
+    orch.report_task_error(b.task_slot, "terminal run error");
+    EXPECT_THROW(orch.wait_run(run), std::runtime_error);
+    EXPECT_TRUE(scheduler.pending_recoveries().empty());
+    orch.release_run(run);
+}
+class RecoveryDisabledTest : public SchedulerRecoveryTest {
+    bool enabled() const override { return false; }
+};
+TEST_F(RecoveryDisabledTest, DefaultFailurePropagationRemainsTerminal) {
+    graph();
+    native_failure();
+    EXPECT_THROW(orch.wait_run(run), std::runtime_error);
+    EXPECT_TRUE(scheduler.pending_recoveries().empty());
+    orch.release_run(run);
+}
+TEST_F(SchedulerRecoveryTest, UnstructuredEndpointFailureIsNotHeld) {
+    graph();
+    first->emit_completion(EndpointOutcome::ENDPOINT_FAILURE, {}, false, "endpoint died");
+    EXPECT_THROW(orch.wait_run(run), std::runtime_error);
+    EXPECT_TRUE(scheduler.pending_recoveries().empty());
+    orch.release_run(run);
+}
 }  // namespace

@@ -54,6 +54,7 @@ void TaskSlotState::reset() {
         std::lock_guard<std::mutex> lk(group_mu);
         group_member_states.clear();
         group_member_outcomes.clear();
+        group_member_completions.clear();
         group_failed = false;
         group_first_failure_index = -1;
         group_first_failure_message.clear();

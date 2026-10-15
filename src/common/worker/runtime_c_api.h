@@ -419,11 +419,6 @@ int simpler_init(
  * without teardown while a prepared native run remains unfinalized.
  */
 int finalize_device(DeviceContextHandle ctx);
-// Program-mode onboard recovery retires the current execution generation via
-// the platform's fatal reset/retry/probe policy. A kernel-mode context is
-// rejected before any device mutation.
-int recovery_finalize_device(DeviceContextHandle ctx);
-
 // Explicit in-place execution rearm. Neither entry dispatches work or resets
 // the device. A non-execution-only scope is refused without mutation.
 int get_execution_recovery_state_ctx(DeviceContextHandle ctx, ExecutionRecoveryResult *result);

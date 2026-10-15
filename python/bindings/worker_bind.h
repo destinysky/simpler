@@ -29,6 +29,7 @@
 #include <nanobind/stl/vector.h>
 
 #include <cstdint>
+#include <algorithm>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -253,7 +254,8 @@ inline void bind_worker(nb::module_ &m) {
         .value("RUNNING", TaskState::RUNNING)
         .value("COMPLETED", TaskState::COMPLETED)
         .value("FAILED", TaskState::FAILED)
-        .value("CONSUMED", TaskState::CONSUMED);
+        .value("CONSUMED", TaskState::CONSUMED)
+        .value("RETRY_PENDING", TaskState::RETRY_PENDING);
 
     // --- Orchestrator (DAG builder, exposed via Worker.get_orchestrator()) ---
     // Bound as `_Orchestrator` because the Python user-facing `Orchestrator`
@@ -397,6 +399,90 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def("_release_run", &Orchestrator::release_run, nb::arg("run_id"));
 
+    nb::class_<RecoveryTicket>(m, "RecoveryTicket")
+        .def_ro("run_id", &RecoveryTicket::run_id)
+        .def_ro("task_slot", &RecoveryTicket::task_slot)
+        .def_ro("recovery_id", &RecoveryTicket::recovery_id)
+        .def_ro("attempt", &RecoveryTicket::attempt)
+        .def_ro("owner_id", &RecoveryTicket::owner_id);
+    nb::class_<RecoveryMember>(m, "RecoveryMember")
+        .def_ro("worker_id", &RecoveryMember::worker_id)
+        .def_ro("endpoint_generation", &RecoveryMember::endpoint_generation)
+        .def_ro("terminal", &RecoveryMember::terminal)
+        .def_prop_ro(
+            "outcome",
+            [](const RecoveryMember &s) {
+                return static_cast<int32_t>(s.completion.outcome);
+            }
+        )
+        .def_prop_ro(
+            "raw_rc",
+            [](const RecoveryMember &s) {
+                return s.completion.native_execution_fault.raw_rc;
+            }
+        )
+        .def_prop_ro(
+            "runtime_status",
+            [](const RecoveryMember &s) {
+                return s.completion.native_execution_fault.runtime_status;
+            }
+        )
+        .def_prop_ro(
+            "device_unusable",
+            [](const RecoveryMember &s) {
+                return s.completion.native_execution_fault.device_unusable;
+            }
+        )
+        .def_prop_ro(
+            "error_message",
+            [](const RecoveryMember &s) {
+                return s.completion.error_message;
+            }
+        )
+        .def_prop_ro("launch_accepted", [](const RecoveryMember &s) {
+            return s.completion.launch_accepted;
+        });
+    nb::class_<RecoveryRequest>(m, "RecoveryRequest")
+        .def_ro("ticket", &RecoveryRequest::ticket)
+        .def_ro("members", &RecoveryRequest::members)
+        .def_prop_ro("all_members_terminal", &RecoveryRequest::all_members_terminal)
+        .def_prop_ro("original_error", [](const RecoveryRequest &s) {
+            return s.failure.error_message;
+        });
+    nb::class_<RecoveryTaskSnapshot>(m, "RecoveryTaskSnapshot")
+        .def(
+            "is_task",
+            [](const RecoveryTaskSnapshot &s, const TaskHandle &h) {
+                return s.handle.run_id == h.run_id && s.handle.task_slot == h.task_slot;
+            }
+        )
+        .def(
+            "depends_on",
+            [](const RecoveryTaskSnapshot &s, const TaskHandle &h) {
+                return s.handle.run_id == h.run_id &&
+                       std::find(s.producers.begin(), s.producers.end(), h.task_slot) != s.producers.end();
+            }
+        )
+        .def_ro("handle", &RecoveryTaskSnapshot::handle)
+        .def_ro("state", &RecoveryTaskSnapshot::state)
+        .def_ro("worker_ids", &RecoveryTaskSnapshot::worker_ids)
+        .def_ro("args", &RecoveryTaskSnapshot::args)
+        .def_ro("producers", &RecoveryTaskSnapshot::producers)
+        .def_ro("consumers", &RecoveryTaskSnapshot::consumers)
+        .def_ro("pipeline_generation", &RecoveryTaskSnapshot::pipeline_generation)
+        .def_ro("active_recovery_id", &RecoveryTaskSnapshot::active_recovery_id)
+        .def_ro("fanin_count", &RecoveryTaskSnapshot::fanin_count)
+        .def_ro("fanin_released", &RecoveryTaskSnapshot::fanin_released)
+        .def_ro("fanout_total", &RecoveryTaskSnapshot::fanout_total)
+        .def_ro("fanout_released", &RecoveryTaskSnapshot::fanout_released)
+        .def_ro("output_key_count", &RecoveryTaskSnapshot::output_key_count);
+    nb::class_<RecoveryGraphSnapshot>(m, "RecoveryGraphSnapshot")
+        .def_ro("ticket", &RecoveryGraphSnapshot::ticket)
+        .def_ro("run_failed", &RecoveryGraphSnapshot::run_failed)
+        .def_ro("submission_closed", &RecoveryGraphSnapshot::submission_closed)
+        .def_ro("active_recoveries", &RecoveryGraphSnapshot::active_recoveries)
+        .def_ro("tasks", &RecoveryGraphSnapshot::tasks);
+
     // --- Worker ---
     // Bound as `_Worker` because the Python user-facing `Worker` factory
     // (simpler.worker.Worker) wraps this C++ class.
@@ -439,6 +525,14 @@ inline void bind_worker(nb::module_ &m) {
             "configure_operator_recovery", &Worker::configure_operator_recovery, nb::arg("enabled") = false,
             "Enable or disable L3 operator recovery before init (default false)."
         )
+        .def("pending_recoveries", &Worker::pending_recoveries)
+        .def(
+            "wait_for_recovery", &Worker::wait_for_recovery, nb::arg("timeout"),
+            nb::call_guard<nb::gil_scoped_release>()
+        )
+        .def("give_up_recovery", &Worker::give_up_recovery, nb::arg("ticket"), nb::arg("reason"))
+        .def("recovery_graph", &Worker::recovery_graph, nb::arg("ticket"), nb::call_guard<nb::gil_scoped_release>())
+        .def("cancel_recoveries", &Worker::cancel_recoveries)
         .def(
             "add_sub_worker",
             [](Worker &self, uint64_t mailbox_ptr, int child_pid) {

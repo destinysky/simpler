@@ -212,8 +212,14 @@ void Worker::init() {
     cfg.on_global_recovery_freeze_cb = [this](bool frozen) {
         orchestrator_.set_global_recovery_freeze(frozen);
     };
+    cfg.recovery_graph_cb = [this](const RecoveryTicket &ticket) {
+        return orchestrator_.recovery_graph(ticket);
+    };
     cfg.reservation_stall_sink = report_reservation_stall;
 
+    orchestrator_.set_recovery_cancel_callback([this](RunId run_id, const std::string &reason) {
+        scheduler_.cancel_run_recovery(run_id, reason);
+    });
     scheduler_.start(cfg);
     // Allocator compaction and scheduler slot access share this mutex.
     orchestrator_.set_scheduler_loop_mutex(&scheduler_.loop_mutex());

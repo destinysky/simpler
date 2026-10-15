@@ -17,6 +17,9 @@
 #include <string>
 
 #include "orchestration_api.h"
+
+extern "C" OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &);
+extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &);
 [[noreturn]] void assert_impl(const char *, const char *, int) { throw "assert_impl"; }
 
 namespace {
@@ -223,4 +226,34 @@ TEST(A5Fatal, AllocTensorConvenienceReportsInvalidArgsInsteadOfAsserting) {
     EXPECT_EQ(runtime.report_fatal_calls, 1);
     EXPECT_EQ(runtime.last_fatal_code, SIMPLER_ERROR_INVALID_ARGS);
     EXPECT_EQ(runtime.alloc_calls, 0);
+}
+
+TEST(A5RetainedFixture, HealthyMemberSubmitsDeviceWork) {
+    FakeRuntime runtime{};
+    runtime.ops = &kFakeOps;
+    RuntimeBindingGuard bind(reinterpret_cast<RuntimeContext *>(&runtime));
+    ChipTaskArgs args;
+    args.add_scalar(0);
+
+    EXPECT_EQ(aicpu_orchestration_config(args).expected_arg_count, 2);
+    aicpu_orchestration_entry(args);
+
+    EXPECT_EQ(runtime.submit_calls, 1);
+    EXPECT_FALSE(runtime.fatal);
+    EXPECT_EQ(runtime.report_fatal_calls, 0);
+}
+
+TEST(A5RetainedFixture, SelectedFatalMemberDoesNotSubmitHealthyWork) {
+    FakeRuntime runtime{};
+    runtime.ops = &kFakeOps;
+    RuntimeBindingGuard bind(reinterpret_cast<RuntimeContext *>(&runtime));
+    ChipTaskArgs args;
+    args.add_scalar(1);
+
+    aicpu_orchestration_entry(args);
+
+    EXPECT_TRUE(runtime.fatal);
+    EXPECT_EQ(runtime.report_fatal_calls, 1);
+    EXPECT_EQ(runtime.last_fatal_code, SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
+    EXPECT_EQ(runtime.submit_calls, 0);
 }
