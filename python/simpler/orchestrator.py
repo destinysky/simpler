@@ -307,6 +307,17 @@ class Orchestrator:
     # User-facing submit API
     # ------------------------------------------------------------------
 
+    def defer_dispatch_until_submitted(self) -> None:
+        """Hold this run's tasks until its graph callback has returned.
+
+        Call before any task submission/allocation. Direct control remains ordered
+        by the whole-run FIFO. Closing submission releases admission; callback
+        failure cancels unstarted tasks through the normal lifecycle. The complete
+        retained graph must fit the configured native task/heap capacity.
+        """
+        if not self._o._defer_run_dispatch():
+            raise RuntimeError("defer_dispatch_until_submitted must precede every task allocation/submission")
+
     def submit_next_level(
         self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int
     ) -> TaskHandle:

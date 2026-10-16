@@ -202,6 +202,17 @@ void Orchestrator::activate_fifo_head() {
     finish_run_if_ready(run);
 }
 
+bool Orchestrator::defer_run_dispatch() {
+    std::lock_guard<std::mutex> runs_lk(runs_mu_);
+    auto it = runs_.find(building_run_id_);
+    if (it == runs_.end()) return false;
+    auto run = it->second;
+    std::lock_guard<std::mutex> lk(run->completion_mu);
+    if (run->submission_closed || !run->task_slots.empty() || run->active_tasks.load() != 0) return false;
+    run->dispatch_after_submission = true;
+    return true;
+}
+
 void Orchestrator::close_run_submission(RunId run_id) {
     auto run = get_run(run_id);
     {
@@ -323,7 +334,8 @@ bool Orchestrator::dispatchable_locked(RunId run_id) const {
         return false;
     }
     std::lock_guard<std::mutex> recovery_lk(it->second->completion_mu);
-    return it->second->active_recoveries == 0;
+    return it->second->active_recoveries == 0 &&
+           (!it->second->dispatch_after_submission || it->second->submission_closed);
 }
 
 bool Orchestrator::can_dispatch_run(RunId run_id) const {

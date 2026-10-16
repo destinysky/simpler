@@ -363,6 +363,7 @@ inline void bind_worker(nb::module_ &m) {
         .def("_scope_begin", &Orchestrator::scope_begin)
         .def("_scope_end", &Orchestrator::scope_end)
         .def("_begin_run", &Orchestrator::begin_run, nb::call_guard<nb::gil_scoped_release>())
+        .def("_defer_run_dispatch", &Orchestrator::defer_run_dispatch)
         .def("_close_run_submission", &Orchestrator::close_run_submission, nb::arg("run_id"))
         .def(
             "_fail_run_submission",

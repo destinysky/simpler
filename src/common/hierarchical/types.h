@@ -158,6 +158,8 @@ struct RunState {
     uint32_t active_recoveries{0};
     std::exception_ptr first_error;
     std::vector<TaskSlot> task_slots;
+    // Opt-in whole-graph admission; protected by completion_mu.
+    bool dispatch_after_submission{false};
     bool submission_closed{false};
     bool submission_failed{false};
     bool lease_released{false};

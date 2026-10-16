@@ -140,6 +140,8 @@ public:
     // Only the calling orchestration thread builds a run at a time.
     RunId begin_run();
     void configure_pipeline_depth(uint32_t depth);
+    // Must precede every task allocation/submission in this run.
+    bool defer_run_dispatch();
     void close_run_submission(RunId run_id);
     void fail_run_submission(RunId run_id, std::exception_ptr error = nullptr);
     void wait_run_accepted(RunId run_id);
