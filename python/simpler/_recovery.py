@@ -36,6 +36,22 @@ def _identity(execution):
     )
 
 
+def _transaction_key(packet):
+    binding = packet.before
+    return (
+        packet.recovery_id,
+        packet.endpoint_generation,
+        packet.impact,
+        packet.has_domain,
+        binding.allocation_id,
+        binding.generation,
+        binding.device_ctx,
+        binding.local_window_base,
+        binding.window_size,
+        binding.workspace,
+    )
+
+
 class EndpointRecoverySession:
     def __init__(self, native, comm_handle):
         self.native = native
@@ -51,7 +67,7 @@ class EndpointRecoverySession:
         if packet.endpoint_generation != endpoint_generation or packet.recovery_id == 0:
             raise RuntimeError("stale endpoint recovery identity")
         phase = packet.phase
-        key = (packet.recovery_id, packet.endpoint_generation)
+        key = _transaction_key(packet)
         if phase == Phase.INSPECT:
             if self.key is not None and packet.recovery_id <= self.key[0]:
                 raise RuntimeError("duplicate or stale resource recovery transaction")
@@ -70,18 +86,18 @@ class EndpointRecoverySession:
                 ExecutionRecoveryStatus.ALREADY_RECOVERED,
             ):
                 raise RuntimeError("healthy endpoint execution substrate is not idle and reusable")
-            self.key, self.execution, self.faulted = key, execution, faulted
-            self.domain = None
-            self.snapshot = None
+            snapshot = None
             if packet.has_domain:
-                self.snapshot = self.native.comm_recovery_snapshot(self.comm_handle(), packet.before.allocation_id)
+                snapshot = self.native.comm_recovery_snapshot(self.comm_handle(), packet.before.allocation_id)
                 if (
-                    not self.snapshot["allocation_present"]
-                    or self.snapshot["device_ctx"] != packet.before.device_ctx
-                    or self.snapshot["local_window_base"] != packet.before.local_window_base
-                    or self.snapshot["workspace_addr"] != packet.before.workspace
+                    not snapshot["allocation_present"]
+                    or snapshot["device_ctx"] != packet.before.device_ctx
+                    or snapshot["local_window_base"] != packet.before.local_window_base
+                    or snapshot["workspace_addr"] != packet.before.workspace
                 ):
                     raise RuntimeError("retained communication binding no longer matches its domain")
+            self.key, self.execution, self.faulted = key, execution, faulted
+            self.domain, self.snapshot = None, snapshot
         elif self.key != key:
             raise RuntimeError("wrong resource recovery transaction")
         elif phase == Phase.ABORT:

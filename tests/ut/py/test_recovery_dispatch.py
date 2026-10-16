@@ -174,6 +174,44 @@ def test_wrong_or_duplicate_resource_ticket_is_rejected():
         session.handle(wrong, True, 1)
 
 
+@pytest.mark.parametrize("phase", [Phase.PREPARE, Phase.REARM, Phase.ABORT])
+def test_resource_transaction_cannot_change_scope_or_binding(phase):
+    native = Native()
+    session = EndpointRecoverySession(native, lambda: 9)
+    session.handle(packet(Phase.INSPECT), True, 1)
+    if phase != Phase.PREPARE:
+        session.handle(packet(Phase.PREPARE), True, 1)
+        session.handle(packet(Phase.COMMIT), True, 1)
+    before = (session.key, session.phase, list(native.calls))
+    changes = [("has_domain", 0), ("impact", DomainRecoveryImpact.EXECUTION_ONLY)]
+    changes.extend(
+        (name, getattr(packet(phase).before, name) + 1)
+        for name in ("allocation_id", "generation", "device_ctx", "local_window_base", "window_size", "workspace")
+    )
+    for name, value in changes:
+        wrong = packet(phase)
+        target = wrong if name in ("impact", "has_domain") else wrong.before
+        setattr(target, name, value)
+        with pytest.raises(RuntimeError, match="wrong resource recovery transaction"):
+            session.handle(wrong, True, 1)
+        assert (session.key, session.phase, native.calls) == before, name
+    # Rejected packets neither advance the session nor reach the provider.
+    session.handle(packet(phase), True, 1)
+
+
+def test_failed_inspect_does_not_consume_transaction_identity():
+    native = Native()
+    session = EndpointRecoverySession(native, lambda: 9)
+    wrong = packet(Phase.INSPECT)
+    wrong.before.workspace += 1
+    with pytest.raises(RuntimeError, match="binding no longer matches"):
+        session.handle(wrong, True, 1)
+    assert session.key is None and session.phase is None and not native.calls
+    session.handle(packet(Phase.INSPECT), True, 1)
+    session.handle(packet(Phase.PREPARE), True, 1)
+    assert native.calls == [DomainRecoveryPhase.PREPARE]
+
+
 def test_healthy_member_transport_recovery_does_not_invent_execution_failure():
     native = Native()
     native.execution.status = ExecutionRecoveryStatus.INVALID_STATE

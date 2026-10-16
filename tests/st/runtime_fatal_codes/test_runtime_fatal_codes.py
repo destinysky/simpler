@@ -402,23 +402,6 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.timeout(90)
-def test_a5_explicit_fatal_quiescence_probe(st_platform, st_device_ids, monkeypatch):
-    """Manual Experiment 1: emit INFO-level PTO shutdown markers for one cooperative fatal run."""
-    configure_logging("info")
-    worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), "explicit_fatal", monkeypatch)
-    try:
-        with pytest.raises(RuntimeError):
-            worker.run(handle, None, config)
-        _flush_host_log(2000)
-    finally:
-        worker.close()
-        _flush_host_log(2000)
-
-
-@pytest.mark.platforms(["a5"])
-@pytest.mark.device_count(1)
-@pytest.mark.runtime(RUNTIME)
-@pytest.mark.timeout(90)
 def test_a5_explicit_fatal_same_stream_reuse_probe(st_platform, st_device_ids, capfd):
     """Explicit recovery preserves one Worker, both Contexts, and execution streams."""
     _check_a5_same_stream_recovery(st_platform, st_device_ids, capfd, "explicit_fatal")
@@ -816,7 +799,7 @@ def _sdma_transaction_log(rank, phase, **fields):
     )
 
 
-def _sdma_domain_recovery_rank(device_id, rank, rootinfo, barrier, outcomes, result_queue, use_binding_plan=False):  # noqa: PLR0915
+def _sdma_domain_recovery_rank(device_id, rank, rootinfo, barrier, outcomes, result_queue):  # noqa: PLR0915
     """Formal local transaction and ordering regression; no transport-fault injection."""
     from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
@@ -1016,58 +999,56 @@ def _sdma_domain_recovery_rank(device_id, rank, rootinfo, barrier, outcomes, res
         snapshot("AFTER_RECOVERY")
         assert all_members_succeeded(recovered.status == ExecutionRecoveryStatus.RECOVERED)
 
-        new_b_args = b_args
-        if use_binding_plan:
-            original = RecoveryDomainBinding()
-            original.allocation_id = 0
-            original.generation = 1
-            original.device_ctx = device_ctx
-            original.local_window_base = base
-            original.window_size = 4 * 1024 * 1024
-            original.workspace = before["workspace_addr"]
-            plan = RecoveryBindingPlan(committed.recovery_id)
-            plan.add_domain(rank, original, committed)
+        original = RecoveryDomainBinding()
+        original.allocation_id = 0
+        original.generation = 1
+        original.device_ctx = device_ctx
+        original.local_window_base = base
+        original.window_size = 4 * 1024 * 1024
+        original.workspace = before["workspace_addr"]
+        plan = RecoveryBindingPlan(committed.recovery_id)
+        plan.add_domain(rank, original, committed)
 
-            def bindings_for(output, marker):
-                binding = TaskDomainBinding()
-                binding.domain = original
-                arguments = []
-                for kind, index, offset in (
-                    (RecoveryArgKind.WINDOW_TENSOR, 0, 0),
-                    (RecoveryArgKind.WINDOW_TENSOR, 1, output - base),
-                    (RecoveryArgKind.WINDOW_TENSOR, 2, marker - base),
-                    (RecoveryArgKind.COMM_CONTEXT, 0, 0),
-                    (RecoveryArgKind.WINDOW_ADDRESS, 1, 0x40000),
-                ):
-                    argument = RecoveryArgBinding()
-                    argument.kind, argument.index, argument.offset = kind, index, offset
-                    arguments.append(argument)
-                binding.arguments = arguments
-                return [binding]
+        def bindings_for(output, marker):
+            binding = TaskDomainBinding()
+            binding.domain = original
+            arguments = []
+            for kind, index, offset in (
+                (RecoveryArgKind.WINDOW_TENSOR, 0, 0),
+                (RecoveryArgKind.WINDOW_TENSOR, 1, output - base),
+                (RecoveryArgKind.WINDOW_TENSOR, 2, marker - base),
+                (RecoveryArgKind.COMM_CONTEXT, 0, 0),
+                (RecoveryArgKind.WINDOW_ADDRESS, 1, 0x40000),
+            ):
+                argument = RecoveryArgBinding()
+                argument.kind, argument.index, argument.offset = kind, index, offset
+                arguments.append(argument)
+            binding.arguments = arguments
+            return [binding]
 
-            a_bindings = bindings_for(a_out, a_marker)
-            b_bindings = bindings_for(b_out, b_marker)
-            bound_a = plan.rebind_materialized(retry_args, a_bindings, rank)
-            bound_b = plan.rebind_materialized(b_args, b_bindings, rank)
-            assert a_bindings[0].domain.generation == b_bindings[0].domain.generation == 1
-            assert bound_a.domain_bindings[0].domain.generation == bound_b.domain_bindings[0].domain.generation == 2
-            assert bound_a.args.scalar(0) == retry_args.scalar(0) == device_ctx
-            assert bound_b.args.scalar(1) == b_args.scalar(1) == base + 0x40000
-            assert (
-                plan.rebind_materialized(bound_a.args, bound_a.domain_bindings, rank)
-                .domain_bindings[0]
-                .domain.generation
-                == 2
-            )
-            retry_args, new_b_args = bound_a.args, bound_b.args
-            _sdma_transaction_log(
-                rank,
-                "BINDING_PLAN_APPLIED",
-                previous_generation=1,
-                generation=2,
-                recovery_id=plan.recovery_id,
-                addresses_preserved=True,
-            )
+        a_bindings = bindings_for(a_out, a_marker)
+        b_bindings = bindings_for(b_out, b_marker)
+        bound_a = plan.rebind_materialized(retry_args, a_bindings, rank)
+        bound_b = plan.rebind_materialized(b_args, b_bindings, rank)
+        assert a_bindings[0].domain.generation == b_bindings[0].domain.generation == 1
+        assert bound_a.domain_bindings[0].domain.generation == bound_b.domain_bindings[0].domain.generation == 2
+        assert bound_a.args.scalar(0) == retry_args.scalar(0) == device_ctx
+        assert bound_b.args.scalar(1) == b_args.scalar(1) == base + 0x40000
+        assert (
+            plan.rebind_materialized(bound_a.args, bound_a.domain_bindings, rank)
+            .domain_bindings[0]
+            .domain.generation
+            == 2
+        )
+        retry_args, b_args = bound_a.args, bound_b.args
+        _sdma_transaction_log(
+            rank,
+            "BINDING_PLAN_APPLIED",
+            previous_generation=1,
+            generation=2,
+            recovery_id=plan.recovery_id,
+            addresses_preserved=True,
+        )
 
         write(base, (ctypes.c_float * 16384)(*([200.0 + rank] * 16384)))
         write(a_out, (ctypes.c_float * 16384)(*([-91.0] * 16384)))
@@ -1083,7 +1064,7 @@ def _sdma_domain_recovery_rank(device_id, rank, rootinfo, barrier, outcomes, res
         with pytest.raises(RuntimeError):
             queued.activate()
         assert not queued.launched
-        successor = submit(transfer_id, new_b_args, 1, 2, 5)
+        successor = submit(transfer_id, b_args, 1, 2, 5)
         assert successor.wait(30)
         check_data(b_out, 301.0 - rank)
         assert read_words(b_marker)[:3] == [1, 1, 1] and read_words(base + 0x40000, 1) == [2]
@@ -1114,23 +1095,13 @@ def _sdma_domain_recovery_rank(device_id, rank, rootinfo, barrier, outcomes, res
 @pytest.mark.device_count(2)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.timeout(300)
-def test_a5_sdma_domain_recovery(st_device_ids, tmp_path):
-    """Explicit PREPARE/COMMIT, preserved resources, and real SDMA A-before-B replay."""
-    _run_sdma_domain_recovery(st_device_ids, tmp_path)
-
-
-@pytest.mark.manual
-@pytest.mark.platforms(["a5"])
-@pytest.mark.device_count(2)
-@pytest.mark.runtime(RUNTIME)
-@pytest.mark.timeout(300)
 def test_a5_sdma_recovery_binding_plan(st_device_ids, tmp_path):
     """Rebind retained materialized args to the committed domain generation, then execute real SDMA."""
-    _run_sdma_domain_recovery(st_device_ids, tmp_path, use_binding_plan=True)
+    _run_sdma_domain_recovery(st_device_ids, tmp_path)
     print("[PTO_RECOVERY_TEST] RECOVERY_BINDING_PLAN_SDMA_PASS", flush=True)
 
 
-def _run_sdma_domain_recovery(st_device_ids, tmp_path, use_binding_plan=False):
+def _run_sdma_domain_recovery(st_device_ids, tmp_path):
     assert len(st_device_ids) == 2
     ctx = mp.get_context("spawn")
     barrier = ctx.Barrier(2)
@@ -1139,7 +1110,7 @@ def _run_sdma_domain_recovery(st_device_ids, tmp_path, use_binding_plan=False):
     ranks = [
         ctx.Process(
             target=_sdma_domain_recovery_rank,
-            args=(int(st_device_ids[r]), r, str(tmp_path / "sdma.bin"), barrier, outcomes, results, use_binding_plan),
+            args=(int(st_device_ids[r]), r, str(tmp_path / "sdma.bin"), barrier, outcomes, results),
         )
         for r in range(2)
     ]

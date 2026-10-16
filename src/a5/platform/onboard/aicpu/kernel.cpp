@@ -138,9 +138,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_platform_phase_base(k_args->device_wall_data_base);
     AicpuPhaseScope run_wall(AicpuPhase::RunWall);
 
-    const int32_t exec_idx = platform_aicpu_affinity_thread_idx();
     int rc = aicpu_execute(runtime);
-    LOG_INFO("[PTO_RECOVERY_PROBE] AICPU_ENTRY_RETURN exec_idx=%d rc=%d", exec_idx, rc);
     if (rc != 0) {
         LOG_ERROR("simpler_aicpu_exec: aicpu_execute failed with rc=%d", rc);
         return rc;

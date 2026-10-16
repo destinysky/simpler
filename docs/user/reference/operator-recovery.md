@@ -55,7 +55,7 @@ epochs are local. The cross-host control plane owns agreement, deadlines and
 failure decisions. No filesystem marker or HCCL barrier implements recovery
 agreement inside the backend. COMMIT is a local resource transaction acknowledgment,
 not a distributed task/result commit. The owner must keep admissions fenced through
-all-member acknowledgment; Step7 replay eligibility and Step8 dispatch remain separate.
+all-member acknowledgment; replay eligibility and logical task dispatch remain separate.
 
 `DomainRecoveryResult` (ABI 2, 136 bytes) includes `transport_channel_count`,
 `stopped_channel_count`, and `transport_stopped`. These describe local provider
@@ -289,8 +289,11 @@ logical-op metadata. No numeric address search infers bindings.
 The transaction keeps ordinary dispatch frozen:
 
 1. INSPECT every member and validate current endpoint identity, failed PTO
-   retirement proof, and unchanged communication binding. Host TASK_DONE alone
-   grants no DMA stop proof.
+   retirement proof, and unchanged communication binding. Each endpoint freezes
+   the recovery id, endpoint generation, impact, domain presence and complete old
+   binding for the transaction. Later phases, including ABORT, reject any change
+   before calling a provider. A rejected INSPECT does not consume the identity.
+   Host TASK_DONE alone grants no DMA stop proof.
 2. PREPARE all domains; only matching all-member acknowledgments permit COMMIT.
    The current SDMA provider aborts its private transport streams and rearms in
    place. Context C/E, execution streams, HCCL and windows are preserved.
@@ -373,8 +376,10 @@ does not exclude `DEVICE_USE_ONLY` streams; the A5 restriction concerns
 `ACL_STREAM_PERSISTENT`, which this manager does not use. Older SDK contracts
 must be checked separately; absence of the Abort symbol returns failure.
 
-SDMA transport recovery preserves window contents. The regression separately
-proves fresh SDMA data movement and failed-A / blocked-old-B / new-A / new-B ordering.
+SDMA transport recovery preserves window contents. The combined
+`test_a5_sdma_recovery_binding_plan` regression checks PREPARE/COMMIT gates,
+materialized argument rebinding, fresh SDMA data movement and
+failed-A / blocked-old-B / new-A / new-B ordering in one two-rank run.
 `test_recovery_dispatch.py` now uses an AIV kernel-reported async error (101)
 before rank0 publishes an SDMA ready notification. Rank1 has already sent its
 entry notification and waits on its real completion counter. That peer can only
