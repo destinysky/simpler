@@ -147,6 +147,14 @@ void Scheduler::start(const Config &cfg) {
     stop_requested_.store(false, std::memory_order_relaxed);
     running_.store(true, std::memory_order_release);
     sched_thread_ = std::thread(&Scheduler::run, this);
+    try {
+        if (cfg_.operator_recovery_enabled && cfg_.automatic_operator_recovery)
+            recovery_thread_ = std::thread(&Scheduler::coordinate_recovery, this);
+    } catch (...) {
+        request_stop();
+        sched_thread_.join();
+        throw;
+    }
 }
 
 void Scheduler::request_stop() {
@@ -163,6 +171,7 @@ void Scheduler::request_stop() {
 void Scheduler::stop() {
     request_stop();
 
+    if (recovery_thread_.joinable()) recovery_thread_.join();
     if (sched_thread_.joinable()) sched_thread_.join();
 
     running_.store(false, std::memory_order_release);

@@ -38,6 +38,7 @@ public:
     ChipRun() = default;
 
     bool done();
+    void request_stop();
     bool wait_until(Deadline deadline);
     void activate();
     void abandon();

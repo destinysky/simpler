@@ -484,6 +484,7 @@ WorkerThread::submit_dispatch(WorkerDispatch d, LaneKind lane_kind, RunId expect
             return SubmitDispatchResult::STAGED_IDENTITY_CHANGED;
         }
         dispatch_lane.dispatch_id = d.dispatch_id;
+        dispatch_lane.task_slot = d.task_slot;
     }
     ++next_dispatch_id_;
     inflight_.fetch_add(1, std::memory_order_release);
@@ -539,6 +540,14 @@ bool WorkerThread::has_staged_run(RunId run_id) const {
     std::lock_guard<std::mutex> lane_lk(lane_mu_);
     const LaneState &staged = lane(LaneKind::STAGED);
     return staged.occupied && staged.run_id == run_id;
+}
+
+uint64_t WorkerThread::active_dispatch_id(RunId run_id, TaskSlot task_slot) const {
+    std::lock_guard<std::mutex> lk(lane_mu_);
+    const auto &active = lanes_[0];
+    if (!active.occupied || active.task_slot != task_slot || ring_->slot_state(task_slot)->run_id != run_id)
+        throw std::logic_error("stop target is not the current active dispatch");
+    return active.dispatch_id;
 }
 
 bool WorkerThread::can_stage() const {
@@ -696,6 +705,7 @@ void WorkerThread::finish_progress_dispatch(const WorkerEndpointProgress &progre
     }
 #endif
     WorkerCompletion completion = progress.completion;
+    completion.dispatch_id = dispatch.dispatch_id;
     if (accepted_dispatch_ids_.erase(dispatch.dispatch_id) == 0) {
         // This advances only the run-level waiter after a terminal endpoint
         // result. It does not manufacture the per-frame launch marker: that

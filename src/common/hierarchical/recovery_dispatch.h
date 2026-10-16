@@ -8,7 +8,7 @@
 #include "../worker/runtime_c_api.h"
 #include "../task_interface/recovery_domain_binding.h"
 
-enum class RecoveryControlPhase : uint32_t { INSPECT, PREPARE, COMMIT, REARM, ARM, ABORT };
+enum class RecoveryControlPhase : uint32_t { INSPECT, PREPARE, COMMIT, REARM, ARM, ABORT, STOP };
 
 // Local control payload; both processes use the native codec, never Python offsets.
 struct RecoveryControlPacket {
@@ -20,6 +20,14 @@ struct RecoveryControlPacket {
     DomainRecoveryImpact impact{DomainRecoveryImpact::EXECUTION_ONLY};
     uint32_t has_domain{0};
     uint32_t faulted{0};
+    uint64_t run_id{0};
+    int32_t task_slot{-1};
+    int32_t group_index{0};
+    uint64_t pipeline_generation{0};
+    uint64_t dispatch_id{0};
+    // ACCEPTED is only request delivery; terminal outcome and stop proof follow separately.
+    uint32_t stop_accepted{0};
+    uint32_t reserved{0};
     RecoveryDomainBinding before{};
     ExecutionRecoveryResult execution{};
     DomainRecoveryResult domain{};

@@ -38,6 +38,7 @@
 
 #pragma once
 
+#include "task_interface/execution_control.h"
 #include <stddef.h>
 
 #include "utils/device_arena.h"
@@ -164,9 +165,10 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
     // 0: pending, -1: a shutdown prerequisite failed, 1: all participants
     // acknowledged and RuntimeContext/AicpuExecutor retirement completed.
     std::atomic<int32_t> execution_quiesced;
+    ExecutionStopControl execution_stop;
 };
 
-static_assert(sizeof(SharedMemoryHeader) == 896, "SharedMemoryHeader layout drift");
+static_assert(sizeof(SharedMemoryHeader) == 960, "SharedMemoryHeader layout drift");
 static_assert(offsetof(SharedMemoryHeader, total_size) == 776, "SharedMemoryHeader total_size layout drift");
 static_assert(offsetof(SharedMemoryHeader, orch_error_code) == 784, "SharedMemoryHeader orch_error_code layout drift");
 static_assert(

@@ -76,6 +76,7 @@ def test_a5_retained_l3_graph(st_device_ids, close_held):  # noqa: PLR0915 -- on
         device_ids=list(st_device_ids),
         num_sub_workers=1,
         enable_operator_recovery=True,
+        automatic_operator_recovery=False,
     )
 
     def build_gate(_args):

@@ -107,6 +107,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _worker_host_mapped_region_peek_cleanup_error,
     _write_recovery_binding,
     _write_recovery_control,
+    _write_recovery_stop_ack,
     get_element_size,
     materialize_task_args,
     read_args_from_blob,
@@ -119,7 +120,7 @@ from _task_interface import (
 )
 
 from . import _log as _simpler_log
-from ._recovery import EndpointRecoverySession, capture_binding
+from ._recovery import EndpointRecoverySession, capture_binding, validate_stop_identity
 from .buffer import (
     OWNER_INSTANCE_ID_BYTES,
     AccessMode,
@@ -2254,6 +2255,7 @@ def _run_mailbox_loop(  # noqa: PLR0912 -- task/control/held-fault ownership sha
     handle_control,
     on_shutdown=None,
     hold_native_fault: bool = False,
+    poll_task=None,
 ) -> None:
     """The mailbox state machine every forked child runs.
 
@@ -2267,6 +2269,10 @@ def _run_mailbox_loop(  # noqa: PLR0912 -- task/control/held-fault ownership sha
     only the caller knows its own context. The pair is published to the
     mailbox error region *before* the DONE state, so the parent never observes
     completion without the matching error report.
+
+    With `poll_task`, a started task may return None. Progress then supplies its
+    terminal pair while control requests remain serviceable; STOP delivery does
+    not publish TASK_DONE.
 
     `on_shutdown()` runs on SHUTDOWN before the loop exits, for children that
     own a nested Worker; per-child resource teardown that must survive an
@@ -2290,6 +2296,18 @@ def _run_mailbox_loop(  # noqa: PLR0912 -- task/control/held-fault ownership sha
     task_buf = buf[MAILBOX_FRAME_SIZE : 2 * MAILBOX_FRAME_SIZE]
     task_state_addr = _buffer_field_addr(task_buf, _OFF_STATE)
     faulted_wait_decision = False
+    task_running = False
+
+    def publish_task(result):
+        nonlocal task_running, faulted_wait_decision
+        code, msg = result
+        _write_error(task_buf, code, msg)
+        _mailbox_store_i32(task_state_addr, _TASK_DONE)
+        task_running = False
+        if hold_native_fault and code:
+            raw_rc, runtime_status = struct.unpack_from("<ii", task_buf, _OFF_NATIVE_EXECUTION_FAULT)
+            faulted_wait_decision = raw_rc != 0 or runtime_status != 0
+
     try:
         while True:
             state = _mailbox_load_i32(state_addr)
@@ -2297,14 +2315,19 @@ def _run_mailbox_loop(  # noqa: PLR0912 -- task/control/held-fault ownership sha
                 if on_shutdown is not None:
                     on_shutdown()
                 break
-            if not faulted_wait_decision and _mailbox_load_i32(task_state_addr) == _TASK_READY:
-                code, msg = handle_task(task_buf)
-                _write_error(task_buf, code, msg)
-                _mailbox_store_i32(task_state_addr, _TASK_DONE)
-                if hold_native_fault and code:
-                    raw_rc, runtime_status = struct.unpack_from("<ii", task_buf, _OFF_NATIVE_EXECUTION_FAULT)
-                    faulted_wait_decision = raw_rc != 0 or runtime_status != 0
-            elif state == _CONTROL_REQUEST:
+            if task_running:
+                result = poll_task(task_buf)
+                if result is not None:
+                    publish_task(result)
+            if not task_running and not faulted_wait_decision and _mailbox_load_i32(task_state_addr) == _TASK_READY:
+                result = handle_task(task_buf)
+                if result is None:
+                    if poll_task is None:
+                        raise RuntimeError("asynchronous task has no progress owner")
+                    task_running = True
+                else:
+                    publish_task(result)
+            if state == _CONTROL_REQUEST:
                 sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
                 if faulted_wait_decision and sub_cmd not in (_CTRL_RELEASE_FAULTED_ENDPOINT, _CTRL_RECOVER_ENDPOINT):
                     code, msg = 1, "faulted endpoint awaits L3 recovery decision"
@@ -2975,6 +2998,9 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     held_recovery_id = [0]
     recovery_session = EndpointRecoverySession(cw._impl, lambda: _comm_base_handle(cw)) if hold_native_fault else None
     replay_armed = [False]
+    active_run = [None]
+    active_identity = [None]
+    stop_recovery_id = [0]
 
     def read_task_config(
         task_buf: memoryview,
@@ -3003,10 +3029,11 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         diagnostic_capture_index += 1
         return cfg
 
-    def handle_task(task_buf) -> tuple[int, str]:
+    def handle_task(task_buf) -> tuple[int, str] | None:
         if replay_armed[0]:
             replay_armed[0] = faulted[0] = False
             held_endpoint_generation[0] = held_recovery_id[0] = 0
+            stop_recovery_id[0] = 0
         task_addr = ctypes.addressof(ctypes.c_char.from_buffer(task_buf))
         digest = _read_task_digest(task_buf)
         frame_identity = _read_task_frame_identity(task_buf)
@@ -3046,6 +3073,22 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             chip_args = materialize_task_args(args, resolved)
             # The acceptance flag lives in the mailbox, not in the materialized args, so
             # the fence still publishes through the address the parent polls.
+            if hold_native_fault:
+                active_identity[0] = frame_identity
+                active_run[0] = cw._impl._submit_chip_run_materialized(
+                    cid,
+                    chip_args,
+                    cfg,
+                    pipeline_slot,
+                    pipeline_generation,
+                    frame_identity[1],
+                    frame_identity[4],
+                    task_addr + _OFF_ACCEPTED,
+                    _TASK_ACCEPTED,
+                    True,
+                    task_addr + _OFF_NATIVE_EXECUTION_FAULT,
+                )
+                return None
             cw._impl.run_materialized(
                 cid,
                 chip_args,
@@ -3060,6 +3103,9 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             code = 1
             msg = _format_exc(f"chip_process dev={device_id}", e)
 
+        return finish_task(task_buf, code, msg)
+
+    def finish_task(task_buf, code, msg):
         # On a successful kernel run, give the caller a chance to do
         # post-run work (e.g. store_to_host D2H staging) before the
         # parent sees TASK_DONE. The kernel's failure path skips the
@@ -3072,8 +3118,27 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             faulted[0] = raw_rc != 0 or runtime_status != 0
             if faulted[0]:
                 held_endpoint_generation[0] = endpoint_generation
-                held_recovery_id[0] = 0
+                held_recovery_id[0] = stop_recovery_id[0]
         return code, msg
+
+    def poll_task(task_buf):
+        try:
+            if not active_run[0].done():
+                return None
+            # done() retires the native run but deliberately does not rethrow its fault.
+            active_run[0].wait(0)
+            result = finish_task(task_buf, 0, "")
+        except Exception as error:  # noqa: BLE001
+            result = finish_task(task_buf, 1, _format_exc(f"chip_process dev={device_id}", error))
+        active_run[0] = None
+        return result
+
+    def shutdown_active_task():
+        if active_run[0] is not None:
+            with contextlib.suppress(Exception):
+                active_run[0].request_stop()
+            cw._impl._close_chip_run_lane()
+            active_run[0] = None
 
     def bind_held_recovery_action() -> tuple[int, int]:
         recovery_id = struct.unpack_from("<Q", buf, _CTRL_OFF_RECOVERY_ID)[0]
@@ -3096,6 +3161,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         code = 0
         msg = ""
         try:
+            if active_run[0] is not None and sub_cmd != _CTRL_RECOVER_ENDPOINT:
+                raise RuntimeError("active native generation only accepts an identity-fenced STOP request")
             if sub_cmd == _CTRL_RECOVER_ENDPOINT:
                 staged, staged_buf, size = _open_ctrl_payload(buf, what="Endpoint recovery")
                 try:
@@ -3104,6 +3171,24 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     if not hold_native_fault:
                         raise RuntimeError("operator recovery is disabled")
                     assert recovery_session is not None
+                    if packet.phase == _RecoveryControlPhase.STOP:
+                        validate_stop_identity(packet, active_identity[0], endpoint_generation, stop_recovery_id[0])
+                        stop_recovery_id[0] = packet.recovery_id
+                        if active_run[0] is not None:
+                            active_run[0].request_stop()
+                        elif faulted[0]:
+                            held_recovery_id[0] = packet.recovery_id
+                        _write_recovery_stop_ack(address, size)
+                        struct.pack_into("Q", buf, _CTRL_OFF_RESULT, 0)
+                        print(
+                            f"[PTO_RECOVERY] STOP_DELIVERED recovery_id={packet.recovery_id} "
+                            f"dispatch_id={packet.dispatch_id} group_index={packet.group_index} "
+                            f"active={int(active_run[0] is not None)}",
+                            flush=True,
+                        )
+                        return 0, ""
+                    if active_run[0] is not None:
+                        raise RuntimeError("resource recovery requires a retired native generation")
                     if faulted[0]:
                         if packet.endpoint_generation != held_endpoint_generation[0]:
                             raise RuntimeError("stale held endpoint generation")
@@ -3510,6 +3595,8 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 handle_task=handle_task,
                 handle_control=handle_control,
                 hold_native_fault=hold_native_fault,
+                poll_task=poll_task if hold_native_fault else None,
+                on_shutdown=shutdown_active_task if hold_native_fault else None,
             )
     finally:
         _teardown_chip_process_resources(import_registry, cw, global_domain_store, provider_region_store)
@@ -8014,14 +8101,21 @@ class Worker:
             return self._worker.assess_replay(ticket)
 
     def retry_recovery(
-        self, ticket, *, max_retries: int = 1, backoff_s: float = 0.0,
-        impact=None, control_timeout_s: float = 30.0,
+        self,
+        ticket,
+        *,
+        max_retries: int = 1,
+        backoff_s: float = 0.0,
+        impact=None,
+        control_timeout_s: float = 30.0,
     ) -> bool:
         """Recover one terminal local group and dispatch a fresh attempt on its original slot."""
         if impact is None:
             impact = DomainRecoveryImpact.DOMAIN_TRANSPORT
         with self._operation_lease("retry_recovery"):
             self._require_retained_recovery()
+            if self._config.get("automatic_operator_recovery", True):
+                raise RuntimeError("retry policy is owned by the automatic RecoveryCoordinator")
             if self._live_domains:
                 raise RuntimeError("replay requires run-scoped domains released by the closed graph")
             return self._worker.retry_recovery(ticket, max_retries, backoff_s, impact, control_timeout_s)
@@ -8030,6 +8124,8 @@ class Worker:
         """End a terminal-member episode through the ordinary failure lifecycle."""
         with self._operation_lease("give_up_recovery"):
             self._require_retained_recovery()
+            if self._config.get("automatic_operator_recovery", True):
+                raise RuntimeError("give-up policy is owned by the automatic RecoveryCoordinator")
             return bool(self._worker.give_up_recovery(ticket, reason))
 
     def _require_retained_recovery(self) -> None:
@@ -8223,6 +8319,15 @@ class Worker:
         # deadline check keeps a just-over-budget attach from committing READY.
         if _monotonic() >= deadline:
             raise RuntimeError("remote L3 activation: startup deadline exceeded after attach")
+
+    def _configure_native_recovery(self, native):
+        native.configure_operator_recovery(self._effective_operator_recovery)
+        if self._effective_operator_recovery and self._config.get("automatic_operator_recovery", True):
+            native.configure_automatic_recovery(
+                int(self._config.get("operator_recovery_max_retries", 1)),
+                float(self._config.get("operator_recovery_backoff_s", 0.0)),
+                float(self._config.get("operator_recovery_timeout_s", 30.0)),
+            )
 
     def _start_hierarchical(self) -> None:  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
         """Fork every local child, await the subtree, register endpoints, start the scheduler.
@@ -8468,7 +8573,7 @@ class Worker:
         dw = self._worker
         assert dw is not None
         dw.configure_pipeline_depth(direct_chip_pipeline_depth)
-        dw.configure_operator_recovery(self._effective_operator_recovery)
+        self._configure_native_recovery(dw)
 
         # Register chip workers as NEXT_LEVEL (L3). The child pid lets the C++
         # endpoint fail a dispatch whose child died instead of spinning on a

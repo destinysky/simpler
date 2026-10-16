@@ -563,6 +563,7 @@ def test_local_task_frame_count_uses_direct_a2a3_pipeline_depth(platform, runtim
     [
         ("a5", {}, False, (1,1)),
         ("a5", {"enable_operator_recovery": True}, True, (1,1)),
+        ("a5", {"enable_operator_recovery": True, "automatic_operator_recovery": False}, True, (1,1)),
         ("a2a3", {"enable_operator_recovery": True}, False, (2,1)),
         ("a5sim", {"enable_operator_recovery": True}, False, (1,1)),
     ],
@@ -574,6 +575,7 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(
         def __init__(self) -> None:
             self.configured_depths: list[int] = []
             self.operator_recovery_values: list[bool] = []
+            self.automatic_recovery_values: list[tuple[int, float, float]] = []
             self.next_level_calls: list[tuple[int, int, int]] = []
             self.initialized = False
 
@@ -582,6 +584,9 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(
 
         def configure_operator_recovery(self, enabled: bool = False) -> None:
             self.operator_recovery_values.append(bool(enabled))
+
+        def configure_automatic_recovery(self, max_retries: int, backoff_s: float, timeout_s: float) -> None:
+            self.automatic_recovery_values.append((max_retries, backoff_s, timeout_s))
 
         def add_next_level_worker(self, mailbox_addr: int, pid: int, task_frame_count: int) -> None:
             self.next_level_calls.append((int(mailbox_addr), int(pid), int(task_frame_count)))
@@ -640,6 +645,8 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(
 
     assert fake_parent.configured_depths == [1]
     assert fake_parent.operator_recovery_values == [expected_operator_recovery]
+    automatic = expected_operator_recovery and worker_config.get("automatic_operator_recovery", True)
+    assert fake_parent.automatic_recovery_values == ([(1, 0.0, 30.0)] if automatic else [])
     assert [call[1:] for call in fake_parent.next_level_calls] == [
         (12001, expected_frame_counts[0]),
         (12002, expected_frame_counts[1]),

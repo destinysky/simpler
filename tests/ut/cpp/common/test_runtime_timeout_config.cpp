@@ -17,6 +17,7 @@
 
 #include "common/platform_config.h"
 #include "host/runtime_timeout_config.h"
+#include "host/execution_poll_deadline.h"
 
 namespace {
 
@@ -186,4 +187,40 @@ TEST(RuntimeTimeoutConfig, SimPlatformSkipsOnboardOrdering) {
         validate_runtime_timeout_order_for_platform(cfg, "a5"),
         RuntimeTimeoutOrderStatus::SCHEDULER_NOT_BELOW_OP_EXECUTE
     );
+}
+
+TEST(ExecutionPollDeadline, RepeatedPendingQueriesDoNotExtendLaunchBudget) {
+    ExecutionPollDeadline deadline;
+    const auto launch = ExecutionPollDeadline::Clock::time_point{};
+    deadline.arm(50, launch);
+    for (int ms = 0; ms < 50; ++ms) {
+        EXPECT_FALSE(deadline.observe_pending(launch + std::chrono::milliseconds(ms)));
+    }
+    EXPECT_TRUE(deadline.observe_pending(launch + std::chrono::milliseconds(50)));
+    EXPECT_TRUE(deadline.timed_out());
+}
+
+TEST(ExecutionPollDeadline, FailureStaysLatchedUntilNextLaunch) {
+    ExecutionPollDeadline deadline;
+    const auto launch = ExecutionPollDeadline::Clock::time_point{};
+    deadline.arm(1, launch);
+    ASSERT_TRUE(deadline.observe_pending(launch + std::chrono::milliseconds(1)));
+    // Subsequent completion/drain must not silently convert a timed-out run to success.
+    EXPECT_TRUE(deadline.timed_out());
+    deadline.arm(50, launch + std::chrono::seconds(1));
+    EXPECT_FALSE(deadline.timed_out());
+    EXPECT_FALSE(deadline.observe_pending(launch + std::chrono::milliseconds(1049)));
+    EXPECT_TRUE(deadline.observe_pending(launch + std::chrono::milliseconds(1050)));
+}
+
+TEST(ExecutionPollDeadline, NoDeadlineUntilActualLaunch) {
+    ExecutionPollDeadline deadline;
+    EXPECT_FALSE(deadline.observe_pending(ExecutionPollDeadline::Clock::time_point::max()));
+}
+
+TEST(ExecutionPollDeadline, InfiniteWaitDoesNotExpire) {
+    ExecutionPollDeadline deadline;
+    deadline.arm(-1, ExecutionPollDeadline::Clock::time_point{});
+    EXPECT_FALSE(deadline.observe_pending(ExecutionPollDeadline::Clock::time_point::max()));
+    EXPECT_FALSE(deadline.timed_out());
 }

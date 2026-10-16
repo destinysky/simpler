@@ -27,6 +27,7 @@
 #define SRC_COMMON_RUNTIME_STATUS_ERROR_NAMES_H_
 
 #include <stdint.h>
+#include "../task_interface/execution_control.h"
 
 #ifndef SIMPLER_ERROR_SCOPE_DEADLOCK
 #error "include the runtime's runtime_status.h before error_names.h"
@@ -36,6 +37,8 @@
 // cover -- callers use that to suppress the annotation rather than print a misleading one.
 static inline const char *error_name(int32_t code) {
     switch (code) {
+    case SIMPLER_ERROR_COORDINATED_STOP:
+        return "COORDINATED_STOP";
     case SIMPLER_ERROR_NONE:
         return "none";
     case SIMPLER_ERROR_SCOPE_DEADLOCK:
@@ -78,6 +81,8 @@ static inline const char *error_name(int32_t code) {
 // One-sentence meaning of a latched SIMPLER_ERROR_* code. Empty string for an uncovered code.
 static inline const char *error_desc(int32_t code) {
     switch (code) {
+    case SIMPLER_ERROR_COORDINATED_STOP:
+        return "the recovery coordinator stopped this execution attempt";
     case SIMPLER_ERROR_NONE:
         return "no error";
     case SIMPLER_ERROR_SCOPE_DEADLOCK:
@@ -131,6 +136,8 @@ static inline const char *error_desc(int32_t code) {
 // What to do next about a latched SIMPLER_ERROR_* code. Empty string for an uncovered code.
 static inline const char *error_hint(int32_t code) {
     switch (code) {
+    case SIMPLER_ERROR_COORDINATED_STOP:
+        return "keep the original failing rank fault; this peer stopped for the same recovery episode";
     case SIMPLER_ERROR_NONE:
         return "";
     case SIMPLER_ERROR_SCOPE_DEADLOCK:

@@ -965,9 +965,25 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             static_cast<uint64_t>(scheduler_timeout_ms_override) * (PLATFORM_PROF_SYS_CNT_FREQ / 1000);
     }
 
+    uint32_t stop_poll_turn = 0;
     while (true) {
         if (completed_.load(std::memory_order_acquire)) {
             break;
+        }
+        if (thread_idx == 0 && (++stop_poll_turn & 63u) == 0 && header->execution_stop.run_epoch != 0) {
+            cache_invalidate_range(&header->execution_stop, sizeof(header->execution_stop));
+            if (execution_stop_requested(header->execution_stop)) {
+                int32_t expected = SIMPLER_ERROR_NONE;
+                header->orch_error_code.compare_exchange_strong(
+                    expected, SIMPLER_ERROR_COORDINATED_STOP, std::memory_order_acq_rel, std::memory_order_acquire
+                );
+                LOG_WARN(
+                    "[PTO_RECOVERY] COORDINATED_STOP_OBSERVED run_epoch=%llu",
+                    static_cast<unsigned long long>(header->execution_stop.run_epoch)
+                );
+                abort_and_shutdown(runtime);
+                break;
+            }
         }
         bool made_progress = false;
 #if SIMPLER_DFX

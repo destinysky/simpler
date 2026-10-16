@@ -26,6 +26,7 @@
 #include "call_config.h"
 #include "pipeline_slot_pool.h"
 #include "runtime_c_api.h"
+#include "host/execution_poll_deadline.h"
 #include "task_args.h"
 #include "types.h"
 
@@ -1041,6 +1042,85 @@ TEST(ChipRunLaneTest, UnsupportedAffectedTransportCannotBeBypassedByExecutionRea
     EXPECT_THROW(submit(lane, 101, 0), std::runtime_error);
     worker.comm_sessions_.clear();
     worker.comm_session_index_.clear();
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, StopTargetsOnlyLaunchedGenerationAndNeverLaunchesPreparedSuccessor) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.request_stop_fn_ = [](void *, void *runtime) {
+        g_events.push_back("stop" + std::to_string(g_slots.at(runtime)));
+        return 0;
+    };
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0);
+    auto second = submit(lane, 102, 1, false);
+    EXPECT_THROW(second.request_stop(), std::logic_error);
+    first.request_stop();
+    first.request_stop();
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stop0"), 2);
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "launch1"), 0);
+    auto stale = worker.native_run_states_[0];
+    ChipWorkerNativeRun token{};
+    token.slot_id = 0;
+    token.run_epoch = stale.run_epoch + 1;
+    EXPECT_THROW(worker.request_stop_native_run(token), std::logic_error);
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    first.request_stop();
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "stop0"), 2);
+    second.abandon();
+    lane.close();
+}
+
+TEST(ChipRunLaneTest, UnsupportedStopDoesNotPretendTheActiveRunIsTerminal) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.request_stop_fn_ = nullptr;
+    ChipRunLane lane(worker);
+    auto run = submit(lane, 101, 0);
+    EXPECT_THROW(run.request_stop(), std::runtime_error);
+    EXPECT_FALSE(run.done());
+    g_complete[0] = true;
+    EXPECT_TRUE(run.wait_until(ChipRun::Clock::now() + std::chrono::seconds(1)));
+    lane.close();
+}
+
+TEST(ChipRunLaneTest, PendingExecutionDeadlineFencesSuccessorEvenWhenDrainSucceeds) {
+    ChipWorker worker;
+    prime_worker(worker);
+    static ExecutionPollDeadline deadline;
+    static ExecutionPollDeadline::Clock::time_point now;
+    now = ExecutionPollDeadline::Clock::time_point{};
+    deadline.arm(50, now);
+    worker.poll_run_fn_ = [](void *, void *) {
+        return deadline.observe_pending(now) ? PTO_RUNTIME_ERR_EXECUTION_WAIT_TIMEOUT :
+                                               SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    };
+    ChipRunLane lane(worker);
+    auto first = submit(lane, 101, 0);
+    auto successor = submit(lane, 102, 1, false);
+    successor.activate();
+    const auto token_epoch = worker.native_run_states_[0].run_epoch;
+    EXPECT_FALSE(first.done());
+    now += std::chrono::milliseconds(50);
+    // The backend timeout is a failure. Successful drain/finalize is not a
+    // successful operator, and does not authorize automatic successor launch.
+    EXPECT_TRUE(first.done());
+    EXPECT_TRUE(successor.done());
+    EXPECT_THROW(first.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
+    EXPECT_THROW(successor.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "wait0"), 1);
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "finalize0"), 1);
+    EXPECT_EQ(std::count(g_events.begin(), g_events.end(), "launch1"), 0);
+    EXPECT_EQ(g_recovery_calls, 0u);
+    ChipWorkerNativeRun stale{};
+    stale.slot_id = 0;
+    stale.run_epoch = token_epoch;
+    EXPECT_THROW(worker.request_stop_native_run(stale), std::logic_error);
+    EXPECT_THROW(submit(lane, 103, 0), std::runtime_error);
     EXPECT_THROW(lane.close(), std::runtime_error);
     worker.finalize();
 }

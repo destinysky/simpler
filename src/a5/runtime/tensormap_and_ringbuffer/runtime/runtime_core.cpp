@@ -122,7 +122,12 @@ static bool wait_for_tensor_ready(
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0) {
                 // A fatal latched elsewhere breaks this wait; cold path only.
-                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
+                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE ||
+                    orch.sm_header->sched_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
+                    // The scheduler cannot complete this producer/consumer after a
+                    // kernel fault. Stop orchestration without overwriting its
+                    // original scheduler code with a later tensor-wait timeout.
+                    orch.fatal = true;
                     failed = true;
                     return;
                 }
@@ -149,7 +154,12 @@ static bool wait_for_tensor_ready(
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0) {
                 // A fatal latched elsewhere breaks this wait; cold path only.
-                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
+                if (orch.sm_header->orch_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE ||
+                    orch.sm_header->sched_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) {
+                    // The scheduler cannot complete this producer/consumer after a
+                    // kernel fault. Stop orchestration without overwriting its
+                    // original scheduler code with a later tensor-wait timeout.
+                    orch.fatal = true;
                     failed = true;
                     return;
                 }

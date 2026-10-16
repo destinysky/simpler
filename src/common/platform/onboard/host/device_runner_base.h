@@ -700,6 +700,7 @@ public:
      * SIMPLER_NATIVE_RUN_POLL_* values.
      */
     virtual int poll_execution(const ActiveExecution &active) = 0;
+    virtual int request_execution_stop(const ActiveExecution &) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
     /**
      * Wait for the launched run, publish DFX, and release its execution

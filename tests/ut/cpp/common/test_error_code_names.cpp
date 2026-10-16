@@ -42,6 +42,7 @@ constexpr int32_t kAllRuntimeCodes[] = {
     SIMPLER_ERROR_SCOPE_TASKS_OVERFLOW,  SIMPLER_ERROR_TENSORMAP_OVERFLOW,
     SIMPLER_ERROR_SCHEDULER_TIMEOUT,     SIMPLER_ERROR_ASYNC_COMPLETION_INVALID,
     SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW,   SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED,
+    SIMPLER_ERROR_COORDINATED_STOP,
 };
 
 TEST(RuntimeErrorNames, EveryCodeHasNameDescAndHint) {
@@ -69,7 +70,7 @@ TEST(RuntimeErrorNames, NoErrorIsNotAnError) {
 // An unrecognised code must be reported as such. Annotating it with a neighbouring code's
 // text would be worse than printing the bare number.
 TEST(RuntimeErrorNames, UnknownCodeFallsBack) {
-    for (int32_t code : {6, 12, 42, 99, 105, 9999, -1}) {
+    for (int32_t code : {6, 13, 42, 99, 105, 9999, -1}) {
         EXPECT_STREQ(error_name(code), "unknown") << "code " << code;
         EXPECT_TRUE(is_blank(error_desc(code))) << "code " << code;
         EXPECT_TRUE(is_blank(error_hint(code))) << "code " << code;

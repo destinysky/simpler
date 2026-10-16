@@ -102,6 +102,16 @@ public:
         operator_recovery_enabled_ = enabled;
     }
 
+    void configure_automatic_recovery(uint32_t max_retries, double backoff_s, double timeout_s) {
+        if (initialized_) throw std::logic_error("automatic recovery configured after init");
+        if (!std::isfinite(backoff_s) || backoff_s < 0 || !std::isfinite(timeout_s) || timeout_s <= 0)
+            throw std::invalid_argument("invalid automatic recovery timing policy");
+        automatic_operator_recovery_ = true;
+        recovery_max_retries_ = max_retries;
+        recovery_backoff_s_ = backoff_s;
+        recovery_timeout_s_ = timeout_s;
+    }
+
     void configure_pipeline_depth(uint32_t depth) {
         if (initialized_) throw std::logic_error("Worker: configure_pipeline_depth after init");
         orchestrator_.configure_pipeline_depth(depth);
@@ -261,6 +271,10 @@ private:
     int32_t level_;
     bool initialized_{false};
     bool operator_recovery_enabled_{false};
+    bool automatic_operator_recovery_{false};
+    uint32_t recovery_max_retries_{1};
+    double recovery_backoff_s_{0.0};
+    double recovery_timeout_s_{30.0};
 
     // --- Scheduling engine components ---
     // Per-task slot state lives inside `allocator_` (Ring) — Orchestrator

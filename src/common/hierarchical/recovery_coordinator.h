@@ -184,6 +184,35 @@ public:
             if (episode.request.all_members_terminal()) return episode.request;
         return std::nullopt;
     }
+    std::optional<RecoveryRequest> wait_next(uint64_t after_id) {
+        std::unique_lock<std::mutex> lk(mu_);
+        auto find = [&] {
+            auto selected = pending_.end();
+            for (auto it = pending_.begin(); it != pending_.end(); ++it)
+                if (it->first > after_id && it->second.reason.empty() &&
+                    (selected == pending_.end() || it->first < selected->first))
+                    selected = it;
+            return selected;
+        };
+        cv_.wait(lk, [&] {
+            return cancelling_ || find() != pending_.end();
+        });
+        if (cancelling_) return std::nullopt;
+        return find()->second.request;
+    }
+    std::optional<RecoveryRequest> wait_terminal(const RecoveryTicket &ticket, double seconds) {
+        std::unique_lock<std::mutex> lk(mu_);
+        auto ready = [&] {
+            const auto it = pending_.find(ticket.recovery_id);
+            return cancelling_ || it == pending_.end() || !it->second.reason.empty() ||
+                   !(it->second.request.ticket == ticket) || it->second.request.all_members_terminal();
+        };
+        if (!cv_.wait_for(lk, std::chrono::duration<double>(seconds), ready) || cancelling_) return std::nullopt;
+        const auto it = pending_.find(ticket.recovery_id);
+        if (it == pending_.end() || !(it->second.request.ticket == ticket) || !it->second.reason.empty())
+            return std::nullopt;
+        return it->second.request;
+    }
     ReplayAssessment assess(const RecoveryTicket &ticket, const RecoveryGraphSnapshot &graph) const {
         std::lock_guard<std::mutex> lk(mu_);
         auto it = pending_.find(ticket.recovery_id);

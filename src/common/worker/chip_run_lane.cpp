@@ -306,6 +306,15 @@ ChipRun::ChipRun(std::shared_ptr<ChipRunLaneState> lane, std::shared_ptr<ChipRun
     lane_(std::move(lane)),
     run_(std::move(run)) {}
 
+void ChipRun::request_stop() {
+    if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    std::lock_guard<std::mutex> lk(lane_->mu);
+    if (run_->phase == ChipRunState::Phase::TERMINAL) return;
+    if (run_->phase != ChipRunState::Phase::LAUNCHED)
+        throw std::logic_error("stop requires the current launched native generation");
+    lane_->worker->request_stop_native_run(run_->native_run);
+}
+
 bool ChipRun::done() {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
     std::lock_guard<std::mutex> lk(lane_->mu);

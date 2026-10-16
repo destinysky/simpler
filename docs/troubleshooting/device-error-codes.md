@@ -40,7 +40,7 @@ orchestrator is on the AICPU. `host_build_graph`'s orchestrator is host-side, so
 its code stays in host memory (`OrchestratorState::fatal_code`) and never crosses
 to the device — a refused bind reports it without the device having run at all.
 
-At most one of `orch_error_code` (1-11) and `sched_error_code` (100+) is ever
+At most one of `orch_error_code` (1-12) and `sched_error_code` (100+) is ever
 non-zero. `runtime_status` is just the latched code negated.
 
 The native-run exception normally has the form
@@ -88,7 +88,7 @@ So on hardware the exception code is the *least* informative thing on screen. Th
 The description and remedy come from the log. What it cannot tell you is which
 layer to go looking in, which is what these columns are for.
 
-### Orchestration errors (1-11)
+### Orchestration errors (1-12)
 
 | Code | Name | Whose bug, usually |
 | ---- | ---- | ------------------ |
@@ -103,6 +103,7 @@ layer to go looking in, which is what these columns are for.
 | 9 | EXPLICIT_ORCH_FATAL | orchestration (deliberate) |
 | 10 | SCOPE_TASKS_OVERFLOW | runtime-internal |
 | 11 | TENSORMAP_OVERFLOW | runtime-internal / extreme scale |
+| 12 | COORDINATED_STOP | peer intentionally stopped by the recovery coordinator (A5 TMR) |
 
 ### Scheduler errors (100+)
 

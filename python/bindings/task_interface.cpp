@@ -3380,6 +3380,7 @@ NB_MODULE(_task_interface, m) {
 
     nb::class_<ChipRun>(m, "_ChipRun")
         .def("done", &ChipRun::done)
+        .def("request_stop", &ChipRun::request_stop, nb::call_guard<nb::gil_scoped_release>())
         .def("activate", &ChipRun::activate)
         .def("abandon", &ChipRun::abandon, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("launched", &ChipRun::launched)
@@ -3554,14 +3555,25 @@ NB_MODULE(_task_interface, m) {
         .value("COMMIT", RecoveryControlPhase::COMMIT)
         .value("REARM", RecoveryControlPhase::REARM)
         .value("ARM", RecoveryControlPhase::ARM)
-        .value("ABORT", RecoveryControlPhase::ABORT);
+        .value("ABORT", RecoveryControlPhase::ABORT)
+        .value("STOP", RecoveryControlPhase::STOP);
     nb::class_<RecoveryControlPacket>(m, "_RecoveryControlPacket")
         .def_ro("recovery_id", &RecoveryControlPacket::recovery_id)
         .def_ro("endpoint_generation", &RecoveryControlPacket::endpoint_generation)
         .def_ro("phase", &RecoveryControlPacket::phase)
         .def_ro("impact", &RecoveryControlPacket::impact)
         .def_ro("has_domain", &RecoveryControlPacket::has_domain)
-        .def_ro("before", &RecoveryControlPacket::before);
+        .def_ro("before", &RecoveryControlPacket::before)
+        .def_ro("run_id", &RecoveryControlPacket::run_id)
+        .def_ro("task_slot", &RecoveryControlPacket::task_slot)
+        .def_ro("group_index", &RecoveryControlPacket::group_index)
+        .def_ro("pipeline_generation", &RecoveryControlPacket::pipeline_generation)
+        .def_ro("dispatch_id", &RecoveryControlPacket::dispatch_id);
+    m.def("_write_recovery_stop_ack", [](uint64_t address, size_t size) {
+        if (!address || size != sizeof(RecoveryControlPacket)) throw std::invalid_argument("invalid stop reply");
+        auto *packet = reinterpret_cast<RecoveryControlPacket *>(address);
+        packet->stop_accepted = 1;
+    });
     m.attr("_RECOVERY_BINDING_BYTES") = sizeof(RecoveryDomainBinding);
     m.def("_read_recovery_binding", [](uint64_t address) {
         RecoveryDomainBinding binding;

@@ -2,6 +2,7 @@
 # Licensed under CANN Open Software License Agreement Version 2.0.
 """Child resource transaction gates without an NPU."""
 
+import struct
 from copy import deepcopy
 from types import SimpleNamespace as Record
 
@@ -16,7 +17,9 @@ from _task_interface import (
 from _task_interface import (
     _RecoveryControlPhase as Phase,
 )
-from simpler._recovery import EndpointRecoverySession, capture_binding
+from simpler import worker as w
+from simpler._recovery import EndpointRecoverySession, capture_binding, validate_stop_identity
+from simpler.task_interface import TaskArgs
 
 
 class Native:
@@ -225,3 +228,132 @@ def test_failed_communication_run_transfers_cleanup_to_native_teardown(monkeypat
     assert domain.freed and not resources.pending_release_domains
     assert handle._keepalive is None and not worker._live_domains
     worker.close()
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["run_id", "task_slot", "group_index", "pipeline_generation", "dispatch_id", "endpoint_generation", "recovery_id"],
+)
+def test_stop_rejects_stale_attempt_identity(field):
+    frame = (1, 7, 0, 13, 31, 5, 1, 2)
+    value = Record(
+        run_id=7,
+        task_slot=5,
+        group_index=1,
+        pipeline_generation=13,
+        dispatch_id=31,
+        endpoint_generation=2,
+        recovery_id=3,
+    )
+    setattr(value, field, 0)
+    with pytest.raises(RuntimeError, match="stale"):
+        validate_stop_identity(value, frame, 2, 0)
+
+
+def test_stop_duplicate_is_idempotent_only_for_the_same_episode():
+    frame = (1, 7, 0, 13, 31, 5, 1, 2)
+    value = Record(
+        run_id=7,
+        task_slot=5,
+        group_index=1,
+        pipeline_generation=13,
+        dispatch_id=31,
+        endpoint_generation=2,
+        recovery_id=3,
+    )
+    validate_stop_identity(value, frame, 2, 0)
+    validate_stop_identity(value, frame, 2, 3)
+    with pytest.raises(RuntimeError, match="stale"):
+        validate_stop_identity(value, frame, 2, 2)
+
+
+def test_single_frame_mailbox_accepts_stop_before_active_task_finishes():
+    buf = memoryview(bytearray(w.MAILBOX_SIZE))
+    base = w._buffer_field_addr(buf, 0)
+    task = buf[w.MAILBOX_FRAME_SIZE : 2 * w.MAILBOX_FRAME_SIZE]
+    task_state = w._buffer_field_addr(task, w._OFF_STATE)
+    w._mailbox_store_i32(task_state, w._TASK_READY)
+    w._mailbox_store_i32(base + w._OFF_STATE, w._CONTROL_REQUEST)
+    struct.pack_into("Q", buf, w._OFF_CALLABLE, w._CTRL_RECOVER_ENDPOINT)
+    events = []
+
+    def start(_task):
+        events.append("started")
+
+    def stop(command):
+        assert command == w._CTRL_RECOVER_ENDPOINT
+        assert events == ["started"]
+        assert w._mailbox_load_i32(task_state) != w._TASK_DONE
+        events.append("stop_delivered")
+        return 0, ""
+
+    def progress(task_buf):
+        assert events == ["started", "stop_delivered"]
+        assert w._mailbox_load_i32(base + w._OFF_STATE) == w._CONTROL_DONE
+        events.append("terminal")
+        struct.pack_into("<ii", task_buf, w._OFF_NATIVE_EXECUTION_FAULT, 507018, -12)
+        w._mailbox_store_i32(base + w._OFF_SHUTDOWN, w._SHUTDOWN_REQUESTED)
+        return 1, "coordinated stop"
+
+    try:
+        w._run_mailbox_loop(
+            buf, base + w._OFF_STATE, handle_task=start, handle_control=stop, poll_task=progress, hold_native_fault=True
+        )
+        assert events == ["started", "stop_delivered", "terminal"]
+        assert w._mailbox_load_i32(task_state) == w._TASK_DONE
+        assert struct.unpack_from("<ii", task, w._OFF_NATIVE_EXECUTION_FAULT) == (507018, -12)
+    finally:
+        task.release()
+        buf.release()
+
+
+def test_active_child_rethrows_retired_native_fault_instead_of_reporting_success(monkeypatch):
+    buf = memoryview(bytearray(w.MAILBOX_SIZE))
+    base = w._buffer_field_addr(buf, 0)
+    digest = bytes(w.CALLABLE_HASH_DIGEST_BYTES)
+    calls = []
+
+    class Run:
+        def done(self):
+            return True
+
+        def wait(self, timeout):
+            assert timeout == 0
+            calls.append("fault observed")
+            raise RuntimeError("structured native kernel fault")
+
+    def serve(_buf, _state, *, handle_task, poll_task, **_kwargs):
+        task = buf[w.MAILBOX_FRAME_SIZE : 2 * w.MAILBOX_FRAME_SIZE]
+        try:
+            assert handle_task(task) is None
+            code, message = poll_task(task)
+            assert code == 1 and "structured native kernel fault" in message
+        finally:
+            task.release()
+
+    native = Record(_submit_chip_run_materialized=lambda *_args: Run())
+    monkeypatch.setattr(w, "_read_task_digest", lambda _: digest)
+    monkeypatch.setattr(w, "_read_task_frame_identity", lambda _: (1, 7, 0, 13, 31, 5, 1, 2))
+    monkeypatch.setattr(w, "_read_config_from_mailbox", lambda *_args, **_kwargs: Record())
+    monkeypatch.setattr(w, "read_args_from_blob", lambda *_args: TaskArgs())
+    monkeypatch.setattr(w, "_run_mailbox_loop", serve)
+    monkeypatch.setattr(w, "_teardown_chip_process_resources", lambda *_args: None)
+    try:
+        w._run_chip_main_loop(
+            Record(_impl=native),
+            buf,
+            base,
+            base + w._OFF_STATE,
+            0,
+            {1: object()},
+            {digest: 1},
+            {digest: 1},
+            w.mint_owner_instance_id(),
+            chip_platform="a5",
+            chip_runtime="tensormap_and_ringbuffer",
+            prepared={1},
+            hold_native_fault=True,
+        )
+        assert calls == ["fault observed"]
+    finally:
+        buf.release()

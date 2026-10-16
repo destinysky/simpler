@@ -1017,6 +1017,14 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     return 0;
 }
 
+int simpler_request_stop(DeviceContextHandle ctx, RuntimeHandle runtime) {
+    auto *state = native_run_context(ctx, runtime, "simpler_request_stop");
+    if (!state || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Running || !state->active_execution)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int rc = state->runner->attach_current_thread(state->runner->device_id());
+    return rc != 0 ? rc : state->runner->request_execution_stop(*state->active_execution);
+}
+
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_poll_run");
     if (state == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;

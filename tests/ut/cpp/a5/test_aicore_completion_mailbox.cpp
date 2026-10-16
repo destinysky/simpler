@@ -35,16 +35,13 @@ namespace {
 TaskId make_token(uint32_t local) { return TaskId{local}; }
 
 AICoreCompletionMailbox *fresh_mailbox() {
-    void *raw = ::operator new(sizeof(AICoreCompletionMailbox));
-    auto *mb = new (raw) AICoreCompletionMailbox{};
+    // Typed C++17 allocation honors the mailbox's cache-line alignment.
+    auto *mb = new AICoreCompletionMailbox{};
     std::memset(mb, 0, sizeof(*mb));
     return mb;
 }
 
-void destroy_mailbox(AICoreCompletionMailbox *mb) {
-    mb->~AICoreCompletionMailbox();
-    ::operator delete(mb);
-}
+void destroy_mailbox(AICoreCompletionMailbox *mb) { delete mb; }
 
 }  // namespace
 

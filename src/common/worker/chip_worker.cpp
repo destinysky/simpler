@@ -222,6 +222,7 @@ void ChipWorker::init(
         prepare_run_fn_ = load_symbol<SimplerPrepareRunFn>(handle, "simpler_prepare_run");
         launch_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_launch_run");
         poll_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_poll_run");
+        request_stop_fn_ = reinterpret_cast<SimplerNativeRunFn>(dlsym(handle, "simpler_request_stop"));
         wait_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_wait_run");
         finalize_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_finalize_run");
         supports_concurrent_native_prepare_fn_ =
@@ -378,6 +379,7 @@ void ChipWorker::init(
         launch_run_fn_ = nullptr;
         poll_run_fn_ = nullptr;
         wait_run_fn_ = nullptr;
+        request_stop_fn_ = nullptr;
         finalize_run_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
         get_arena_bank_gm_heap_base_fn_ = nullptr;
@@ -443,6 +445,7 @@ void ChipWorker::init(
         launch_run_fn_ = nullptr;
         poll_run_fn_ = nullptr;
         wait_run_fn_ = nullptr;
+        request_stop_fn_ = nullptr;
         finalize_run_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
         get_arena_bank_gm_heap_base_fn_ = nullptr;
@@ -541,6 +544,7 @@ void ChipWorker::finalize() {
     launch_run_fn_ = nullptr;
     poll_run_fn_ = nullptr;
     wait_run_fn_ = nullptr;
+    request_stop_fn_ = nullptr;
     finalize_run_fn_ = nullptr;
     supports_concurrent_native_prepare_fn_ = nullptr;
     get_arena_bank_gm_heap_base_fn_ = nullptr;
@@ -892,6 +896,17 @@ void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run) {
     std::lock_guard<std::mutex> lk(native_run_mu_);
     NativeRunSlotState &state = native_run_states_[run.slot_id];
     state.phase = NativeRunPhase::LAUNCHED;
+}
+
+void ChipWorker::request_stop_native_run(const ChipWorkerNativeRun &run) {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    if (run.slot_id >= native_run_states_.size()) throw std::logic_error("invalid stop slot");
+    const auto &state = native_run_states_[run.slot_id];
+    if (state.run_epoch != run.run_epoch || state.phase != NativeRunPhase::LAUNCHED)
+        throw std::logic_error("stale or non-running stop token");
+    const int rc = request_stop_fn_ ? request_stop_fn_(device_ctx_, runtime_bufs_[run.slot_id].data()) :
+                                      PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (rc != 0) throw std::runtime_error("native cooperative stop delivery failed: " + std::to_string(rc));
 }
 
 bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {

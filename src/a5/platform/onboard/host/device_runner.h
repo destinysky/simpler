@@ -47,6 +47,7 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/function_cache.h"
+#include "host/execution_poll_deadline.h"
 #include "host/memory_allocator.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/pmu_collector.h"
@@ -94,6 +95,7 @@ public:
     LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
     int poll_execution(const ActiveExecution &active) override;
+    int request_execution_stop(const ActiveExecution &active) override;
     int drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
     bool execution_admission_open() const override {
@@ -232,6 +234,7 @@ private:
     };
     std::atomic<RunPollState> run_poll_state_{RunPollState::Idle};
     std::atomic<uint32_t> run_poll_slot_{PTO_PIPELINE_MAX_DEPTH};
+    ExecutionPollDeadline run_poll_deadline_;
 
     // Release execution-owned per-run resources. Idempotent so prepare rollback
     // and drain share one path. `launched` publishes the sticky terminal poll

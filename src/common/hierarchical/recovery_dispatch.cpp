@@ -186,3 +186,117 @@ bool Scheduler::retry_recovery(
     notify_ready();
     return true;
 }
+
+void Scheduler::coordinate_recovery() {
+    uint64_t last_id = 0;
+    while (auto observed = recovery_coordinator_.wait_next(last_id)) {
+        const RecoveryRequest request = *observed;
+        last_id = request.ticket.recovery_id;
+        try {
+            std::vector<std::pair<int32_t, RecoveryControlPacket>> stops;
+            {
+                std::lock_guard<std::mutex> lk(loop_mu_);
+                if (stop_requested_.load()) break;
+                for (size_t index = 0; index < request.members.size(); ++index) {
+                    const auto &member = request.members[index];
+                    auto *worker = cfg_.manager->get_worker_by_id(WorkerType::NEXT_LEVEL, member.worker_id);
+                    if (!worker || worker->caps().kind != WorkerEndpointKind::LOCAL_MAILBOX ||
+                        worker->caps().max_inflight_tasks != 1 ||
+                        worker->endpoint_generation() != member.endpoint_generation)
+                        throw std::logic_error("coordinated stop requires the current local single-frame endpoint");
+                    RecoveryControlPacket packet;
+                    packet.phase = RecoveryControlPhase::STOP;
+                    packet.recovery_id = request.ticket.recovery_id;
+                    packet.endpoint_generation = member.endpoint_generation;
+                    packet.run_id = request.ticket.run_id;
+                    packet.task_slot = request.ticket.task_slot;
+                    packet.group_index = static_cast<int32_t>(index);
+                    packet.pipeline_generation = request.pipeline_lease.generation;
+                    // Completion may race the initial event snapshot; obtain its current identity under loop_mu_.
+                    const auto current = recovery_coordinator_.pending();
+                    const auto episode = std::find_if(current.begin(), current.end(), [&](const auto &r) {
+                        return r.ticket == request.ticket;
+                    });
+                    if (episode == current.end()) throw std::logic_error("recovery was cancelled before stop");
+                    const auto &latest = episode->members[index];
+                    packet.dispatch_id = latest.terminal ? latest.completion.dispatch_id :
+                                                           worker->active_dispatch_id(packet.run_id, packet.task_slot);
+                    if (packet.dispatch_id == 0)
+                        throw std::logic_error("stop target lacks a physical dispatch identity");
+                    stops.emplace_back(member.worker_id, packet);
+                }
+            }
+            HostLogger::get_instance().log(
+                simpler::log::LogLevel::WARN, __func__,
+                "[PTO_RECOVERY] AUTO_RECOVERY_BEGIN recovery_id=%llu attempt=%u members=%zu",
+                static_cast<unsigned long long>(request.ticket.recovery_id), request.ticket.attempt, stops.size()
+            );
+            std::vector<std::future<void>> replies;
+            for (const auto &stop : stops)
+                replies.push_back(std::async(std::launch::async, [this, worker_id = stop.first, packet = stop.second] {
+                    const auto bytes = cfg_.manager->control_payload(
+                        WorkerType::NEXT_LEVEL, worker_id, CTRL_RECOVER_ENDPOINT, &packet, sizeof(packet),
+                        cfg_.recovery_timeout_s
+                    );
+                    if (bytes.size() != sizeof(packet)) throw std::runtime_error("invalid stop reply size");
+                    RecoveryControlPacket reply;
+                    std::memcpy(&reply, bytes.data(), sizeof(reply));
+                    if (reply.abi_version != packet.abi_version || reply.struct_bytes != sizeof(reply) ||
+                        reply.phase != packet.phase || reply.recovery_id != packet.recovery_id ||
+                        reply.endpoint_generation != packet.endpoint_generation || reply.run_id != packet.run_id ||
+                        reply.task_slot != packet.task_slot || reply.group_index != packet.group_index ||
+                        reply.pipeline_generation != packet.pipeline_generation ||
+                        reply.dispatch_id != packet.dispatch_id || reply.stop_accepted != 1)
+                        throw std::runtime_error("stop delivery acknowledgement is stale or refused");
+                }));
+            std::exception_ptr failure;
+            for (auto &reply : replies) {
+                try {
+                    reply.get();
+                } catch (...) {
+                    if (!failure) failure = std::current_exception();
+                }
+            }
+            if (failure) std::rethrow_exception(failure);
+            const auto terminal = recovery_coordinator_.wait_terminal(request.ticket, cfg_.recovery_timeout_s);
+            if (!terminal) throw std::runtime_error("coordinated stop deadline expired or recovery cancelled");
+            for (const auto &member : terminal->members)
+                HostLogger::get_instance().log(
+                    simpler::log::LogLevel::WARN, __func__,
+                    "[PTO_RECOVERY] AUTO_MEMBER_TERMINAL recovery_id=%llu worker=%d raw_rc=%d runtime_status=%d",
+                    static_cast<unsigned long long>(last_id), member.worker_id,
+                    member.completion.native_execution_fault.raw_rc,
+                    member.completion.native_execution_fault.runtime_status
+                );
+            HostLogger::get_instance().log(
+                simpler::log::LogLevel::WARN, __func__, "[PTO_RECOVERY] ALL_MEMBERS_TERMINAL recovery_id=%llu",
+                static_cast<unsigned long long>(last_id)
+            );
+            const auto assessment = assess_replay(request.ticket);
+            if (assessment.status != ReplayStatus::REPLAY_ALLOWED) {
+                give_up_recovery(request.ticket, "automatic replay refused: " + assessment.reason);
+                continue;
+            }
+            (void)retry_recovery(
+                request.ticket, cfg_.recovery_max_retries, cfg_.recovery_backoff_s,
+                DomainRecoveryImpact::DOMAIN_TRANSPORT, cfg_.recovery_timeout_s
+            );
+        } catch (const std::exception &error) {
+            if (stop_requested_.load()) break;
+            const std::string reason = "automatic recovery failed: " + std::string(error.what());
+            HostLogger::get_instance().log(
+                simpler::log::LogLevel::WARN, __func__,
+                "[PTO_RECOVERY] AUTO_RECOVERY_FAILED recovery_id=%llu original=%s recovery=%s",
+                static_cast<unsigned long long>(last_id), request.original_failure.error_message.c_str(), error.what()
+            );
+            try {
+                if (!give_up_recovery(request.ticket, reason)) continue;
+            } catch (const std::logic_error &) {
+                // Unproved live executions retain their slots/resources until default endpoint teardown.
+                std::lock_guard<std::mutex> lk(loop_mu_);
+                if (cfg_.on_task_failed_cb) cfg_.on_task_failed_cb(request.ticket.task_slot, reason);
+                cfg_.manager->stop_workers();
+            }
+        }
+    }
+}

@@ -573,6 +573,10 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def("cancel_recoveries", &Worker::cancel_recoveries)
         .def(
+            "configure_automatic_recovery", &Worker::configure_automatic_recovery, nb::arg("max_retries"),
+            nb::arg("backoff_s"), nb::arg("timeout_s")
+        )
+        .def(
             "add_sub_worker",
             [](Worker &self, uint64_t mailbox_ptr, int child_pid) {
                 self.add_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr), child_pid);

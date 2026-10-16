@@ -64,10 +64,14 @@ protected:
     static constexpr int kSlotPayloadPoolSize = 16;
     TaskPayload slot_payload_pool_[kSlotPayloadPoolSize];
     int slot_payload_pool_idx_ = 0;
+    // Even a payload with no edges needs a valid pool for the reference-taking fanin helper.
+    FaninSpillEntry slot_fanin_entries_[2]{};
+    FaninPool slot_fanin_pool_{};
 
     void SetUp() override {
         sm_handle = SharedMemoryHandle::create_and_init_default(sm_arena);
         ASSERT_NE(sm_handle, nullptr);
+        slot_fanin_pool_.init(slot_fanin_entries_, 2, &sm_handle->header->orch_error_code);
         auto layout = SchedulerState::reserve_layout(sched_arena);
         ASSERT_NE(sched_arena.commit(), nullptr);
         ASSERT_TRUE(sched.init_data_from_layout(layout, sched_arena, sm_handle->header));
@@ -98,6 +102,7 @@ protected:
         slot.logical_block_num = 1;
         TaskPayload &slot_pl = slot_payload_pool_[slot_payload_pool_idx_++ % kSlotPayloadPoolSize];
         memset(&slot_pl, 0, sizeof(slot_pl));
+        slot_pl.fanin_spill_pool = &slot_fanin_pool_;
         slot.payload = &slot_pl;
     }
 
@@ -110,6 +115,7 @@ protected:
         TaskDescriptor &task = ring.get_task_by_task_id(task_id);
         memset(&slot, 0, sizeof(slot));
         memset(&payload, 0, sizeof(payload));
+        payload.fanin_spill_pool = &slot_fanin_pool_;
         memset(&task, 0, sizeof(task));
         slot.task_state.store(state, std::memory_order_relaxed);
         slot.fanin_count = 0;

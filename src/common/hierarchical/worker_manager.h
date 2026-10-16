@@ -622,6 +622,7 @@ public:
     // dispatchable on the same device.
     bool idle() const;
     bool can_stage() const;
+    uint64_t active_dispatch_id(RunId run_id, TaskSlot task_slot) const;
     bool busy() const { return inflight_.load(std::memory_order_acquire) != 0; }
     const WorkerEndpointCaps &caps() const;
     int32_t worker_id() const;
@@ -717,6 +718,7 @@ private:
 
     struct LaneState {
         bool occupied{false};
+        TaskSlot task_slot{INVALID_SLOT};
         bool activation_requested{false};
         RunId run_id{INVALID_RUN_ID};
         uint64_t dispatch_id{0};

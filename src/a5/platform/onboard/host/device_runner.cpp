@@ -22,6 +22,7 @@
 #include "host_log.h"
 #include "platform_comm/comm.h"
 #include "runtime_c_api.h"
+#include "task_interface/execution_control.h"
 
 #include <dlfcn.h>
 
@@ -90,6 +91,7 @@ extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip
 // A runtime supplies the address of its per-run cooperative-stop publication.
 // Missing publication is an unsupported recovery capability, not a stop proof.
 extern "C" __attribute__((weak, visibility("hidden"))) void *execution_quiescence_flag(Runtime *) { return nullptr; }
+extern "C" __attribute__((weak, visibility("hidden"))) void *execution_stop_control(Runtime *) { return nullptr; }
 
 // =============================================================================
 // DeviceRunner Implementation
@@ -494,6 +496,12 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                     const int reset_rc = copy_to_device(flag, &pending, sizeof(pending));
                     if (reset_rc != 0) return reset_rc;
                 }
+                if (void *control = execution_stop_control(&runtime)) {
+                    ExecutionStopControl initial;
+                    initial.run_epoch = prepared->identity.dispatch_id != 0 ? prepared->identity.run_epoch : 0;
+                    const int reset_rc = copy_to_device(control, &initial, sizeof(initial));
+                    if (reset_rc != 0) return reset_rc;
+                }
                 activate_launch_shape(runtime);
                 (void)arm_device_wall_buffer(prepared->kernel_args);
                 if (int arm_rc = arm_collectors_for_run(runtime, *prepared); arm_rc != 0) return arm_rc;
@@ -580,9 +588,35 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
     if (transaction.progress == LaunchProgress::NotStarted) {
         outcome.prepared = std::move(prepared);
     } else {
+        // Start where the old blocking wait could begin: after launch returns,
+        // never at prepare or on each progress query. One launched run owns it.
+        run_poll_deadline_.arm(timeout_config_.stream_sync_timeout_ms);
         outcome.active = std::make_unique<ActiveExecution>(std::move(prepared), transaction.progress);
     }
     return outcome;
+}
+
+int DeviceRunner::request_execution_stop(const ActiveExecution &active) {
+    if (!active.prepared || active.prepared->identity.dispatch_id == 0 ||
+        run_poll_slot_.load(std::memory_order_acquire) != active.prepared->pipeline_slot)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const auto state = run_poll_state_.load(std::memory_order_acquire);
+    // A matching generation can finish between the parent's observation and STOP delivery.
+    if (state == RunPollState::DeviceComplete || state == RunPollState::Drained) return 0;
+    if (state != RunPollState::Submitted) return PTO_RUNTIME_ERR_INVALID_STATE;
+    void *control = execution_stop_control(active.prepared->runtime);
+    if (!control) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    const uint64_t epoch = active.prepared->identity.run_epoch;
+    // A standalone H2D control write, independent of the executing AICPU/AICore streams.
+    const int rc = copy_to_device(
+        static_cast<char *>(control) + offsetof(ExecutionStopControl, requested_epoch), &epoch, sizeof(epoch)
+    );
+    LOG_WARN(
+        "[PTO_RECOVERY] EXECUTION_STOP_REQUEST run_epoch=%llu dispatch_id=%llu rc=%d",
+        static_cast<unsigned long long>(epoch), static_cast<unsigned long long>(active.prepared->identity.dispatch_id),
+        rc
+    );
+    return rc;
 }
 
 int DeviceRunner::poll_execution(const ActiveExecution &active) {
@@ -596,8 +630,29 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
         return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
     }
     if (state != RunPollState::Submitted) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    if (run_poll_deadline_.timed_out()) return PTO_RUNTIME_ERR_EXECUTION_WAIT_TIMEOUT;
 
     const int rc = query_stream_pair_nonblocking(stream_aicpu_, stream_aicore_);
+    if (rc == SIMPLER_NATIVE_RUN_POLL_NOT_READY && run_poll_deadline_.observe_pending()) {
+        const uint64_t epoch = active.prepared->identity.run_epoch;
+        handle_execution_failure(PTO_RUNTIME_ERR_EXECUTION_WAIT_TIMEOUT, "poll-timeout", epoch);
+        LOG_WARN(
+            "[PTO_RECOVERY] EXECUTION_WAIT_TIMEOUT run_epoch=%llu dispatch_id=%llu timeout_ms=%d",
+            static_cast<unsigned long long>(epoch),
+            static_cast<unsigned long long>(active.prepared->identity.dispatch_id),
+            timeout_config_.stream_sync_timeout_ms
+        );
+        // Expiration is a failure observation, never a completion/stop proof.
+        // Ask the existing cooperative path to exit before bounded drain. A
+        // failed request still reaches drain/fault reporting; only independent
+        // quiescence and retirement can authorize a later explicit rearm.
+        const int stop_rc = request_execution_stop(active);
+        LOG_WARN(
+            "[PTO_RECOVERY] EXECUTION_WAIT_TIMEOUT_STOP run_epoch=%llu stop_rc=%d",
+            static_cast<unsigned long long>(epoch), stop_rc
+        );
+        return PTO_RUNTIME_ERR_EXECUTION_WAIT_TIMEOUT;
+    }
     if (rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
         RunPollState expected = RunPollState::Submitted;
         (void)run_poll_state_.compare_exchange_strong(
@@ -628,13 +683,17 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         static_cast<unsigned long long>(prepared.identity.generation),
         static_cast<unsigned long long>(prepared.identity.dispatch_id)
     );
-    int rc = sync_run_streams();
+    const int stream_rc = sync_run_streams();
+    // A STOP can make sync succeed (or return COORDINATED_STOP's host status).
+    // Neither erases the original host deadline failure. Preserve stream_rc in
+    // diagnostics, and collect the independent PTO quiescence proof below.
+    const int rc = run_poll_deadline_.timed_out() ? PTO_RUNTIME_ERR_EXECUTION_WAIT_TIMEOUT : stream_rc;
     LOG_INFO(
         "[PTO_RECOVERY_PROBE] HOST_STREAM_PAIR_DRAIN_END slot=%u run_epoch=%llu generation=%llu dispatch_id=%llu "
-        "rc=%d",
+        "rc=%d stream_rc=%d",
         pipeline_slot, static_cast<unsigned long long>(prepared.identity.run_epoch),
         static_cast<unsigned long long>(prepared.identity.generation),
-        static_cast<unsigned long long>(prepared.identity.dispatch_id), rc
+        static_cast<unsigned long long>(prepared.identity.dispatch_id), rc, stream_rc
     );
     if (rc != 0) {
         // Stream status is diagnostic. Cooperative-stop publication supplies

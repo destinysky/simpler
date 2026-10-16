@@ -203,6 +203,10 @@ void Worker::init() {
         orchestrator_.report_task_error(slot, message);
     };
     cfg.operator_recovery_enabled = operator_recovery_enabled_;
+    cfg.automatic_operator_recovery = automatic_operator_recovery_;
+    cfg.recovery_max_retries = recovery_max_retries_;
+    cfg.recovery_backoff_s = recovery_backoff_s_;
+    cfg.recovery_timeout_s = recovery_timeout_s_;
     cfg.begin_task_recovery_cb = [this](TaskSlot slot, uint64_t recovery_id) {
         return orchestrator_.begin_task_recovery(slot, recovery_id);
     };

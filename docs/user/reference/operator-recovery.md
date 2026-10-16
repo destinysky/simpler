@@ -75,12 +75,65 @@ propagation, places the original TaskSlot in RETRY_PENDING, and freezes new
 dispatch/admission. The submitted graph, TaskArgs, dependencies, TensorMap keys
 and managed-buffer references remain owned by the run. It is not a data snapshot.
 
-For a local chip group, the first fault establishes one episode. Other members
-continue reporting terminal outcomes while dispatch stays frozen, including a
-healthy member that finishes before or after its peer's fault. This collects local
-evidence for `assess_replay`; cross-host agreement remains the owner's responsibility.
+For a local chip group, the first structured native fault establishes one episode
+and wakes the native L3 Coordinator owner, without waiting for the other ranks to
+finish. Automatic coordination is the default when recovery is enabled:
 
-The owner uses asynchronous `Worker.submit` and these explicit APIs:
+```python
+worker = Worker(
+    level=3, platform="a5", runtime="tensormap_and_ringbuffer",
+    device_ids=[0, 1], enable_operator_recovery=True,
+    operator_recovery_max_retries=1,
+    operator_recovery_backoff_s=0.0,
+    operator_recovery_timeout_s=30.0,
+)
+worker.run(graph)
+```
+
+The owner sends STOP concurrently to every member of the current attempt. Each
+request matches recovery id, run id, TaskSlot, group index, pipeline generation,
+physical dispatch id and endpoint generation. A matching duplicate is harmless;
+a stale identity cannot stop a new generation. The single-frame child progresses
+the native run without blocking its control mailbox. STOP writes an epoch-fenced
+control word through the existing host-to-device copy path, independently of the
+execution streams. The A5 TMR AICPU scheduler samples that dedicated cache line
+every 64 iterations and invokes its existing cooperative emergency shutdown.
+Already-terminal members acknowledge their matching attempt without inventing a
+new failure. `COORDINATED_STOP` (12) describes the peer's intentional stop and is
+separate from the original rank's fault.
+
+STOP delivery is not termination proof. The owner first collects all terminal
+outcomes, then validates native retirement/quiescence and SDMA provider stop
+proofs through the existing INSPECT/PREPARE transaction. An accepted STOP without
+terminal evidence, a failed proof, an identity mismatch or unsupported backend
+ends soft recovery. The retained run receives the original and recovery faults;
+a still-live endpoint remains owned until existing terminal teardown completes.
+The soft path neither resets a device nor frees an unproved execution/window.
+An unresponsive device may still need the existing watchdog/default fatal path;
+a control acknowledgment is never fabricated into successful retirement.
+
+After current replay eligibility passes, the owner runs the existing all-member
+domain transaction, argument rebinding and original-TaskSlot replay. It currently
+requests `DOMAIN_TRANSPORT` for a bound communication op, independently of fault
+codes. Context C/E and the persistent AICPU/AICore streams remain unchanged.
+Only all-member logical A success releases original dependent B/C, once. Retry
+budget/backoff are L3 configuration; L2 has no retry credit. Close cancels the
+owner before draining the graph. A local group requiring cross-host agreement,
+missing semantic metadata, input restoration or an open graph is refused.
+The stop interface and proof contract are backend-neutral; only the A5 TMR/SDMA
+provider is implemented and requires hardware validation of live H2D stop delivery.
+URMA/CCU and L4+ control-plane transport are not added by this mechanism.
+
+The A5 L3 facade currently selects one task frame even with recovery disabled;
+this recovery feature does not reduce an existing two-frame A5 L3 path. Native
+pipeline depth/prepare overlap and mailbox frame capacity are separate contracts.
+If `_local_task_frame_count` or endpoint staging capabilities change, reassess
+recovery of staged successors and their binding generations before enabling this
+owner on those endpoints; do not assume a hardware single-frame restriction.
+
+Inspection APIs remain available in automatic mode; episode tickets may resolve
+before a caller inspects them. For manual diagnostics, construct the Worker with
+`automatic_operator_recovery=False` and use asynchronous `Worker.submit` with these APIs:
 
 - `pending_recoveries()` returns copied episode/member records, including groups
   with a member still executing.
@@ -99,8 +152,9 @@ The owner uses asynchronous `Worker.submit` and these explicit APIs:
   Tickets also identify their local coordinator owner, so matching numeric run,
   slot and recovery ids from another Worker cannot resolve this episode.
 
-Without an owner decision the graph remains held. Synchronous `run` therefore
-requires a separate recovery owner; it cannot resolve its own wait. `close`
+In manual diagnostic mode, without an owner decision the graph remains held.
+Synchronous `run` then requires a separate recovery owner. Automatic mode supplies
+that owner in the native scheduler and supports synchronous `run`. `close`
 cancels held episodes before draining run fences and releases leased recovery
 waiters. A remaining active peer still needs endpoint terminalization; timeout
 does not justify freeing its resources. Terminal cleanup may reset a failed
@@ -108,8 +162,10 @@ device under the existing lifecycle, but no hold/rebind primitive resets one.
 Graph-construction cancellation or another terminal run error also ends its
 held episodes, so a failed submission cannot leave an orphaned recovery hold.
 
-There is no implicit retry or endpoint recreation. The owner explicitly invokes
-`retry_recovery` after eligibility succeeds. Unlaunched downstream tasks remain
+Automatic recovery never recreates an endpoint. The native owner invokes
+`retry_recovery` after eligibility succeeds. In manual mode only the external
+owner does so; public `retry_recovery`/`give_up_recovery` refuse to compete with
+an automatic owner. Unlaunched downstream tasks remain
 in the graph during the hold; retired native execution tokens remain invalid.
 
 ## Logical-op metadata and replay eligibility
@@ -183,11 +239,13 @@ resource recovery, argument rebinding or cross-host agreement. It performs none
 of these actions and never releases A or dispatches B/C. The separate
 `retry_recovery` transaction collects local resource proofs, revalidates the
 current ticket/graph and commits only all-member success before releasing the
-original successors. Rank-stop commands, cross-host evidence exchange, input
-restoration and global result commit are not implemented by eligibility or
-local dispatch. Unannotated ordinary execution keeps its existing behavior.
+original successors. Rank-stop commands belong to the separate automatic owner;
+cross-host evidence exchange, input restoration and global result commit remain
+unimplemented. Unannotated ordinary execution keeps its existing behavior.
 
-## Explicit local replay
+## Explicit local replay (manual diagnostic mode)
+
+Set `automatic_operator_recovery=False` before init to own these decisions.
 
 ```python
 accepted = worker.retry_recovery(
@@ -215,8 +273,8 @@ progress active. Close cancels the wait before draining operation leases.
 Local replay requires one fully observed, terminal local chip group, no other
 outstanding endpoint work, closed graph construction, and current replay-safe
 metadata. Separate per-rank TaskSlots, missing/remote ranks, and still-running
-peers require further coordination and are refused. The API does not stop a
-live peer. Existing scope checks restrict the Python facade to A5 local L3 with
+peers are refused by this manual transaction. Automatic coordination stops a live
+local peer before invoking this same terminal-only transaction. Existing scope checks restrict the Python facade to A5 local L3 with
 operator recovery enabled and single-frame endpoints.
 
 Communication scope requires one explicitly bound full-communicator domain on
@@ -317,9 +375,50 @@ must be checked separately; absence of the Abort symbol returns failure.
 
 SDMA transport recovery preserves window contents. The regression separately
 proves fresh SDMA data movement and failed-A / blocked-old-B / new-A / new-B ordering.
-Tests use the existing explicit execution-fatal fixture; they do not simulate a
-network outage or certify recovery from every physical transport fault.
+`test_recovery_dispatch.py` now uses an AIV kernel-reported async error (101)
+before rank0 publishes an SDMA ready notification. Rank1 has already sent its
+entry notification and waits on its real completion counter. That peer can only
+finish the failed attempt through coordinated STOP or a failure/timeout; replay
+uses a fresh notification epoch. The test has no user recovery loop, and checks
+original A/B/C counters and order after automatic replay. This models protocol
+stall after a peer failure; it neither fabricates an error CQE nor simulates a
+physical link outage. Hardware runs must show peer status -12 rather than a
+watchdog timeout before claiming coordinated-stop recovery.
 URMA supports execution-only preservation; its transport recovery is unsupported.
 CCU retains an engine/capability boundary. The former binding-rebuild and transport
 replacement APIs are removed; shared communication or device scope returns `GIVE_UP`. Other
 hardware backends retain their existing comm ABI and return `UNSUPPORTED`.
+
+
+### Host execution-wait deadline
+
+On A5, a nonblocking native-run wait uses the existing resolved
+`SIMPLER_STREAM_SYNC_TIMEOUT_MS` budget (default 50000 ms). Its steady-clock
+deadline starts after the launch transaction returns with submitted work;
+preparation and subsequent queries never restart it. Both execution streams
+are queried first: an observed completion/error is handled normally. Only an
+otherwise pending pair can expire. A nonpositive internal timeout leaves the
+wait unbounded; the existing environment parser still requires a positive value.
+
+Expiration records `PTO_RUNTIME_ERR_EXECUTION_WAIT_TIMEOUT` (-1005), fences
+execution admission, and requests generation-fenced cooperative STOP once before
+entering the existing drain/finalize path. The original host timeout remains a
+failure even when STOP makes the final stream sync succeed. The drain's actual
+stream return is logged separately as `stream_rc`; it is not fabricated as a
+CANN timeout. PTO quiescence, native retirement, collective domain recovery,
+replay eligibility, and retry policy retain their existing structural gates.
+A timeout alone proves none of them, and does not launch any successor.
+
+This bounds the pending-query phase, not the whole recovery transaction. Final
+stream drain retains its own existing per-stream timeout; STOP H2D and driver
+calls are not made interruptible by a host clock. The Coordinator's STOP ACK and
+terminal deadlines start in their own phases. `RunHandle.wait(timeout)` remains
+a caller wait limit, not an execution cancellation request. Device watchdogs
+remain independent and can report a fault before the host deadline.
+
+The enabled child currently polls without an added sleep. The deadline adds a
+steady-clock read while pending, but does not change the device STOP sampling
+period or introduce a new query interval. Runtime synchronization internals and
+CPU cost equivalence are not assumed; normal execution overhead requires a
+hardware measurement. No transport-fault injection or test-only production
+switch is added for this deadline.

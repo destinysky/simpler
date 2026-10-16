@@ -110,6 +110,9 @@ enum {
     PTO_RUNTIME_ERR_INVALID_STATE = PTO_RUNTIME_ERR_BASE - 3,
     /* A caller supplied an invalid pointer, id, size, or other argument. */
     PTO_RUNTIME_ERR_INVALID_ARGUMENT = PTO_RUNTIME_ERR_BASE - 4,
+    /* Host execution wait expired; this is not a device/transport diagnosis or
+       proof that the submitted generation has stopped. */
+    PTO_RUNTIME_ERR_EXECUTION_WAIT_TIMEOUT = PTO_RUNTIME_ERR_BASE - 5,
 };
 
 /** Return values from simpler_poll_run(). */
@@ -539,6 +542,8 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  * simpler_launch_run() returns.
  */
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+// Optional capability: delivers a stop request; never grants a quiescence proof.
+int simpler_request_stop(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 /** Wait for device execution to terminate. Does not release prepared resources. */
 int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime);

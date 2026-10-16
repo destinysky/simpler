@@ -107,6 +107,10 @@ public:
         // transition and the run-level hold. The coordinator retains evidence
         // until the external owner resolves the episode.
         bool operator_recovery_enabled{false};
+        bool automatic_operator_recovery{false};
+        uint32_t recovery_max_retries{1};
+        double recovery_backoff_s{0.0};
+        double recovery_timeout_s{30.0};
         std::function<std::optional<uint32_t>(TaskSlot, uint64_t)> begin_task_recovery_cb;
         std::function<void(TaskSlot, uint64_t)> finish_task_recovery_cb;
         std::function<void(bool)> on_global_recovery_freeze_cb;
@@ -227,6 +231,8 @@ private:
     void run();
     bool try_intercept_recovery(WorkerCompletion &completion);
     void progress_recovery();
+    void coordinate_recovery();
+    std::thread recovery_thread_;
     void on_recovery_resolution(RecoveryRequest request, const std::string &reason);
     void finish_recovery_episode(uint64_t recovery_id);
     void on_task_complete(const WorkerCompletion &completion);

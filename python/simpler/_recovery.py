@@ -168,3 +168,12 @@ class EndpointRecoverySession:
         request.phase = phase
         request.collective_rc = -1 if phase == DomainRecoveryPhase.ABORT else 0
         return request
+
+
+def validate_stop_identity(packet, frame, endpoint_generation, previous_recovery_id):
+    if frame is None or packet.endpoint_generation != endpoint_generation or packet.recovery_id == 0:
+        raise RuntimeError("stale cooperative-stop endpoint")
+    expected = (frame[1], frame[5], frame[6], frame[3], frame[4])
+    actual = (packet.run_id, packet.task_slot, packet.group_index, packet.pipeline_generation, packet.dispatch_id)
+    if actual != expected or previous_recovery_id not in (0, packet.recovery_id):
+        raise RuntimeError("cooperative stop targets a stale task/attempt/generation")

@@ -140,6 +140,7 @@ public:
     );
     void launch_native_run(const ChipWorkerNativeRun &run);
     bool poll_native_run(const ChipWorkerNativeRun &run);
+    void request_stop_native_run(const ChipWorkerNativeRun &run);
     void wait_native_run(const ChipWorkerNativeRun &run);
     void finalize_native_run(const ChipWorkerNativeRun &run);
 
@@ -344,6 +345,7 @@ private:
     SimplerPrepareRunFn prepare_run_fn_ = nullptr;
     SimplerNativeRunFn launch_run_fn_ = nullptr;
     SimplerNativeRunFn poll_run_fn_ = nullptr;
+    SimplerNativeRunFn request_stop_fn_ = nullptr;
     SimplerNativeRunFn wait_run_fn_ = nullptr;
     SimplerNativeRunFn finalize_run_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_concurrent_native_prepare_fn_ = nullptr;

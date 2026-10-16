@@ -5,7 +5,7 @@
 
 extern "C" {
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
-    return OrchestrationConfig{.expected_arg_count = 11};
+    return OrchestrationConfig{.expected_arg_count = 13};
 }
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
     CoreTaskArgs transfer;
@@ -22,10 +22,21 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const uint32_t attempt = get_tensor_data<uint32_t>(counter, 1, index) + 1;
     set_tensor_data(counter, 1, index, attempt);
     const uint64_t mode = args.scalar<uint64_t>(4);
-    if (mode == 2 || (mode == 1 && attempt == 1)) {
-        rt_report_fatal(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "replay regression fault after SDMA completion");
-        return;
-    }
+    const uint64_t epoch = args.scalar<uint64_t>(3) * 16 + attempt;
+    auto protocol = [&](uint64_t publish, uint64_t fail) {
+        CoreTaskArgs task;
+        task.add_inout(args.tensor(6).ref());
+        task.add_output(args.tensor(2).ref());
+        task.add_scalar(args.scalar<uint64_t>(0));
+        task.add_scalar(epoch);
+        task.add_scalar(publish);
+        task.add_scalar(fail);
+        rt_submit_aiv_task(1, task);
+        (void)get_tensor_data<uint32_t>(args.tensor(2).ref(), 1, first);
+    };
+    protocol(0, 0);
+    // Rank0 produces the ready notification. Rank1 cannot finish A without it.
+    if (args.scalar<uint64_t>(5) == 0) protocol(1, mode == 2 || (mode == 1 && attempt == 1));
 
     CoreTaskArgs completion;
     completion.add_input(args.tensor(1).ref());
@@ -33,6 +44,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     completion.add_scalar(args.scalar<uint64_t>(1));
     completion.add_scalar(args.scalar<uint64_t>(2));
     completion.add_scalar(args.scalar<uint64_t>(3));
-    rt_submit_aiv_task(1, completion);
+    rt_submit_aiv_task(2, completion);
 }
 }

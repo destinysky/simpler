@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "call_config.h"
+#include "execution_control.h"
 #include "orchestrator.h"
 #include "recovery_coordinator.h"
 #include "ring.h"
@@ -127,6 +128,9 @@ public:
 
     std::optional<RecoveryControlPhase> fail_phase;
     bool stale_reply{false};
+    bool ignore_stop{false};
+    bool stale_stop_reply{false};
+    bool stop_proof{true};
     std::vector<RecoveryControlPhase> phases;
     bool wait_count(size_t count) {
         std::unique_lock<std::mutex> lk(mu_);
@@ -153,12 +157,32 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
             phases.push_back(packet.phase);
             fail = fail_phase && *fail_phase == packet.phase;
+            if (packet.phase == RecoveryControlPhase::STOP) {
+                if (packet.dispatch_id != dispatch_.dispatch_id || packet.task_slot != dispatch_.task_slot ||
+                    packet.group_index != dispatch_.group_index)
+                    fail = true;
+                packet.stop_accepted = 1;
+                if (outstanding_ && events_.empty() && !ignore_stop) {
+                    WorkerEndpointProgress stopped;
+                    stopped.kind = WorkerProgressKind::COMPLETED;
+                    stopped.dispatch = dispatch_;
+                    stopped.completion.task_slot = dispatch_.task_slot;
+                    stopped.completion.group_index = dispatch_.group_index;
+                    stopped.completion.outcome = EndpointOutcome::TASK_FAILURE;
+                    stopped.completion.error_message = "peer cooperatively stopped";
+                    stopped.completion.native_execution_fault.raw_rc = 507018;
+                    stopped.completion.native_execution_fault.runtime_status = -SIMPLER_ERROR_COORDINATED_STOP;
+                    faulted_ = true;
+                    events_.push_back(std::move(stopped));
+                }
+                if (stale_stop_reply) ++packet.dispatch_id;
+            }
             packet.faulted = faulted_ ? 1 : 0;
             packet.execution.communication_context = 0x100;
             packet.execution.execution_context = 0x200;
             packet.execution.aicpu_stream = 0x300;
             packet.execution.aicore_stream = 0x400;
-            packet.execution.quiesced = 1;
+            packet.execution.quiesced = stop_proof ? 1 : 0;
             packet.execution.failed_run_epoch = 1;
             packet.execution.status = packet.phase == RecoveryControlPhase::INSPECT && faulted_ ?
                                           ExecutionRecoveryStatus::RECOVERY_REQUIRED :
@@ -422,6 +446,7 @@ protected:
     uint64_t backing{0};
     Tensor resource{};
     virtual bool enabled() const { return true; }
+    virtual bool automatic() const { return false; }
     void SetUp() override {
         ring.init(1ULL << 20);
         auto one = std::make_unique<RecoveryEndpoint>(0);
@@ -464,6 +489,8 @@ protected:
             orch.report_task_error(slot, message);
         };
         cfg.operator_recovery_enabled = enabled();
+        cfg.automatic_operator_recovery = automatic();
+        cfg.recovery_timeout_s = 0.2;
         cfg.begin_task_recovery_cb = [this](TaskSlot slot, uint64_t id) {
             return orch.begin_task_recovery(slot, id);
         };
@@ -509,6 +536,12 @@ protected:
         args.add_scalar(42);
         CallConfig cfg;
         TaskArgs peer = args;
+        if (automatic()) {
+            TaskDomainBinding binding;
+            binding.domain = {0, 1, 42, 0x2000, 0x1000, 0x4000};
+            binding.arguments = {{RecoveryArgKind::COMM_CONTEXT, 0, 0}};
+            args.domain_bindings = peer.domain_bindings = {binding};
+        }
         if (annotate) {
             RecoveryMetadata metadata{
                 91, 0, 1, 0, group ? std::vector<int32_t>{0, 1} : std::vector<int32_t>{0}, ReplaySafety::REPLAY_SAFE
@@ -871,6 +904,149 @@ TEST_F(SchedulerRecoveryTest, CallerCanBudgetMoreThanOneRetryWithoutAnL2Credit) 
     EXPECT_EQ(second->history().size(), 3u);
     orch.release_run(run);
 }
+
+class AutomaticRecoveryTest : public SchedulerRecoveryTest {
+    bool automatic() const override { return true; }
+};
+TEST_F(AutomaticRecoveryTest, StopsLivePeerAndCommitsOriginalGraphWithoutAnExternalOwner) {
+    graph(true, true);
+    native_failure();
+    ASSERT_TRUE(first->wait_count(2));
+    ASSERT_TRUE(second->wait_count(2));
+    EXPECT_EQ(ring.slot_state(b.task_slot)->state.load(), TaskState::PENDING);
+    first->succeed();
+    EXPECT_FALSE(orch.wait_run_for(run, 0.03));
+    EXPECT_EQ(ring.slot_state(b.task_slot)->state.load(), TaskState::PENDING);
+    second->succeed();
+    ASSERT_TRUE(first->wait_count(3));
+    EXPECT_EQ(first->history()[2].task_slot, b.task_slot);
+    first->succeed();
+    ASSERT_TRUE(first->wait_count(4));
+    first->succeed();
+    EXPECT_TRUE(orch.wait_run_for(run, 3));
+    EXPECT_EQ(first->history().size(), 4u);
+    EXPECT_EQ(second->history().size(), 2u);
+    EXPECT_FALSE(orch.run_failed(run));
+    orch.release_run(run);
+}
+TEST_F(AutomaticRecoveryTest, HostWaitTimeoutAloneStopsPeerAndReplaysOriginalGraph) {
+    graph(true, true);
+    NativeExecutionFault timeout{};
+    timeout.raw_rc = PTO_RUNTIME_ERR_EXECUTION_WAIT_TIMEOUT;
+    // No device error code is needed to trigger the normal recovery transaction.
+    first->fail_native(timeout, true);
+    ASSERT_TRUE(first->wait_count(2));
+    ASSERT_TRUE(second->wait_count(2));
+    EXPECT_EQ(ring.slot_state(b.task_slot)->state.load(), TaskState::PENDING);
+    EXPECT_NE(
+        std::find(second->phases.begin(), second->phases.end(), RecoveryControlPhase::STOP), second->phases.end()
+    );
+    first->succeed();
+    EXPECT_FALSE(orch.wait_run_for(run, 0.03));
+    EXPECT_EQ(ring.slot_state(b.task_slot)->state.load(), TaskState::PENDING);
+    second->succeed();
+    ASSERT_TRUE(first->wait_count(3));
+    EXPECT_EQ(first->history()[2].task_slot, b.task_slot);
+    first->succeed();
+    ASSERT_TRUE(first->wait_count(4));
+    first->succeed();
+    EXPECT_TRUE(orch.wait_run_for(run, 3));
+    EXPECT_FALSE(orch.run_failed(run));
+    EXPECT_EQ(first->history().size(), 4u);
+    EXPECT_EQ(second->history().size(), 2u);
+    orch.release_run(run);
+}
+TEST_F(AutomaticRecoveryTest, HostWaitTimeoutWithoutQuiescenceProofCannotReplay) {
+    first->stop_proof = false;
+    graph(true, true);
+    NativeExecutionFault timeout{};
+    timeout.raw_rc = PTO_RUNTIME_ERR_EXECUTION_WAIT_TIMEOUT;
+    first->fail_native(timeout, true);
+    EXPECT_THROW(orch.wait_run_for(run, 3), std::runtime_error);
+    EXPECT_EQ(first->history().size(), 1u);
+    EXPECT_EQ(second->history().size(), 1u);
+    EXPECT_EQ(std::count(first->phases.begin(), first->phases.end(), RecoveryControlPhase::REARM), 0);
+    EXPECT_EQ(std::count(second->phases.begin(), second->phases.end(), RecoveryControlPhase::ARM), 0);
+    orch.release_run(run);
+}
+TEST_F(AutomaticRecoveryTest, PersistentFailureUsesTheConfiguredL3Budget) {
+    graph(true, true);
+    native_failure();
+    ASSERT_TRUE(first->wait_count(2));
+    ASSERT_TRUE(second->wait_count(2));
+    native_failure();
+    EXPECT_THROW(orch.wait_run_for(run, 3), std::runtime_error);
+    EXPECT_EQ(first->history().size(), 2u);
+    EXPECT_EQ(second->history().size(), 2u);
+    orch.release_run(run);
+}
+TEST_F(AutomaticRecoveryTest, MissingMetadataStillStopsThePeerThenGivesUp) {
+    graph(true, false);
+    native_failure();
+    EXPECT_THROW(orch.wait_run_for(run, 3), std::runtime_error);
+    EXPECT_EQ(second->history().size(), 1u);
+    EXPECT_NE(
+        std::find(second->phases.begin(), second->phases.end(), RecoveryControlPhase::STOP), second->phases.end()
+    );
+    EXPECT_EQ(std::count(second->phases.begin(), second->phases.end(), RecoveryControlPhase::ARM), 0);
+    orch.release_run(run);
+}
+TEST_F(AutomaticRecoveryTest, DeliveryAckWithoutTerminalOutcomeCannotStartResourceRecovery) {
+    second->ignore_stop = true;
+    graph(true, true);
+    native_failure();
+    EXPECT_THROW(orch.wait_run_for(run, 3), std::runtime_error);
+    EXPECT_EQ(first->history().size(), 1u);
+    EXPECT_EQ(std::count(second->phases.begin(), second->phases.end(), RecoveryControlPhase::PREPARE), 0);
+    orch.release_run(run);
+}
+TEST_F(AutomaticRecoveryTest, AStaleStopReplyNeverRearmsOrRedispatches) {
+    second->stale_stop_reply = true;
+    graph(true, true);
+    native_failure();
+    EXPECT_THROW(orch.wait_run_for(run, 3), std::runtime_error);
+    EXPECT_EQ(first->history().size(), 1u);
+    EXPECT_EQ(std::count(second->phases.begin(), second->phases.end(), RecoveryControlPhase::ARM), 0);
+    orch.release_run(run);
+}
+TEST_F(AutomaticRecoveryTest, AStoppedPeerWithoutProofCannotRecover) {
+    second->stop_proof = false;
+    graph(true, true);
+    native_failure();
+    EXPECT_THROW(orch.wait_run_for(run, 3), std::runtime_error);
+    EXPECT_EQ(first->history().size(), 1u);
+    EXPECT_EQ(std::count(second->phases.begin(), second->phases.end(), RecoveryControlPhase::ARM), 0);
+    orch.release_run(run);
+}
+TEST(RecoveryCoordinatorTest, FaultEventArrivesBeforePeerTermination) {
+    RecoveryCoordinator c;
+    auto r = episode(true);
+    r.ticket = c.submit(r);
+    const auto early = c.wait_next(0);
+    ASSERT_TRUE(early);
+    EXPECT_FALSE(early->all_members_terminal());
+    EXPECT_FALSE(c.wait_terminal(r.ticket, 0));
+    c.complete_member(r.ticket.recovery_id, 1, WorkerCompletion{});
+    EXPECT_TRUE(c.wait_terminal(r.ticket, 0)->all_members_terminal());
+    auto waiter = std::async(std::launch::async, [&] {
+        return c.wait_next(r.ticket.recovery_id);
+    });
+    c.cancel_all();
+    ASSERT_EQ(waiter.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    EXPECT_FALSE(waiter.get());
+}
+TEST(ExecutionStopControlTest, ZeroAndStaleEpochCannotCancelAnotherGeneration) {
+    ExecutionStopControl control;
+    EXPECT_FALSE(execution_stop_requested(control));
+    control.run_epoch = 7;
+    control.requested_epoch = 6;
+    EXPECT_FALSE(execution_stop_requested(control));
+    control.requested_epoch = 7;
+    EXPECT_TRUE(execution_stop_requested(control));
+    control.run_epoch = 8;
+    EXPECT_FALSE(execution_stop_requested(control));
+}
+
 class RecoveryDisabledTest : public SchedulerRecoveryTest {
     bool enabled() const override { return false; }
 };

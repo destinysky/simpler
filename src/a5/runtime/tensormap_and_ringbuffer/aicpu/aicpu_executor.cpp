@@ -35,6 +35,7 @@
 
 // Runtime headers (full struct definition for create/destroy + SIMPLER_SCOPE)
 #include "runtime_core.h"
+#include "run_completion.h"
 #include "runtime_types.h"
 #include "shared_memory.h"
 
@@ -139,7 +140,7 @@ struct AicpuExecutor {
 
     // ===== Task queue state (managed by scheduler ready queues) =====
 
-    std::atomic<int32_t> finished_count_{0};
+    AicpuRunCompletion run_completion_;
     std::atomic<bool> runtime_init_ready_{false};
 
     // Per-Worker arena attaching to the pooled prebuilt runtime image. Host
@@ -171,7 +172,7 @@ struct AicpuExecutor {
         int32_t callable_id, uint64_t dev_orch_so_addr, uint64_t dev_orch_so_size, const char *entry_symbol,
         const char *config_symbol, int32_t thread_idx
     );
-    int32_t run(Runtime *runtime, bool &last_thread);
+    int32_t run(Runtime *runtime, bool &last_thread, bool &retired);
     void deinit(Runtime *runtime);
 
     ~AicpuExecutor() {
@@ -311,7 +312,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         // peer that already passed that gate is not joined here — its own cores are
         // valid (it handshaked them), and the failure ends in the host device reset
         // that reaps every core, so the residual overlap is bounded and
-        // non-corrupting. finished_count_ is reset per-run in deinit(), not here.
+        // non-corrupting. run_completion_ is reset per-run in deinit(), not here.
         if (sched_ctx_.handshake_failed()) {
             sched_ctx_.abort_and_shutdown(runtime);
             init_failed_.store(true, std::memory_order_release);
@@ -329,7 +330,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     hs_arrived_.fetch_add(1, std::memory_order_acq_rel);
     if (is_leader) {
         while (hs_arrived_.load(std::memory_order_acquire) < hs_nthreads) {}
-        finished_count_.store(0, std::memory_order_release);
+        run_completion_.reset();
         if (sched_ctx_.post_handshake_init(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
             init_done_.store(true, std::memory_order_release);
@@ -489,7 +490,8 @@ int32_t AicpuExecutor::load_orch_so(
 /**
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
-int32_t AicpuExecutor::run(Runtime *runtime, bool &last_thread) {
+int32_t AicpuExecutor::run(Runtime *runtime, bool &last_thread, bool &retired) {
+    retired = false;
     // Prefer the filter gate's deterministic exec_idx so role assignment
     // (sched 0..N-2 / orch N-1) is driven by host-computed ALLOWED_CPUS,
     // not arrival order. Fall back to the legacy fetch-add counter on
@@ -891,12 +893,13 @@ int32_t AicpuExecutor::run(Runtime *runtime, bool &last_thread) {
 
     // Check if this is the last thread to finish
     const int32_t participant_count = aicpu_thread_num_;
-    int32_t prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
+    const auto completion = run_completion_.arrive(participant_count, run_rc);
+    retired = true;
     LOG_INFO(
-        "[PTO_RECOVERY_PROBE] AICPU_FINISH_COUNT thread=%d finished=%d target=%d", thread_idx, prev_finished + 1,
+        "[PTO_RECOVERY_PROBE] AICPU_FINISH_COUNT thread=%d finished=%d target=%d", thread_idx, completion.finished,
         participant_count
     );
-    if (prev_finished + 1 == participant_count) {
+    if (completion.last) {
         LOG_INFO(
             "[PTO_RECOVERY_PROBE] ALL_AICPU_RUN_THREADS_EXITED count=%d callable_id=%d", aicpu_thread_num_,
             runtime->get_active_callable_id()
@@ -928,7 +931,7 @@ int32_t AicpuExecutor::run(Runtime *runtime, bool &last_thread) {
         }
     }
 
-    return run_rc;
+    return completion.report_rc;
 }
 
 void AicpuExecutor::deinit(Runtime *runtime) {
@@ -937,12 +940,12 @@ void AicpuExecutor::deinit(Runtime *runtime) {
                          header->execution_quiesced.load(std::memory_order_acquire) >= 0;
     LOG_INFO(
         "[PTO_RECOVERY_PROBE] AICPU_EXECUTOR_DEINIT_BEGIN aicpu_threads=%d sched_threads=%d finished_count=%d",
-        aicpu_thread_num_, sched_thread_num_, finished_count_.load(std::memory_order_acquire)
+        aicpu_thread_num_, sched_thread_num_, run_completion_.finished()
     );
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
 
-    finished_count_.store(0, std::memory_order_release);
+    run_completion_.reset();
     runtime_init_ready_.store(false, std::memory_order_release);
 
     aicpu_thread_num_ = 0;
@@ -1044,9 +1047,18 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
 
     int32_t rc = 0;
     bool last_thread = false;
+    bool retired = false;
     {
         AicpuPhaseScope graph_build(AicpuPhase::GraphBuild);
-        rc = g_aicpu_executor.run(runtime, last_thread);
+        rc = g_aicpu_executor.run(runtime, last_thread, retired);
+    }
+    if (retired && !last_thread) {
+        // Successful early entry returns already exist on the healthy path.
+        // Preserve that behavior for failed runs too: the last participant
+        // owns the shared runtime error and all aggregated local errors, and
+        // reports them only after deinit has published the stop proof. A run
+        // that failed before joining retirement still returns its error below.
+        return 0;
     }
     if (rc != 0) {
         LOG_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
@@ -1058,8 +1070,9 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     // threads are still draining) open the window at its early exit, so the
     // cross-thread max(end)-min(start) reduction would absorb the orch-waits-for-
     // sched overlap into post_orch — inflating it well past the actual teardown.
-    // read_runtime_status is two atomic loads every thread needs, so it stays
-    // outside the scope.
+    // Only the final reporter reads the shared runtime status here. A thread
+    // that failed before joining retirement also preserves its existing error
+    // return, without claiming that the generation is safe to recover.
     int32_t runtime_rc = read_runtime_status(runtime);
     if (last_thread) {
         AicpuPhaseScope post_orch(AicpuPhase::PostOrch);

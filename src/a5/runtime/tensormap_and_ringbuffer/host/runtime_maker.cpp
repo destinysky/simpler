@@ -206,6 +206,11 @@ static bool resolve_ring_config(
     return true;
 }
 
+extern "C" void *execution_stop_control(Runtime *runtime) {
+    if (runtime == nullptr || runtime->get_gm_sm_ptr() == nullptr) return nullptr;
+    return static_cast<char *>(runtime->get_gm_sm_ptr()) + offsetof(SharedMemoryHeader, execution_stop);
+}
+
 extern "C" void *execution_quiescence_flag(Runtime *runtime) {
     if (runtime == nullptr || runtime->get_gm_sm_ptr() == nullptr) return nullptr;
     return static_cast<char *>(runtime->get_gm_sm_ptr()) + offsetof(SharedMemoryHeader, execution_quiesced);

@@ -338,6 +338,7 @@ struct WorkerCompletion {
     std::string error_message;
     bool launch_accepted{false};
     NativeExecutionFault native_execution_fault{};
+    uint64_t dispatch_id{0};
 };
 
 // =============================================================================
