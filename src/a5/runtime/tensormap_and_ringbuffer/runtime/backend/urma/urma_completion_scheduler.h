@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_URMA_URMA_COMPLETION_SCHEDULER_H_
-#define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_URMA_URMA_COMPLETION_SCHEDULER_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -20,10 +19,9 @@
 #include "completion_token.h"
 #include "runtime_status.h"
 
-namespace pto2::urma_backend {
+namespace urma_backend {
 
 inline constexpr uint32_t kHandleRankIdShift = 32;
-inline constexpr uint32_t kCqeBytes = 64;
 inline constexpr uint32_t kMaxCqeShift = 12;
 
 enum class UrmaDbMode : int32_t {
@@ -35,12 +33,14 @@ enum class UrmaDbMode : int32_t {
 struct UrmaInfo {
     uint32_t qp_num;
     uint32_t local_token_id;
+    uint32_t notify_pool_token_id;
     uint32_t rank_count;
     uint64_t sq_ptr;
     uint64_t rq_ptr;
     uint64_t scq_ptr;
     uint64_t rcq_ptr;
     uint64_t mem_ptr;
+    uint64_t notify_pool_ptr;
 };
 
 struct UrmaWqCtx {
@@ -53,6 +53,7 @@ struct UrmaWqCtx {
     UrmaDbMode db_mode;
     uint64_t db_addr;
     uint32_t sl;
+    uint32_t submitted_wqe_count;
 };
 
 struct UrmaCqCtx {
@@ -66,8 +67,11 @@ struct UrmaCqCtx {
     uint64_t db_addr;
 };
 
-static_assert(sizeof(UrmaInfo) == 56, "URMA info ABI drift");
+static_assert(sizeof(UrmaInfo) == 64, "URMA info ABI drift");
+static_assert(offsetof(UrmaInfo, rank_count) == 12, "URMA info ABI drift");
+static_assert(offsetof(UrmaInfo, notify_pool_ptr) == 56, "URMA info ABI drift");
 static_assert(offsetof(UrmaInfo, sq_ptr) == 16, "URMA info ABI drift");
+static_assert(offsetof(UrmaWqCtx, submitted_wqe_count) == 60, "URMA WQ context ABI drift");
 static_assert(sizeof(UrmaWqCtx) == 64, "URMA WQ context ABI drift");
 static_assert(offsetof(UrmaWqCtx, db_addr) == 48, "URMA WQ context ABI drift");
 static_assert(sizeof(UrmaCqCtx) == 56, "URMA CQ context ABI drift");
@@ -118,105 +122,80 @@ inline uint32_t load_cqe_dw0(uint64_t cqe_addr) {
     return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
 }
 
-inline void update_tail_info(const UrmaCqCtx &cq_ctx, const UrmaWqCtx &wq_ctx, uint32_t cur_tail) {
-    if (cq_ctx.tail_addr != 0) {
-        store_device_u32(cq_ctx.tail_addr, cur_tail);
-    }
-    if (cq_ctx.db_addr != 0) {
-        store_device_u32(cq_ctx.db_addr, cur_tail & 0xFFFFFFu);
-    }
-    if (wq_ctx.tail_addr != 0) {
-        store_device_u32(wq_ctx.tail_addr, cur_tail);
-    }
+inline void
+update_tail_info(const UrmaCqCtx &cq_ctx, const UrmaWqCtx &wq_ctx, uint32_t target_bb, uint32_t target_cqe) {
+    store_device_u32(cq_ctx.tail_addr, target_cqe);
+    store_device_u32(cq_ctx.db_addr, target_cqe & 0xFFFFFFu);
+    store_device_u32(wq_ctx.tail_addr, target_bb);
 }
 
-inline CompletionPollResult poll_urma_event_handle(uint64_t event_handle, uint64_t workspace_addr) {
-    if (event_handle == 0) {
-        return {CompletionPollState::READY, SIMPLER_ERROR_NONE};
-    }
-    if (workspace_addr == 0) {
-        return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
-    }
+inline CompletionPollResult
+poll_urma_event_handle(uint64_t event_handle, uint64_t workspace_addr, uint32_t target_cqe) {
+    const CompletionPollResult invalid{CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
+    if (event_handle == 0) return {CompletionPollState::READY, SIMPLER_ERROR_NONE};
+    if (workspace_addr == 0) return invalid;
 
     uint32_t remote_rank = 0;
-    uint32_t target_head = 0;
-    decode_urma_event_handle(event_handle, remote_rank, target_head);
-    if (target_head == 0) {
-        return {CompletionPollState::READY, SIMPLER_ERROR_NONE};
-    }
-
+    uint32_t target_bb = 0;
+    decode_urma_event_handle(event_handle, remote_rank, target_bb);
     auto *info = reinterpret_cast<volatile UrmaInfo *>(static_cast<uintptr_t>(workspace_addr));
     invalidate_object(info, sizeof(*info));
     const uint32_t qp_num = __atomic_load_n(&info->qp_num, __ATOMIC_ACQUIRE);
     const uint32_t rank_count = __atomic_load_n(&info->rank_count, __ATOMIC_ACQUIRE);
     const uint64_t sq_ptr = __atomic_load_n(&info->sq_ptr, __ATOMIC_ACQUIRE);
     const uint64_t scq_ptr = __atomic_load_n(&info->scq_ptr, __ATOMIC_ACQUIRE);
-    if (qp_num == 0 || remote_rank >= rank_count || sq_ptr == 0 || scq_ptr == 0) {
-        return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
-    }
+    // AsyncEvent identifies the peer, but carries no QP index.
+    if (qp_num != 1 || remote_rank >= rank_count || sq_ptr == 0 || scq_ptr == 0) return invalid;
 
-    const uint64_t ctx_index = static_cast<uint64_t>(remote_rank) * qp_num;
     auto *cq_entry = reinterpret_cast<volatile UrmaCqCtx *>(
-        static_cast<uintptr_t>(scq_ptr + ctx_index * static_cast<uint64_t>(sizeof(UrmaCqCtx)))
+        static_cast<uintptr_t>(scq_ptr + remote_rank * static_cast<uint64_t>(sizeof(UrmaCqCtx)))
     );
     auto *wq_entry = reinterpret_cast<volatile UrmaWqCtx *>(
-        static_cast<uintptr_t>(sq_ptr + ctx_index * static_cast<uint64_t>(sizeof(UrmaWqCtx)))
+        static_cast<uintptr_t>(sq_ptr + remote_rank * static_cast<uint64_t>(sizeof(UrmaWqCtx)))
     );
     invalidate_object(cq_entry, sizeof(*cq_entry));
     invalidate_object(wq_entry, sizeof(*wq_entry));
-
     UrmaCqCtx cq_ctx{};
     cq_ctx.buf_addr = __atomic_load_n(&cq_entry->buf_addr, __ATOMIC_ACQUIRE);
     cq_ctx.cqe_shift_size = __atomic_load_n(&cq_entry->cqe_shift_size, __ATOMIC_ACQUIRE);
     cq_ctx.depth = __atomic_load_n(&cq_entry->depth, __ATOMIC_ACQUIRE);
     cq_ctx.tail_addr = __atomic_load_n(&cq_entry->tail_addr, __ATOMIC_ACQUIRE);
     cq_ctx.db_addr = __atomic_load_n(&cq_entry->db_addr, __ATOMIC_ACQUIRE);
-
     UrmaWqCtx wq_ctx{};
+    wq_ctx.head_addr = __atomic_load_n(&wq_entry->head_addr, __ATOMIC_ACQUIRE);
     wq_ctx.tail_addr = __atomic_load_n(&wq_entry->tail_addr, __ATOMIC_ACQUIRE);
-    if (cq_ctx.buf_addr == 0 || cq_ctx.tail_addr == 0 || cq_ctx.cqe_shift_size > kMaxCqeShift ||
-        !is_power_of_two(cq_ctx.depth)) {
-        return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
-    }
+    wq_ctx.depth = __atomic_load_n(&wq_entry->depth, __ATOMIC_ACQUIRE);
+    const uint32_t submitted_cqe = __atomic_load_n(&wq_entry->submitted_wqe_count, __ATOMIC_ACQUIRE);
+    if (cq_ctx.buf_addr == 0 || cq_ctx.tail_addr == 0 || cq_ctx.db_addr == 0 || wq_ctx.head_addr == 0 ||
+        wq_ctx.tail_addr == 0 || cq_ctx.cqe_shift_size < 6 || cq_ctx.cqe_shift_size > kMaxCqeShift ||
+        !is_power_of_two(cq_ctx.depth) || !is_power_of_two(wq_ctx.depth) || cq_ctx.depth >= (1U << 31) ||
+        wq_ctx.depth >= (1U << 31))
+        return invalid;
 
+    const uint32_t cur_tail = load_device_u32(cq_ctx.tail_addr);
+    const uint32_t bb_tail = load_device_u32(wq_ctx.tail_addr);
+    if (has_reached(cur_tail, target_cqe)) {
+        return has_reached(bb_tail, target_bb) ? CompletionPollResult{CompletionPollState::READY, SIMPLER_ERROR_NONE} :
+                                                 invalid;
+    }
+    if (!has_reached(load_device_u32(wq_ctx.head_addr), target_bb) || !has_reached(submitted_cqe, target_cqe) ||
+        target_cqe - cur_tail > cq_ctx.depth || target_bb - bb_tail > wq_ctx.depth)
+        return invalid;
     const uint32_t cqe_size = 1u << cq_ctx.cqe_shift_size;
-    uint32_t cur_tail = load_device_u32(cq_ctx.tail_addr);
-    if (has_reached(cur_tail, target_head)) {
-        return {CompletionPollState::READY, SIMPLER_ERROR_NONE};
-    }
-
-    uint32_t next_tail = cur_tail;
-    while (!has_reached(next_tail, target_head)) {
-        const uint64_t cqe_addr =
-            cq_ctx.buf_addr + static_cast<uint64_t>(cqe_size) * static_cast<uint64_t>(next_tail & (cq_ctx.depth - 1));
-        const uint32_t dw0 = load_cqe_dw0(cqe_addr);
-        const bool valid_owner = ((next_tail / cq_ctx.depth) & 1u) != 0;
+    for (uint32_t sequence = cur_tail; sequence != target_cqe; ++sequence) {
+        const uint64_t address = cq_ctx.buf_addr + static_cast<uint64_t>(cqe_size) * (sequence & (cq_ctx.depth - 1));
+        const uint32_t dw0 = load_cqe_dw0(address);
+        const bool valid_owner = ((sequence / cq_ctx.depth) & 1u) != 0;
         const bool owner = ((dw0 >> 2) & 1u) != 0;
-        if ((valid_owner ^ owner) == 0) {
-            break;
-        }
-
-        const uint8_t substatus = static_cast<uint8_t>((dw0 >> 16) & 0xFFu);
-        const uint8_t status = static_cast<uint8_t>((dw0 >> 24) & 0xFFu);
-        if (status != 0 || substatus != 0) {
-            ++next_tail;
-            update_tail_info(cq_ctx, wq_ctx, next_tail);
-            return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
-        }
-        next_tail++;
+        if (valid_owner == owner) return {CompletionPollState::PENDING, SIMPLER_ERROR_NONE};
+        // A failed CQE stays in the unretired prefix for the recovery owner.
+        if ((dw0 & 0xFFFF0000u) != 0) return invalid;
     }
-
-    if (next_tail != cur_tail) {
-        update_tail_info(cq_ctx, wq_ctx, next_tail);
-    }
-    return {
-        has_reached(next_tail, target_head) ? CompletionPollState::READY : CompletionPollState::PENDING,
-        SIMPLER_ERROR_NONE
-    };
+    // SQ counts basic blocks; notify/FAA can use multiple blocks per CQE.
+    update_tail_info(cq_ctx, wq_ctx, target_bb, target_cqe);
+    return {CompletionPollState::READY, SIMPLER_ERROR_NONE};
 }
 
 inline void retire_urma_event_handle(uint64_t /*event_handle*/, uint64_t /*workspace_addr*/) {}
 
-}  // namespace pto2::urma_backend
-
-#endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_URMA_URMA_COMPLETION_SCHEDULER_H_
+}  // namespace urma_backend

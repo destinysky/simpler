@@ -9,16 +9,13 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_URMA_URMA_COMPLETION_KERNEL_H_
-#define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_URMA_URMA_COMPLETION_KERNEL_H_
+#pragma once
 
 #include <stdint.h>
 
 #include <type_traits>
 
-#if defined(__CPU_SIM)
-#include <type_traits>
-#else
+#if !defined(__CPU_SIM)
 #include "async_kernel_api.h"
 
 #include <pto/comm/async_common/async_event_impl.hpp>
@@ -93,14 +90,24 @@ UrmaTput(const DstTensor &dst, const SrcTensor &src, __gm__ uint8_t *workspace, 
 
 namespace pto2::detail {
 
+#if defined(__CPU_SIM)
+inline __aicore__ void defer_error(AsyncCtx &ctx, int32_t error_code) {
+    if (ctx.task_token.is_valid() && ctx.completion_error_code != nullptr) {
+        *ctx.completion_error_code = error_code;
+    }
+}
+
+inline __aicore__ void defer_flush(AsyncCtx & /*ctx*/) { __asm__ __volatile__("" ::: "memory"); }
+#endif
+
+}  // namespace pto2::detail
+
+namespace urma_backend {
+
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
 inline __aicore__ bool register_urma_async_event(
     AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session, __gm__ uint8_t *workspace
 );
-
-}  // namespace pto2::detail
-
-namespace pto2::urma_backend {
 
 inline constexpr uint64_t kUrmaMaxTransferBytes = 256ULL * 1024ULL * 1024ULL;
 
@@ -192,7 +199,7 @@ inline __aicore__ bool submit_urma_request_once(AsyncCtx &ctx, UrmaRequestDescri
     } else {
         event = pto::comm::TPUT_ASYNC<pto::comm::DmaEngine::URMA>(desc.dst, desc.src, session);
     }
-    if (!pto2::detail::register_urma_async_event(ctx, event, session, desc.workspace)) {
+    if (!register_urma_async_event(ctx, event, session, desc.workspace)) {
         return false;
     }
     pto2::detail::defer_flush(ctx);
@@ -246,7 +253,7 @@ inline __aicore__ bool submit_chunked_urma_request(AsyncCtx &ctx, UrmaRequestDes
     return true;
 }
 
-}  // namespace pto2::urma_backend
+}  // namespace urma_backend
 
 #if defined(__CPU_SIM)
 inline __aicore__ AsyncCtx get_async_ctx(__gm__ int64_t *args) {
@@ -286,26 +293,17 @@ inline __aicore__ bool register_completion_condition(AsyncCtx &ctx, const Comple
 }
 #endif
 
-namespace pto2::detail {
-
-#if defined(__CPU_SIM)
-inline __aicore__ void defer_load_slab(AsyncCtx & /*ctx*/) { __asm__ __volatile__("" ::: "memory"); }
-
-inline __aicore__ void defer_error(AsyncCtx &ctx, int32_t error_code) {
-    if (ctx.task_token.is_valid() && ctx.completion_error_code != nullptr) {
-        *ctx.completion_error_code = error_code;
-    }
-}
-
-inline __aicore__ void defer_flush(AsyncCtx & /*ctx*/) { __asm__ __volatile__("" ::: "memory"); }
-#endif
+namespace urma_backend {
 
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
 inline __aicore__ bool register_urma_async_event(
     AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session, __gm__ uint8_t *workspace
 ) {
     if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
-        (void)event.Wait(session);
+        if (!event.Wait(session)) {
+            pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            return false;
+        }
         return true;
     }
     if (event.handle == 0) {
@@ -314,31 +312,29 @@ inline __aicore__ bool register_urma_async_event(
 
     const uint32_t engine = static_cast<uint32_t>(event.engine);
     if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::URMA) || workspace == nullptr) {
-        defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         (void)event.Wait(session);
         return false;
     }
 
     CompletionToken token{
         event.handle,
-        0,
+        event.urmaTargetCqe,
         COMPLETION_ENGINE_URMA,
         COMPLETION_TYPE_URMA_EVENT_HANDLE,
         reinterpret_cast<uint64_t>(workspace),
     };
     if (!register_completion_condition(ctx, token)) {
-        defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
         (void)event.Wait(session);
         return false;
     }
     return true;
 }
 
-}  // namespace pto2::detail
+}  // namespace urma_backend
 
 template <typename DstTensor, typename SrcTensor>
 inline __aicore__ bool send_request_entry(AsyncCtx &ctx, UrmaRequestDescriptor<DstTensor, SrcTensor> desc) {
-    return pto2::urma_backend::submit_chunked_urma_request(ctx, desc);
+    return urma_backend::submit_chunked_urma_request(ctx, desc);
 }
-
-#endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_URMA_URMA_COMPLETION_KERNEL_H_

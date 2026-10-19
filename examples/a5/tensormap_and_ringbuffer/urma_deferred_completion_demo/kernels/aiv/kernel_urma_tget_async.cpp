@@ -47,34 +47,62 @@ static inline __aicore__ __gm__ T *tensor_data(__gm__ Tensor *tensor) {
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *input_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[2]);
-
-    // A null workspace means the host runtime was not built with the URMA
-    // backend; self-skip rather than dereferencing it.
-    if (comm_ctx == nullptr || comm_ctx->rankNum != 2 || comm_ctx->rankId >= comm_ctx->rankNum ||
+    __gm__ Tensor *evidence_tensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[3]);
+    const bool notify = args[4] != 0;
+    __gm__ int32_t *evidence = tensor_data<int32_t>(evidence_tensor);
+    AsyncCtx async_ctx = get_async_ctx(args);
+    const bool deferred = async_ctx_is_deferred(async_ctx) && async_ctx.completion_count != nullptr &&
+                          async_ctx.completion_entries != nullptr;
+    evidence[5] = deferred ? 1 : 0;
+    if (!deferred || comm_ctx == nullptr || comm_ctx->rankNum != 2 || comm_ctx->rankId >= comm_ctx->rankNum ||
         comm_ctx->workSpace == 0 || comm_ctx->windowsIn[comm_ctx->rankId] == 0) {
         pipe_barrier(PIPE_ALL);
         return;
     }
 
+    __gm__ uint8_t *workspace = reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace);
+    const uint32_t peer_rank = 1u - comm_ctx->rankId;
+    const uint64_t peer_base = urma_backend::peer_mr_base_addr(workspace, peer_rank);
     __gm__ float *local_input = tensor_data<float>(input_tensor);
     __gm__ float *local_out = tensor_data<float>(out_tensor);
-    uint32_t peer_rank = 1u - comm_ctx->rankId;
-    uint64_t input_offset = reinterpret_cast<uint64_t>(local_input) - comm_ctx->windowsIn[comm_ctx->rankId];
-    __gm__ float *remote_input = pto2::urma_backend::peer_mr_ptr<float>(
-        reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace), peer_rank, input_offset
-    );
+    const uint64_t input_offset = reinterpret_cast<uint64_t>(local_input) - comm_ctx->windowsIn[comm_ctx->rankId];
+    __gm__ float *remote_input = reinterpret_cast<__gm__ float *>(peer_base + input_offset);
+
+    comm::AsyncSession session;
+    if (!comm::BuildAsyncSession<comm::DmaEngine::URMA>(workspace, peer_rank, session)) return;
+    auto *info = reinterpret_cast<__gm__ comm::urma::UrmaInfo *>(workspace);
+    auto *wq = reinterpret_cast<__gm__ comm::urma::UrmaWQCtx *>(info->sqPtr) + peer_rank;
+    uint32_t previous_bb = ld_dev(reinterpret_cast<__gm__ uint32_t *>(wq->headAddr), 0);
+    uint32_t previous_cqe = wq->submittedWqeCount;
+    bool registered = true;
+    if (notify) {
+        using Payload = GlobalTensor<float, Shape<1, 1, 1, 1, 4>, pto::Stride<4, 4, 4, 4, 1>>;
+        Payload source(local_input);
+        Payload destination(reinterpret_cast<__gm__ float *>(peer_base + 64));
+        comm::Signal signal(reinterpret_cast<__gm__ int32_t *>(peer_base));
+        auto event = comm::TPUT_ASYNC_NOTIFY<comm::DmaEngine::URMA>(
+            destination, source, signal, 7, comm::NotifyOp::AtomicAdd, session, peer_rank
+        );
+        evidence[0] = static_cast<uint32_t>(event.handle) - previous_bb;
+        evidence[1] = event.urmaTargetCqe - previous_cqe;
+        previous_bb = static_cast<uint32_t>(event.handle);
+        previous_cqe = event.urmaTargetCqe;
+        registered = urma_backend::register_urma_async_event(async_ctx, event, session, workspace);
+    }
 
     using FlatShape = Shape<1, 1, 1, 1, kElems>;
     using FlatStride = pto::Stride<kElems, kElems, kElems, kElems, 1>;
     using GlobalData = GlobalTensor<float, FlatShape, FlatStride>;
-
     GlobalData remote_global(remote_input);
     GlobalData local_global(local_out);
-
-    AsyncCtx async_ctx = get_async_ctx(args);
-    (void)send_request_entry(
-        async_ctx,
-        UrmaTget(local_global, remote_global, reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace), peer_rank)
-    );
+    auto read = comm::TGET_ASYNC<comm::DmaEngine::URMA>(local_global, remote_global, session);
+    evidence[2] = static_cast<uint32_t>(read.handle) - previous_bb;
+    evidence[3] = read.urmaTargetCqe - previous_cqe;
+    registered = urma_backend::register_urma_async_event(async_ctx, read, session, workspace) && registered;
+    evidence[4] = *async_ctx.completion_count;
+    evidence[7] = registered ? 1 : 0;
+    pto2::detail::defer_flush(async_ctx);
+    comm::urma::DcciCachelines(reinterpret_cast<__gm__ uint8_t *>(evidence), 8 * sizeof(int32_t));
+    pipe_barrier(PIPE_ALL);
 }
