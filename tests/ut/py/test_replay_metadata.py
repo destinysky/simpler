@@ -97,10 +97,14 @@ def _native_pair():
 
 def test_metadata_is_copied_and_cleared():
     metadata = _metadata(0)
+    assert metadata.uses_communication
+    metadata.uses_communication = False
     value = TaskArgs()
     value.add_scalar(42)
     value.set_recovery_metadata(metadata)
     metadata.op_seq = 99
+    metadata.uses_communication = True
+    assert not value.recovery_metadata.uses_communication
     copied = value.recovery_metadata
     copied.rank = 1
     assert value.recovery_metadata.rank == 0

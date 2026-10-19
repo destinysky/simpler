@@ -24,12 +24,15 @@ struct RecoveryMetadata {
     int32_t rank{-1};
     std::vector<int32_t> participants;
     ReplaySafety replay_safety{ReplaySafety::UNKNOWN};
+    // Legacy declarations conservatively include the communication domain.
+    bool uses_communication{true};
 
     bool same_op(const RecoveryMetadata &other) const {
         return logical_run_id == other.logical_run_id && domain_id == other.domain_id && op_seq == other.op_seq;
     }
     bool same_contract(const RecoveryMetadata &other) const {
-        return same_op(other) && participants == other.participants && replay_safety == other.replay_safety;
+        return same_op(other) && participants == other.participants && replay_safety == other.replay_safety &&
+               uses_communication == other.uses_communication;
     }
     void validate() const {
         if (logical_run_id == 0 || rank < 0 || participants.empty() ||

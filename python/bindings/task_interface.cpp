@@ -2615,6 +2615,7 @@ NB_MODULE(_task_interface, m) {
         .def_rw("rank", &RecoveryMetadata::rank)
         .def_rw("participants", &RecoveryMetadata::participants)
         .def_rw("replay_safety", &RecoveryMetadata::replay_safety)
+        .def_rw("uses_communication", &RecoveryMetadata::uses_communication)
         .def("validate", &RecoveryMetadata::validate);
     nb::class_<TaskArgs>(m, "TaskArgs", nb::is_weak_referenceable())
         .def(nb::init<>())

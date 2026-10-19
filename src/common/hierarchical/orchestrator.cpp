@@ -10,6 +10,7 @@
  */
 
 #include "orchestrator.h"
+#include "host_log.h"
 
 #include <algorithm>
 #include <chrono>
@@ -202,14 +203,14 @@ void Orchestrator::activate_fifo_head() {
     finish_run_if_ready(run);
 }
 
-bool Orchestrator::defer_run_dispatch() {
+bool Orchestrator::enable_incremental_recovery() {
     std::lock_guard<std::mutex> runs_lk(runs_mu_);
     auto it = runs_.find(building_run_id_);
     if (it == runs_.end()) return false;
     auto run = it->second;
     std::lock_guard<std::mutex> lk(run->completion_mu);
     if (run->submission_closed || !run->task_slots.empty() || run->active_tasks.load() != 0) return false;
-    run->dispatch_after_submission = true;
+    run->incremental_recovery.store(true, std::memory_order_release);
     return true;
 }
 
@@ -334,8 +335,7 @@ bool Orchestrator::dispatchable_locked(RunId run_id) const {
         return false;
     }
     std::lock_guard<std::mutex> recovery_lk(it->second->completion_mu);
-    return it->second->active_recoveries == 0 &&
-           (!it->second->dispatch_after_submission || it->second->submission_closed);
+    return it->second->active_recoveries == 0;
 }
 
 bool Orchestrator::can_dispatch_run(RunId run_id) const {
@@ -564,6 +564,19 @@ void Orchestrator::wait_recovery_gate(const std::shared_ptr<RunState> &run) {
     }
 }
 
+std::unique_lock<std::mutex> Orchestrator::lock_publication(const std::shared_ptr<RunState> &run) {
+    if (!run->incremental_recovery.load(std::memory_order_acquire)) return {};
+    for (;;) {
+        wait_recovery_gate(run);
+        std::unique_lock<std::mutex> publication(run->publication_mu);
+        std::lock_guard<std::mutex> completion(run->completion_mu);
+        if (run->first_error) std::rethrow_exception(run->first_error);
+        if (run->submission_failed || is_terminal(run->phase.load(std::memory_order_acquire)))
+            throw std::runtime_error("Orchestrator: run is no longer accepting work");
+        if (run->active_recoveries == 0) return publication;
+    }
+}
+
 bool Orchestrator::current_building_run_failed_for_test() const {
     auto run = current_building_run();
     std::lock_guard<std::mutex> lk(run->completion_mu);
@@ -671,13 +684,14 @@ void Orchestrator::start_task_replay(const RecoveryTicket &ticket) {
 void Orchestrator::rebind_recovery_graph(const RecoveryTicket &ticket, const RecoveryBindingPlan &plan) {
     auto run = find_run(ticket.run_id);
     if (!run) throw std::invalid_argument("unknown recovery run");
+    std::lock_guard<std::mutex> publication(run->publication_mu);
     std::lock_guard<std::mutex> lk(run->completion_mu);
     auto *root = allocator_->slot_state(ticket.task_slot);
     if (!root || root->run_id != ticket.run_id || run->first_error || run->submission_failed ||
-        !run->submission_closed || root->state.load() != TaskState::RETRY_PENDING ||
+        (!run->submission_closed && !run->incremental_recovery.load()) || root->state.load() != TaskState::RETRY_PENDING ||
         root->active_recovery_id.load() != ticket.recovery_id || root->recovery_attempt != ticket.attempt ||
         plan.recovery_id() != ticket.recovery_id)
-        throw std::logic_error("graph rebinding requires the current closed recovery hold");
+        throw std::logic_error("graph rebinding requires the current frozen recovery hold");
     struct Staged {
         TaskSlotState *task;
         std::vector<TaskArgs> args;
@@ -700,22 +714,27 @@ void Orchestrator::rebind_recovery_graph(const RecoveryTicket &ticket, const Rec
         }
         staged.push_back(std::move(item));
     }
+    auto retained_plan = std::make_shared<const RecoveryBindingPlan>(plan);
+    run->binding_history.reserve(run->binding_history.size() + 1);
     // All validation precedes publication, including bindings on unlaunched consumers.
     static_assert(std::is_nothrow_move_assignable_v<TaskArgs>);
     for (auto &item : staged) {
         if (item.task->is_group()) item.task->task_args_list.swap(item.args);
         else item.task->task_args = std::move(item.args.front());
     }
+    run->binding_history.push_back(std::move(retained_plan));
 }
 
 RecoveryGraphSnapshot Orchestrator::recovery_graph(const RecoveryTicket &ticket) {
     auto run = find_run(ticket.run_id);
     if (run == nullptr) throw std::invalid_argument("unknown recovery run");
+    std::lock_guard<std::mutex> publication(run->publication_mu);
     std::lock_guard<std::mutex> lk(run->completion_mu);
     RecoveryGraphSnapshot snapshot;
     snapshot.ticket = ticket;
     snapshot.run_failed = static_cast<bool>(run->first_error);
     snapshot.submission_closed = run->submission_closed;
+    snapshot.publication_frozen = run->incremental_recovery.load() && run->active_recoveries != 0;
     snapshot.active_recoveries = run->active_recoveries;
     for (TaskSlot slot : run->task_slots) {
         auto *task = allocator_->slot_state(slot);
@@ -875,7 +894,9 @@ uint64_t Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype,
     // failed alloc must remain claimable by run cancellation. FREE would make
     // cancellation skip the registered slot and strand active_tasks forever.
     s.state.store(TaskState::BUILDING, std::memory_order_release);
+    std::unique_lock<std::mutex> publication;
     try {
+        publication = lock_publication(run);
         if (test_hook_) test_hook_(OrchestratorTestPoint::ALLOC_RUN_SLOT_REGISTERING);
         register_run_slot(run, ar.slot);
     } catch (...) {
@@ -1055,7 +1076,32 @@ SubmitResult Orchestrator::submit_impl(
     // bookkeeping is final; BUILDING is what tells every other thread the
     // counters below cannot be acted on yet.
     s.state.store(TaskState::BUILDING, std::memory_order_release);
+    std::unique_lock<std::mutex> publication;
     try {
+        publication = lock_publication(run);
+        for (size_t member = 0; member < args_list.size(); ++member) {
+            auto &args = args_list[member];
+            if (args.domain_bindings.empty() || run->binding_history.empty()) continue;
+            for (const auto &plan : run->binding_history)
+                args = plan->advance(args, target_worker_ids[member]);
+            for (const auto &binding : args.domain_bindings) {
+                for (auto plan = run->binding_history.rbegin(); plan != run->binding_history.rend(); ++plan) {
+                    if (!(*plan)->affects_domain(target_worker_ids[member], binding.domain.allocation_id)) continue;
+                    TaskArgs current = args;
+                    current.domain_bindings = {binding};
+                    (*plan)->validate_current(current, target_worker_ids[member]);
+                    HostLogger::get_instance().log(
+                        simpler::log::LogLevel::WARN, __func__,
+                        "[PTO_RECOVERY] SUBMISSION_BINDING_CURRENT run_id=%llu task_slot=%d worker=%d "
+                        "allocation_id=%llu generation=%llu",
+                        static_cast<unsigned long long>(run->id), slot, target_worker_ids[member],
+                        static_cast<unsigned long long>(binding.domain.allocation_id),
+                        static_cast<unsigned long long>(binding.domain.generation)
+                    );
+                    break;
+                }
+            }
+        }
         if (test_hook_) test_hook_(OrchestratorTestPoint::SUBMIT_RUN_SLOT_REGISTERING);
         register_run_slot(run, slot);
     } catch (...) {
@@ -1255,7 +1301,7 @@ SubmitResult Orchestrator::submit_impl(
         return SubmitResult{run->id, slot};
     }
 
-    // Enqueued outside the publication lock: enqueue_ready takes runs_mu_, and
+    // Enqueued outside the slot's fanout_mu: enqueue_ready takes runs_mu_, and
     // a producer completing between the two finds the slot already READY and
     // does nothing, so the queue receives it exactly once.
     if (ready_now) {

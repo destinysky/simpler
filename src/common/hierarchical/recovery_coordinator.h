@@ -82,6 +82,7 @@ struct RecoveryGraphSnapshot {
     bool submission_closed{false};
     uint32_t active_recoveries{0};
     std::vector<RecoveryTaskSnapshot> tasks;
+    bool publication_frozen{false};
 };
 
 enum class ReplayStatus : int32_t {
@@ -112,6 +113,7 @@ struct DistributedOpRecord {
     ReplaySafety replay_safety{ReplaySafety::UNKNOWN};
     std::vector<int32_t> participants;
     std::vector<DistributedOpMember> members;
+    bool uses_communication{true};
 };
 struct ReplayAssessment {
     RecoveryTicket ticket{};

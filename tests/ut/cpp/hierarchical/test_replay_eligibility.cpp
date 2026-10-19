@@ -262,4 +262,24 @@ TEST(RecoveryMetadataTest, ValidationClearAndWireBoundaryAreExplicit) {
     original.clear();
     EXPECT_FALSE(original.recovery_metadata);
 }
+TEST_F(ReplayEligibilityTest, OpenGraphRequiresFrozenPublicationAndStillRejectsBuildingSlots) {
+    graph.submission_closed = false;
+    EXPECT_EQ(assess().status, ReplayStatus::WAITING_GRAPH);
+    graph.publication_frozen = true;
+    EXPECT_EQ(assess().status, ReplayStatus::REPLAY_ALLOWED);
+    graph.tasks.back().state = TaskState::BUILDING;
+    EXPECT_EQ(assess().status, ReplayStatus::WAITING_GRAPH);
+}
+TEST_F(ReplayEligibilityTest, IndependentComputeDoesNotAdvanceTheCommunicationProtocol) {
+    graph.tasks[0].consumers.clear();
+    graph.tasks[1].state = TaskState::COMPLETED;
+    for (auto &arg : graph.tasks[1].args) arg.recovery_metadata->uses_communication = false;
+    EXPECT_EQ(assess().status, ReplayStatus::REPLAY_ALLOWED);
+    graph.tasks[0].consumers = {graph.tasks[1].handle.task_slot};
+    EXPECT_EQ(assess().status, ReplayStatus::NACK_ADVANCED);
+}
+TEST_F(ReplayEligibilityTest, FailureDomainScopeMustAgreeAcrossMembers) {
+    graph.tasks[0].args[1].recovery_metadata->uses_communication = false;
+    EXPECT_EQ(assess().status, ReplayStatus::NACK_METADATA);
+}
 }  // namespace

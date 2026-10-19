@@ -279,7 +279,9 @@ void Scheduler::coordinate_recovery() {
             }
             (void)retry_recovery(
                 request.ticket, cfg_.recovery_max_retries, cfg_.recovery_backoff_s,
-                DomainRecoveryImpact::DOMAIN_TRANSPORT, cfg_.recovery_timeout_s
+                assessment.op->uses_communication ? DomainRecoveryImpact::DOMAIN_TRANSPORT :
+                                                    DomainRecoveryImpact::EXECUTION_ONLY,
+                cfg_.recovery_timeout_s
             );
         } catch (const std::exception &error) {
             if (stop_requested_.load()) break;

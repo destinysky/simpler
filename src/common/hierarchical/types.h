@@ -140,6 +140,8 @@ enum class RunPhase : int32_t {
     FAILED = 5,
 };
 
+class RecoveryBindingPlan;
+
 struct RunState {
     RunState(RunId run_id, PipelineSlotLease slot_lease) :
         id(run_id),
@@ -158,8 +160,10 @@ struct RunState {
     uint32_t active_recoveries{0};
     std::exception_ptr first_error;
     std::vector<TaskSlot> task_slots;
-    // Opt-in whole-graph admission; protected by completion_mu.
-    bool dispatch_after_submission{false};
+    // Publication is frozen during a recovery episode; snapshots contain a stable prefix.
+    std::atomic<bool> incremental_recovery{false};
+    mutable std::mutex publication_mu;
+    std::vector<std::shared_ptr<const RecoveryBindingPlan>> binding_history;
     bool submission_closed{false};
     bool submission_failed{false};
     bool lease_released{false};

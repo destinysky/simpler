@@ -2,6 +2,8 @@
  * Licensed under CANN Open Software License Agreement Version 2.0.
  */
 #include <gtest/gtest.h>
+#include <future>
+#include <chrono>
 #include "recovery_binding_plan.h"
 #include "orchestrator.h"
 
@@ -285,5 +287,44 @@ TEST_F(RetainedSlot, RejectsBackingIdentityChangeUntilGraphAliasPublicationExist
     EXPECT_EQ(state->task_args.scalar(0), 0x1000u);
     EXPECT_EQ(state->task_args.domain_bindings[0].domain.generation, 1u);
     EXPECT_EQ(state->task_args.tensor(0).buffer.identity.generation, 1u);
+}
+TEST_F(RetainedSlot, IncrementalPrefixRecoversBeforeClosureAndAdvancesFutureBindings) {
+    ASSERT_TRUE(orch.enable_incremental_recovery());
+    auto root = task();
+    hold(root);
+    RecoveryTicket ticket{run, root.task_slot, 11, 0, 1};
+    auto snapshot = orch.recovery_graph(ticket);
+    EXPECT_FALSE(snapshot.submission_closed);
+    EXPECT_TRUE(snapshot.publication_frozen);
+    RecoveryBindingPlan plan(11);
+    plan.add_domain(0, original(), committed());
+    orch.rebind_recovery_graph(ticket, plan);
+    auto future = std::async(std::launch::async, [&] { return task(); });
+    EXPECT_EQ(future.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    EXPECT_TRUE(orch.finish_task_recovery(root.task_slot, 11));
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(3)), std::future_status::ready);
+    auto next = future.get();
+    EXPECT_EQ(ring.slot_state(next.task_slot)->task_args.domain_bindings[0].domain.generation, 2u);
+    EXPECT_FALSE(orch.recovery_graph(ticket).submission_closed);
+}
+
+TEST(RecoveryBindingPlanTest, HistoricalChainAcceptsIntermediateButRejectsFabricatedFuture) {
+    RecoveryBindingPlan first(11);
+    first.add_domain(0, original(), committed());
+    auto before = original();
+    before.generation = 2;
+    auto result = committed(12);
+    result.previous_generation = 2;
+    result.generation = 3;
+    RecoveryBindingPlan second(12);
+    second.add_domain(0, before, result);
+    auto source = retained();
+    auto current = second.advance(first.advance(source, 0), 0);
+    EXPECT_EQ(current.domain_bindings[0].domain.generation, 3u);
+    EXPECT_NO_THROW(second.validate_current(current, 0));
+    auto intermediate = first.rebind(source, 0);
+    EXPECT_EQ(second.advance(first.advance(intermediate, 0), 0).domain_bindings[0].domain.generation, 3u);
+    source.domain_bindings[0].domain.generation = 4;
+    EXPECT_THROW(second.validate_current(second.advance(first.advance(source, 0), 0), 0), std::invalid_argument);
 }
 }  // namespace

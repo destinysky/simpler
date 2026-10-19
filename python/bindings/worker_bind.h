@@ -363,7 +363,7 @@ inline void bind_worker(nb::module_ &m) {
         .def("_scope_begin", &Orchestrator::scope_begin)
         .def("_scope_end", &Orchestrator::scope_end)
         .def("_begin_run", &Orchestrator::begin_run, nb::call_guard<nb::gil_scoped_release>())
-        .def("_defer_run_dispatch", &Orchestrator::defer_run_dispatch)
+        .def("_enable_incremental_recovery", &Orchestrator::enable_incremental_recovery)
         .def("_close_run_submission", &Orchestrator::close_run_submission, nb::arg("run_id"))
         .def(
             "_fail_run_submission",
@@ -483,6 +483,7 @@ inline void bind_worker(nb::module_ &m) {
         .def_ro("ticket", &RecoveryGraphSnapshot::ticket)
         .def_ro("run_failed", &RecoveryGraphSnapshot::run_failed)
         .def_ro("submission_closed", &RecoveryGraphSnapshot::submission_closed)
+        .def_ro("publication_frozen", &RecoveryGraphSnapshot::publication_frozen)
         .def_ro("active_recoveries", &RecoveryGraphSnapshot::active_recoveries)
         .def_ro("tasks", &RecoveryGraphSnapshot::tasks);
 
@@ -510,6 +511,7 @@ inline void bind_worker(nb::module_ &m) {
         .def_ro("op_seq", &DistributedOpRecord::op_seq)
         .def_ro("participants", &DistributedOpRecord::participants)
         .def_ro("replay_safety", &DistributedOpRecord::replay_safety)
+        .def_ro("uses_communication", &DistributedOpRecord::uses_communication)
         .def_ro("members", &DistributedOpRecord::members);
     nb::class_<ReplayAssessment>(m, "ReplayAssessment")
         .def_ro("ticket", &ReplayAssessment::ticket)

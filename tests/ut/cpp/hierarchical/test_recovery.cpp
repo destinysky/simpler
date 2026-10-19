@@ -520,8 +520,9 @@ protected:
         manager.stop();
         ring.shutdown();
     }
-    void graph(bool group = false, bool annotate = false) {
+    void graph(bool group = false, bool annotate = false, bool incremental = false) {
         run = orch.begin_run();
+        if (incremental) ASSERT_TRUE(orch.enable_incremental_recovery());
         orch.scope_begin();
         resource = wire_tensor(42);
         resource.buffer.backend_kind = static_cast<uint8_t>(BackendKind::FORK_SHM);
@@ -560,7 +561,7 @@ protected:
         successor.add_dep(b);
         c = orch.submit_next_level(chip_callable(3), successor, cfg, 0);
         orch.scope_end();
-        orch.close_run_submission(run);
+        if (!incremental) orch.close_run_submission(run);
         ASSERT_TRUE(first->wait_submitted());
         if (group) ASSERT_TRUE(second->wait_submitted());
     }
@@ -926,6 +927,48 @@ TEST_F(AutomaticRecoveryTest, StopsLivePeerAndCommitsOriginalGraphWithoutAnExter
     EXPECT_TRUE(orch.wait_run_for(run, 3));
     EXPECT_EQ(first->history().size(), 4u);
     EXPECT_EQ(second->history().size(), 2u);
+    EXPECT_FALSE(orch.run_failed(run));
+    orch.release_run(run);
+}
+TEST_F(AutomaticRecoveryTest, AutomaticReplayAndSuccessorsProgressBeforeGraphClosure) {
+    graph(true, true, true);
+    native_failure();
+    ASSERT_TRUE(first->wait_count(2));
+    ASSERT_TRUE(second->wait_count(2));
+    EXPECT_EQ(ring.slot_state(b.task_slot)->state.load(), TaskState::PENDING);
+    first->succeed();
+    second->succeed();
+    ASSERT_TRUE(first->wait_count(3));
+    EXPECT_EQ(first->history()[2].task_slot, b.task_slot);
+    first->succeed();
+    ASSERT_TRUE(first->wait_count(4));
+    first->succeed();
+    EXPECT_FALSE(orch.wait_run_for(run, 0.03));
+    orch.close_run_submission(run);
+    EXPECT_TRUE(orch.wait_run_for(run, 3));
+    EXPECT_FALSE(orch.run_failed(run));
+    orch.release_run(run);
+}
+TEST_F(AutomaticRecoveryTest, ProvedComputeTaskPreservesTheCommunicationDomain) {
+    run = orch.begin_run();
+    ASSERT_TRUE(orch.enable_incremental_recovery());
+    orch.scope_begin();
+    TaskArgs one;
+    one.set_recovery_metadata(RecoveryMetadata{91, 0, 1, 0, {0, 1}, ReplaySafety::REPLAY_SAFE, false});
+    TaskArgs two = one;
+    two.recovery_metadata->rank = 1;
+    a = orch.submit_next_level_group(chip_callable(1), {one, two}, CallConfig{}, {0, 1});
+    orch.scope_end();
+    orch.close_run_submission(run);
+    ASSERT_TRUE(first->wait_submitted());
+    ASSERT_TRUE(second->wait_submitted());
+    native_failure();
+    ASSERT_TRUE(first->wait_count(2));
+    ASSERT_TRUE(second->wait_count(2));
+    EXPECT_EQ(std::count(first->phases.begin(), first->phases.end(), RecoveryControlPhase::COMMIT), 0);
+    first->succeed();
+    second->succeed();
+    EXPECT_TRUE(orch.wait_run_for(run, 3));
     EXPECT_FALSE(orch.run_failed(run));
     orch.release_run(run);
 }

@@ -28,6 +28,9 @@ public:
         if (recovery_id == 0) throw std::invalid_argument("binding plan requires a recovery id");
     }
     uint64_t recovery_id() const { return recovery_id_; }
+    bool affects_domain(int32_t worker_id, uint64_t allocation_id) const {
+        return find(worker_id, allocation_id) != nullptr;
+    }
 
     void add_domain(int32_t worker_id, const RecoveryDomainBinding &before, const DomainRecoveryResult &result) {
         validate_domain(before);
@@ -73,6 +76,29 @@ public:
         TaskArgs next = source;
         rewrite(next, next.domain_bindings, worker_id);
         return next;
+    }
+
+    // Historical plans may precede an argument's generation. The latest plan
+    // still validates its final resources; a fabricated future binding fails.
+    TaskArgs advance(const TaskArgs &source, int32_t worker_id) const {
+        TaskArgs next = source;
+        for (auto &binding : next.domain_bindings) {
+            const auto *change = find(worker_id, binding.domain.allocation_id);
+            if (change == nullptr || binding.domain.generation > change->after.generation) continue;
+            std::vector<TaskDomainBinding> selected{binding};
+            rewrite(next, selected, worker_id);
+            binding = std::move(selected.front());
+        }
+        return next;
+    }
+
+    void validate_current(const TaskArgs &args, int32_t worker_id) const {
+        for (const auto &binding : args.domain_bindings) {
+            const auto *change = find(worker_id, binding.domain.allocation_id);
+            if (change == nullptr || !(binding.domain == change->after))
+                throw std::invalid_argument("submission does not match the latest committed binding");
+            validate_binding(args, binding);
+        }
     }
 
     MaterializedRecoveryBinding rebind_materialized(

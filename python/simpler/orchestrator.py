@@ -307,16 +307,16 @@ class Orchestrator:
     # User-facing submit API
     # ------------------------------------------------------------------
 
-    def defer_dispatch_until_submitted(self) -> None:
-        """Hold this run's tasks until its graph callback has returned.
+    def enable_incremental_recovery(self) -> None:
+        """Publish full task groups during graph construction.
 
-        Call before any task submission/allocation. Direct control remains ordered
-        by the whole-run FIFO. Closing submission releases admission; callback
-        failure cancels unstarted tasks through the normal lifecycle. The complete
-        retained graph must fit the configured native task/heap capacity.
+        Call before the first allocation/submission. A recovery episode freezes
+        the published prefix. Subsequent submissions wait for its resolution and
+        inherit committed binding generations. The retained graph must fit the
+        native task/heap capacity; direct-control ordering is unchanged.
         """
-        if not self._o._defer_run_dispatch():
-            raise RuntimeError("defer_dispatch_until_submitted must precede every task allocation/submission")
+        if not self._o._enable_incremental_recovery():
+            raise RuntimeError("incremental recovery must precede every task allocation/submission")
 
     def submit_next_level(
         self, callable_handle: Any, args: TaskArgs, config: CallConfig | None = None, *, worker: int

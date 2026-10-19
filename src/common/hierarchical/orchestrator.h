@@ -141,7 +141,7 @@ public:
     RunId begin_run();
     void configure_pipeline_depth(uint32_t depth);
     // Must precede every task allocation/submission in this run.
-    bool defer_run_dispatch();
+    bool enable_incremental_recovery();
     void close_run_submission(RunId run_id);
     void fail_run_submission(RunId run_id, std::exception_ptr error = nullptr);
     void wait_run_accepted(RunId run_id);
@@ -286,6 +286,7 @@ private:
     static void record_run_error(const std::shared_ptr<RunState> &run, std::exception_ptr error);
     void record_run_error(RunId run_id, std::exception_ptr error);
     void wait_recovery_gate(const std::shared_ptr<RunState> &run);
+    std::unique_lock<std::mutex> lock_publication(const std::shared_ptr<RunState> &run);
 
     // Slot state lives in the Ring; the pointer stays stable for the
     // slot's lifetime. Throws if the id is out of range — callers that

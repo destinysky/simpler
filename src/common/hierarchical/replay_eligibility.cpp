@@ -47,7 +47,8 @@ ReplayAssessment assess_replay_eligibility(const RecoveryRequest &request, const
         failed->active_recovery_id != request.ticket.recovery_id ||
         failed->pipeline_generation != request.pipeline_lease.generation)
         return verdict(ReplayStatus::NACK_NOT_RETAINED, "failed task identity, generation or recovery hold changed");
-    if (!graph.submission_closed) return verdict(ReplayStatus::WAITING_GRAPH, "graph construction is not closed");
+    if (!graph.submission_closed && !graph.publication_frozen)
+        return verdict(ReplayStatus::WAITING_GRAPH, "graph publication is not frozen");
     if (std::any_of(graph.tasks.begin(), graph.tasks.end(), [](const auto &task) {
             return task.state == TaskState::BUILDING;
         }))
@@ -68,6 +69,7 @@ ReplayAssessment assess_replay_eligibility(const RecoveryRequest &request, const
     op.op_seq = seed.op_seq;
     op.participants = seed.participants;
     op.replay_safety = seed.replay_safety;
+    op.uses_communication = seed.uses_communication;
     std::map<int32_t, DistributedOpMember> members;
     std::unordered_set<int32_t> workers;
     std::unordered_set<TaskSlot> op_slots;
@@ -151,7 +153,8 @@ ReplayAssessment assess_replay_eligibility(const RecoveryRequest &request, const
         if (!advanced(task.state)) continue;
         for (const auto &args : task.args) {
             const auto &metadata = args.recovery_metadata;
-            if (metadata && metadata->logical_run_id == seed.logical_run_id && metadata->domain_id == seed.domain_id &&
+            if (seed.uses_communication && metadata && metadata->uses_communication &&
+                metadata->logical_run_id == seed.logical_run_id && metadata->domain_id == seed.domain_id &&
                 metadata->op_seq > seed.op_seq) {
                 if (std::none_of(result.blocking_tasks.begin(), result.blocking_tasks.end(), [&](const auto &handle) {
                         return handle.task_slot == task.handle.task_slot;
