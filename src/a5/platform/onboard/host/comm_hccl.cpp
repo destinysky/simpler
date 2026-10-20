@@ -29,6 +29,8 @@
 #include "common/acl_hal_device.h"
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
+#include "host/urma_drain.h"
+#include "host/urma_cqe_reader.h"
 
 #include <algorithm>
 #include <chrono>
@@ -37,6 +39,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -937,6 +940,120 @@ static bool ensure_base_urma_workspace(CommHandle h) {
     h->host_ctx.workSpaceSize = urma_workspace_bytes(static_cast<uint32_t>(h->nranks));
     return h->host_ctx.workSpace != 0 && h->host_ctx.workSpaceSize != 0;
 }
+
+static void log_urma_binding(CommHandle h, uint64_t allocation_id, const DomainAllocation &alloc, const char *stage) {
+    LOG_INFO(
+        "[PTO_RECOVERY] URMA_BINDING stage=%s rank=%d allocation_id=%llu context_c=%p hccl=%p "
+        "comm_stream=%p workspace=0x%llx local_window=%p device_ctx=%p",
+        stage, h->rank, static_cast<unsigned long long>(allocation_id), h->runtime_context, h->hccl_comm, h->stream,
+        static_cast<unsigned long long>(alloc.workspace_addr), alloc.local_buf, alloc.device_ctx
+    );
+}
+
+static int
+drain_urma_domain(CommHandle h, DomainAllocation &alloc, DomainRecoveryResult &proof, const UrmaCqeReader &read_cqe) {
+    if (!read_cqe) return -1;
+    using namespace pto::comm::urma;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    auto copy = [](void *dst, uint64_t address, size_t bytes) {
+        if (address == 0) return -1;
+        return static_cast<int>(aclrtMemcpy(
+            dst, bytes, reinterpret_cast<void *>(static_cast<uintptr_t>(address)), bytes, ACL_MEMCPY_DEVICE_TO_HOST
+        ));
+    };
+    UrmaInfo info{};
+    const int info_rc = copy(&info, alloc.workspace_addr, sizeof(info));
+    if (info_rc != 0 || info.qpNum != 1 || info.rankCount != static_cast<uint32_t>(alloc.nranks) || info.sqPtr == 0 ||
+        info.scqPtr == 0) {
+        LOG_WARN("[PTO_RECOVERY] URMA_DRAIN_REJECTED rank=%d stage=workspace rc=%d", h->rank, info_rc);
+        return info_rc != 0 ? info_rc : -1;
+    }
+    proof.transport_channel_count = info.rankCount - 1;
+    for (uint32_t peer = 0; peer < info.rankCount; ++peer) {
+        if (peer == static_cast<uint32_t>(alloc.rank)) continue;
+        UrmaWQCtx wq{};
+        UrmaCqCtx cq{};
+        urma_drain::Queue target{};
+        int rc = copy(&wq, info.sqPtr + peer * sizeof(wq), sizeof(wq));
+        if (rc == 0) rc = copy(&cq, info.scqPtr + peer * sizeof(cq), sizeof(cq));
+        if (rc == 0) rc = copy(&target.submitted_bb, wq.headAddr, sizeof(uint32_t));
+        if (rc == 0) rc = copy(&target.retired_bb, wq.tailAddr, sizeof(uint32_t));
+        if (rc == 0) rc = copy(&target.retired_cqe, cq.tailAddr, sizeof(uint32_t));
+        target.submitted_cqe = wq.submittedWqeCount;
+        target.sq_depth = wq.depth;
+        target.cq_depth = cq.depth;
+        urma_drain::Observation observation;
+        if (rc != 0) {
+            observation.state = urma_drain::State::READ_FAILED;
+            observation.read_rc = rc;
+        } else if (cq.bufAddr != 0 && cq.cqeShiftSize >= 6 && cq.cqeShiftSize <= 12 &&
+                   cq.bufAddr <=
+                       std::numeric_limits<uint64_t>::max() - (static_cast<uint64_t>(cq.depth) << cq.cqeShiftSize)) {
+            do {
+                observation = urma_drain::inspect(target, [&](uint32_t sequence, uint32_t &dw0) {
+                    if (std::chrono::steady_clock::now() >= deadline) return -1;
+                    const uint64_t offset = static_cast<uint64_t>(sequence & (cq.depth - 1)) << cq.cqeShiftSize;
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               deadline - std::chrono::steady_clock::now()
+                    )
+                                               .count();
+                    if (remaining <= 0) return -1;
+                    return read_cqe(cq.bufAddr + offset, dw0, static_cast<uint32_t>(remaining));
+                });
+            } while (observation.state == urma_drain::State::PENDING && std::chrono::steady_clock::now() < deadline);
+        }
+        if (observation.state == urma_drain::State::DRAINED) {
+            UrmaInfo current_info{};
+            UrmaWQCtx current_wq{};
+            UrmaCqCtx current_cq{};
+            uint32_t head{}, tail{}, retired{};
+            rc = copy(&current_info, alloc.workspace_addr, sizeof(current_info));
+            if (rc == 0) rc = copy(&current_wq, info.sqPtr + peer * sizeof(wq), sizeof(wq));
+            if (rc == 0) rc = copy(&current_cq, info.scqPtr + peer * sizeof(cq), sizeof(cq));
+            if (rc == 0) rc = copy(&head, wq.headAddr, sizeof(head));
+            if (rc == 0) rc = copy(&tail, wq.tailAddr, sizeof(tail));
+            if (rc == 0) rc = copy(&retired, cq.tailAddr, sizeof(retired));
+            if (rc != 0) {
+                observation.state = urma_drain::State::READ_FAILED;
+                observation.read_rc = rc;
+            } else if (current_info.qpNum != info.qpNum || current_info.rankCount != info.rankCount ||
+                       current_info.localTokenId != info.localTokenId ||
+                       current_info.notifyPoolTokenId != info.notifyPoolTokenId || current_info.sqPtr != info.sqPtr ||
+                       current_info.scqPtr != info.scqPtr || current_info.rqPtr != info.rqPtr ||
+                       current_info.rcqPtr != info.rcqPtr || current_info.memPtr != info.memPtr ||
+                       current_info.notifyPoolPtr != info.notifyPoolPtr || head != target.submitted_bb ||
+                       tail != target.retired_bb || retired != target.retired_cqe ||
+                       current_wq.submittedWqeCount != target.submitted_cqe || current_wq.wqn != wq.wqn ||
+                       current_wq.bufAddr != wq.bufAddr || current_wq.headAddr != wq.headAddr ||
+                       current_wq.tailAddr != wq.tailAddr || current_wq.depth != wq.depth ||
+                       current_wq.dbAddr != wq.dbAddr || current_wq.wqeShiftSize != wq.wqeShiftSize ||
+                       current_cq.cqn != cq.cqn || current_cq.headAddr != cq.headAddr ||
+                       current_cq.bufAddr != cq.bufAddr || current_cq.tailAddr != cq.tailAddr ||
+                       current_cq.depth != cq.depth || current_cq.cqeShiftSize != cq.cqeShiftSize ||
+                       current_cq.dbAddr != cq.dbAddr) {
+                observation.state = urma_drain::State::INVALID;
+            }
+        }
+        const bool timed_out = std::chrono::steady_clock::now() >= deadline;
+        if (timed_out && observation.state == urma_drain::State::DRAINED)
+            observation.state = urma_drain::State::PENDING;
+        const bool drained = observation.state == urma_drain::State::DRAINED;
+        LOG_INFO(
+            "[PTO_RECOVERY] URMA_DRAIN_RESULT rank=%d peer=%u state=%u checked=%u "
+            "target_bb=%u retired_bb=%u target_cqe=%u retired_cqe=%u sequence=%u dw0=0x%x "
+            "read_rc=%d timed_out=%u wqn=%u cqn=%u",
+            h->rank, peer, static_cast<unsigned>(observation.state), observation.checked, target.submitted_bb,
+            target.retired_bb, target.submitted_cqe, target.retired_cqe, observation.sequence, observation.dw0,
+            observation.read_rc, static_cast<unsigned>(timed_out), wq.wqn, cq.cqn
+        );
+        if (!drained) return observation.read_rc != 0 ? observation.read_rc : -1;
+        ++proof.stopped_channel_count;
+    }
+    proof.transport_stopped =
+        proof.transport_channel_count > 0 && proof.stopped_channel_count == proof.transport_channel_count;
+    return proof.transport_stopped == 1 ? 0 : -1;
+}
+
 #endif
 
 static void reset_domain_urma_workspace(DomainAllocation &alloc) {
@@ -1267,7 +1384,10 @@ static int domain_alloc_via_ipc(
     out->workspace_addr = domain_workspace_addr;
     out->engine = domain_workspace_addr == 0 ? DomainRecoveryEngine::NONE : DomainRecoveryEngine::SDMA;
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
-    if (out->urma_workspace) out->engine = DomainRecoveryEngine::URMA;
+    if (out->urma_workspace) {
+        out->engine = DomainRecoveryEngine::URMA;
+        log_urma_binding(h, allocation_id, *out, "READY");
+    }
 #endif
     return 0;
 }
@@ -1542,9 +1662,11 @@ static DomainRecoveryResult domain_binding(CommHandle h, uint64_t allocation_id,
 
 }  // namespace
 
-extern "C" int comm_recover_domain(
-    void *handle, uint64_t allocation_id, const DomainRecoveryRequest *request, DomainRecoveryResult *result
+int comm_recover_domain_with_reader(
+    void *handle, uint64_t allocation_id, const DomainRecoveryRequest *request, DomainRecoveryResult *result,
+    const UrmaCqeReader &read_cqe
 ) try {
+    (void)read_cqe;
     if (handle == nullptr || request == nullptr || result == nullptr) return -1;
     auto h = reinterpret_cast<CommHandle>(handle);
     *result = {};
@@ -1588,10 +1710,32 @@ extern "C" int comm_recover_domain(
         };
     }
 #endif
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    if (transport && old.engine == DomainRecoveryEngine::URMA) {
+        bool exclusive = old.urma_workspace && !h->urma_workspace && h->domain_allocations.size() == 1 &&
+                         h->device_ctx == nullptr && h->derived_contexts.empty() && old.nranks == h->nranks &&
+                         old.rank_ids.size() == static_cast<size_t>(h->nranks);
+        for (size_t rank = 0; exclusive && rank < old.rank_ids.size(); ++rank)
+            exclusive = old.rank_ids[rank] == rank;
+        operations.rearm_supported = exclusive && static_cast<bool>(read_cqe);
+        operations.quiesce = [&](DomainRecoveryResult &proof) {
+            return drain_urma_domain(h, old, proof, read_cqe);
+        };
+        // Completed URMA requests need no queue reset or descriptor replacement.
+        operations.rearm = [] {
+            return 0;
+        };
+    }
+#endif
     *result = old.recovery.recover(*request, domain_binding(h, allocation_id, old), operations);
-    if (transport && old.engine == DomainRecoveryEngine::SDMA &&
+    if (transport && (old.engine == DomainRecoveryEngine::SDMA || old.engine == DomainRecoveryEngine::URMA) &&
         (result->status == DomainRecoveryStatus::RECOVERY_FAILED || result->status == DomainRecoveryStatus::GIVE_UP))
         h->transport_quarantined = true;
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    if (old.engine == DomainRecoveryEngine::URMA && request->phase == DomainRecoveryPhase::COMMIT &&
+        result->status == DomainRecoveryStatus::REARMED)
+        log_urma_binding(h, allocation_id, old, "COMMIT");
+#endif
     const char *outcome = result->status == DomainRecoveryStatus::PREPARED          ? "DOMAIN_RECOVERY_PREPARED" :
                           result->status == DomainRecoveryStatus::REARMED           ? "DOMAIN_RECOVERY_COMMITTED" :
                           result->status == DomainRecoveryStatus::PRESERVED         ? "PRESERVE_COMM_DOMAIN" :
@@ -1612,6 +1756,12 @@ extern "C" int comm_recover_domain(
 } catch (...) {
     LOG_ERROR("[PTO_RECOVERY] domain recovery unknown exception");
     return -1;
+}
+
+extern "C" int comm_recover_domain(
+    void *handle, uint64_t allocation_id, const DomainRecoveryRequest *request, DomainRecoveryResult *result
+) {
+    return comm_recover_domain_with_reader(handle, allocation_id, request, result, {});
 }
 
 extern "C" int comm_recovery_snapshot(CommHandle h, uint64_t allocation_id, CommRecoverySnapshot *snapshot_out) try {
@@ -1876,12 +2026,20 @@ extern "C" int comm_destroy(CommHandle h) try {
     if (comm_recovery_pending(h)) h->transport_quarantined = true;
     if (h->transport_quarantined) {
         LOG_WARN("[PTO_RECOVERY] COMM_QUARANTINE_TO_DEVICE_LIFECYCLE rank=%d", h->rank);
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+        // Retain URMA registrations and manager ownership until terminal child/device teardown.
+        // Finalize frees memory and is not a stop primitive for outstanding requests.
+        if (h->urma_workspace ||
+            std::any_of(h->domain_allocations.begin(), h->domain_allocations.end(), [](const auto &entry) {
+                return bool(entry.second->urma_workspace);
+            }))
+            return -1;
+#endif
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
         if (h->sdma_workspace) h->sdma_workspace->AbandonToDeviceLifecycle();
 #endif
         // VMM/HCCL ownership remains on the device until terminal cleanup.
-        // DomainAllocation holds raw device handles; deleting host metadata
-        // issues no VMM frees on this SDMA-only quarantine path.
+        // DomainAllocation holds raw device handles; deleting SDMA metadata issues no VMM frees.
         delete h;
         return -1;
     }

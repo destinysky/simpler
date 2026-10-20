@@ -168,6 +168,8 @@ public:
      */
     int destroy_comm_stream(void *stream);
 
+    int read_urma_cqe(uint64_t address, uint32_t &dw0, uint32_t timeout_ms);
+
 private:
     // A5 communication may install context-wide failure policy while PTO
     // execution remains retryable, so keep those lifetimes in distinct Runtime
@@ -201,6 +203,11 @@ private:
     // gates it behind this flag. finalize() drives aclFinalize only if we observed
     // acl_ready_, so runtimes that never ask for ACL (e.g. pure rt-layer) stay unaffected.
     bool acl_ready_{false};
+
+    // Recovery-only control work uses E; persistent business streams stay unchanged.
+    rtStream_t urma_query_stream_{nullptr};
+    void *urma_query_result_{nullptr};
+    uint64_t urma_query_request_id_{0};
 
     // Set true when an AICore launch/sync error (e.g. an op-timeout reaped by
     // STARS, surfaced as 507000/507018 at stream sync, or a 207001 launch

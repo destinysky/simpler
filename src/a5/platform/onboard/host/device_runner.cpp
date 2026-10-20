@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "aicpu_topology_probe.h"
+#include "common/urma_cqe_probe.h"
 #include "callable.h"
 #include "callable_protocol.h"
 #include "call_config.h"
@@ -82,8 +83,8 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_host_graph_em
 
 // Each host_runtime.so links one runtime source set. A5 HBG replaces this
 // no-op with the publisher for its resident scheduler state.
-extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip_swimlane_extensions(
-    Runtime * /*runtime*/
+extern "C" __attribute__((weak, visibility("hidden"))) bool
+publish_runtime_chip_swimlane_extensions(Runtime * /*runtime*/
 ) noexcept {
     return true;
 }
@@ -200,6 +201,59 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
         LOG_ERROR("aclrtDestroyStream failed (leaking stream): %d", static_cast<int>(destroy_rc));
     }
     return 0;
+}
+
+int DeviceRunner::read_urma_cqe(uint64_t address, uint32_t &dw0, uint32_t timeout_ms) {
+    if (address == 0 || address % alignof(uint32_t) != 0 || timeout_ms == 0 || timeout_ms > INT32_MAX ||
+        device_unusable_.load(std::memory_order_acquire) || !binaries_loaded_ || execution_rt_context_ == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const auto recovery = execution_recovery_state();
+    if (recovery.status == ExecutionRecoveryStatus::RECOVERY_REQUIRED && recovery.quiesced == 0)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    aclrtContext saved = nullptr;
+    int rc = aclrtGetCurrentContext(&saved);
+    if (rc != 0) return rc;
+    rc = aclrtSetCurrentContext(execution_rt_context_);
+    if (rc != 0) return rc;
+    auto restore = RAIIScopeGuard([&] {
+        if (aclrtSetCurrentContext(saved) != ACL_SUCCESS) device_unusable_.store(true, std::memory_order_release);
+    });
+    const int query_rc = [&]() -> int {
+        if (urma_query_stream_ == nullptr) {
+            rc = aclrtCreateStream(&urma_query_stream_);
+            if (rc != 0) return rc;
+        }
+        if (urma_query_result_ == nullptr) {
+            rc = aclrtMalloc(&urma_query_result_, sizeof(UrmaCqeProbeResult), ACL_MEM_MALLOC_HUGE_FIRST);
+            if (rc != 0) return rc;
+        }
+        if (urma_query_request_id_ == UINT64_MAX) return PTO_RUNTIME_ERR_INVALID_STATE;
+        UrmaCqeProbeArgs args{address, reinterpret_cast<uint64_t>(urma_query_result_), ++urma_query_request_id_};
+        rc = launch_aicpu_payload(urma_query_stream_, &args, sizeof(args), "simpler_aicpu_read_urma_cqe", 1);
+        if (rc == 0) rc = aclrtSynchronizeStreamWithTimeout(urma_query_stream_, static_cast<int32_t>(timeout_ms));
+        if (rc != 0) {
+            // An uncertain helper retains its HBM and stream until terminal device cleanup.
+            device_unusable_.store(true, std::memory_order_release);
+            LOG_WARN(
+                "[PTO_RECOVERY] URMA_CQE_QUERY_FAILED request=%llu rc=%d",
+                static_cast<unsigned long long>(args.request_id), rc
+            );
+            return rc;
+        }
+        UrmaCqeProbeResult result{};
+        rc = aclrtMemcpy(&result, sizeof(result), urma_query_result_, sizeof(result), ACL_MEMCPY_DEVICE_TO_HOST);
+        if (rc == 0 && !urma_cqe_probe_matches(args, result)) rc = PTO_RUNTIME_ERR_INVALID_STATE;
+        LOG_INFO(
+            "[PTO_RECOVERY] URMA_CQE_DEVICE_READ request=%llu address=0x%llx dw0=0x%x rc=%d",
+            static_cast<unsigned long long>(args.request_id), static_cast<unsigned long long>(address), result.dw0, rc
+        );
+        if (rc == 0) dw0 = result.dw0;
+        return rc;
+    }();
+    const int restore_rc = aclrtSetCurrentContext(saved);
+    restore.dismiss();
+    if (restore_rc != 0) device_unusable_.store(true, std::memory_order_release);
+    return query_rc != 0 ? query_rc : restore_rc;
 }
 
 int DeviceRunner::query_aicpu_device_occupancy(pto::a5::AicpuDeviceOccupancy &out) {
@@ -328,11 +382,9 @@ int DeviceRunner::prepare_execution(
     // failure cascade into a single fast, self-explanatory error; the runner is
     // then recovered at finalize.
     if (device_unusable_.load(std::memory_order_acquire)) {
-        LOG_ERROR(
-            "DeviceRunner marked unusable by a prior AICore failure; refusing to enqueue. "
-            "A soft reset does not clear the poison on a5; finalize() will force-reset "
-            "the card so the next Worker on it inits clean."
-        );
+        LOG_ERROR("DeviceRunner marked unusable by a prior AICore failure; refusing to enqueue. "
+                  "A soft reset does not clear the poison on a5; finalize() will force-reset "
+                  "the card so the next Worker on it inits clean.");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (validate_launch_aicpu_num(requested_aicpu_num) != 0) return PTO_RUNTIME_ERR_INTERNAL;
@@ -1144,6 +1196,9 @@ int DeviceRunner::retire_execution_generation() {
         );
     }
 
+    urma_query_stream_ = nullptr;
+    urma_query_result_ = nullptr;
+    urma_query_request_id_ = 0;
     int abandon_rc = abandon_common_after_device_failure();
     abandon_runtime_contexts_after_device_failure();
     if (acl_ready_) {
@@ -1188,6 +1243,23 @@ int DeviceRunner::finalize_healthy() {
     // Shared cleanup body — streams, kernel_args, callable/orch maps,
     // chip-callable buffer pool, the three arenas, device_wall,
     // mem_alloc_.finalize(), and cached arena sizes.
+    if (urma_query_stream_ != nullptr) {
+        int query_rc = aclrtDestroyStream(urma_query_stream_);
+        if (query_rc != 0) {
+            device_unusable_.store(true, std::memory_order_release);
+            return retire_execution_generation();
+        }
+        urma_query_stream_ = nullptr;
+    }
+    if (urma_query_result_ != nullptr) {
+        int query_rc = aclrtFree(urma_query_result_);
+        if (query_rc != 0) {
+            device_unusable_.store(true, std::memory_order_release);
+            return retire_execution_generation();
+        }
+        urma_query_result_ = nullptr;
+    }
+    urma_query_request_id_ = 0;
     rc = finalize_common();
 
     // Execution-owned resources are gone; retire the execution Context while

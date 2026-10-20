@@ -1,9 +1,16 @@
 # Copyright (c) PyPTO Contributors.
-# Licensed under CANN Open Software License Agreement Version 2.0.
-"""Automatic replay after a kernel error leaves the peer waiting for an SDMA notification."""
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""Automatic replay after a kernel error leaves the peer waiting for a communication notification."""
 
 import ctypes
 import json
+import logging
 import os
 import re
 import select
@@ -38,17 +45,26 @@ N = 16384
 KERNELS = Path(__file__).parent / "kernels"
 
 
-def _callable():
+def _urma_enabled():
+    return os.environ.get("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", "").upper() in {"1", "ON", "TRUE", "YES"}
+
+
+def _callable(backend="sdma"):
     compiler = KernelCompiler(platform="a5")
     root = ensure_pto_isa_root()
     includes = list(compiler.get_orchestration_include_dirs("tensormap_and_ringbuffer")) + [
         str(compiler.project_root / "src/common")
     ]
     children = []
+    filenames = (
+        ("kernel_urma_transfer.cpp", "kernel_urma_protocol.cpp", "kernel_urma_order.cpp")
+        if backend == "urma"
+        else ("kernel_sdma_transfer.cpp", "kernel_replay_protocol.cpp", "kernel_sdma_order.cpp")
+    )
     for index, filename, signature in (
-        (0, "kernel_sdma_transfer.cpp", [D.IN, D.OUT, D.IN]),
-        (1, "kernel_replay_protocol.cpp", [D.INOUT, D.OUT] + [D.IN] * 4),
-        (2, "kernel_sdma_order.cpp", [D.IN, D.OUT, D.IN, D.IN, D.IN]),
+        (0, filenames[0], [D.IN, D.OUT, D.IN]),
+        (1, filenames[1], [D.INOUT, D.OUT] + [D.IN] * 4),
+        (2, filenames[2], [D.IN, D.OUT, D.IN, D.IN, D.IN, D.IN]),
     ):
         binary = compiler.compile_incore(
             source_path=str(KERNELS / "aiv" / filename),
@@ -73,8 +89,25 @@ def _callable():
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 @pytest.mark.device_count(2)
 @pytest.mark.timeout(240)
+@pytest.mark.skipif(_urma_enabled(), reason="SDMA test requires the default SDMA workspace build")
 @pytest.mark.parametrize("mode", ["healthy", "transient", "persistent", "two-ops"])
-def test_a5_original_graph_replay(st_device_ids, mode, capfd):  # noqa: PLR0912, PLR0915
+def test_a5_original_graph_replay(st_device_ids, mode, capfd):
+    _run_original_graph_replay(st_device_ids, mode, capfd, backend="sdma")
+
+
+@pytest.mark.manual
+@pytest.mark.platforms(["a5"])
+@pytest.mark.runtime("tensormap_and_ringbuffer")
+@pytest.mark.device_count(2)
+@pytest.mark.timeout(240)
+@pytest.mark.skipif(not _urma_enabled(), reason="URMA test requires the URMA workspace build")
+@pytest.mark.parametrize("mode", ["healthy", "transient"])
+def test_a5_urma_protocol_recovery(st_device_ids, mode, capfd, caplog):
+    caplog.set_level(logging.INFO, logger="simpler")
+    _run_original_graph_replay(st_device_ids, mode, capfd, backend="urma")
+
+
+def _run_original_graph_replay(st_device_ids, mode, capfd, *, backend):  # noqa: PLR0912, PLR0915
     assert len(st_device_ids) == 2
     worker = Worker(
         level=3,
@@ -93,7 +126,7 @@ def test_a5_original_graph_replay(st_device_ids, mode, capfd):  # noqa: PLR0912,
         assert os.read(read_fd, 1) == b"G"
 
     gate_handle = worker.register(gate)
-    chip = worker.register(_callable())
+    chip = worker.register(_callable(backend))
     device_buffers, host_buffers = [], []
     counters, orders, outputs, markers, tasks = {}, {}, {}, {}, {}
     budget_exhausted = False
@@ -222,6 +255,7 @@ def test_a5_original_graph_replay(st_device_ids, mode, capfd):  # noqa: PLR0912,
         run.wait(90)
         episode_count = 0 if mode == "healthy" else (2 if mode == "two-ops" else 1)
         for rank in range(2):
+            identities = []
             expected_counts = [1, 1, 1, 0, 0, 0, 0, 0]
             if mode != "healthy":
                 expected_counts[0] = 2
@@ -233,8 +267,13 @@ def test_a5_original_graph_replay(st_device_ids, mode, capfd):  # noqa: PLR0912,
                 assert all(value == 101.0 - rank for value in read(outputs[rank, seq], N, ctypes.c_float))
                 marker = read(markers[rank, seq], 8, ctypes.c_uint32)
                 assert marker[0] == 1 and marker[1] in (seq - 1, seq)
+                if backend == "urma":
+                    identities.append(marker[3:8])
                 if seq == 3:
                     assert marker[1:3] == [2, 1]
+            if backend == "urma":
+                assert identities[0] == identities[1] == identities[2], "URMA resources changed across A/B/C"
+                assert identities[0][2] != 0 or identities[0][3] != 0
         assert not worker.pending_recoveries()
         for buffer in device_buffers:
             worker.free(buffer)
@@ -272,6 +311,8 @@ def test_a5_original_graph_replay(st_device_ids, mode, capfd):  # noqa: PLR0912,
             if outputs_verified or budget_exhausted:
                 with capfd.disabled():
                     _assert_automatic_evidence(captured.out + captured.err, mode)
+                    if backend == "urma":
+                        _assert_urma_evidence(captured.out + captured.err, mode)
 
 
 def _assert_automatic_evidence(log, mode):
@@ -296,3 +337,32 @@ def _assert_automatic_evidence(log, mode):
     if mode == "persistent":
         assert "RETRY_BUDGET_GIVE_UP" in log
     print(f"[PTO_RECOVERY_TEST] COORDINATED_PROTOCOL_RECOVERY_PASS mode={mode} episodes={expected}", flush=True)
+
+
+def _assert_urma_evidence(log, mode):
+    bindings = {}
+    for stage, rank, allocation, fields in re.findall(
+        r"URMA_BINDING stage=(READY|COMMIT) rank=(\d+) allocation_id=(\d+)([^\n]*)", log
+    ):
+        key = stage, rank
+        assert key not in bindings, "duplicate URMA binding stage"
+        identity = dict(re.findall(r"(\w+)=(0x[0-9a-fA-F]+)", fields))
+        assert set(identity) == {"context_c", "hccl", "comm_stream", "workspace", "local_window", "device_ctx"}
+        assert all(int(value, 16) != 0 for value in identity.values())
+        bindings[key] = allocation, identity
+    assert {rank for stage, rank in bindings if stage == "READY"} == {"0", "1"}
+    expected = 0 if mode == "healthy" else 2
+    proofs = re.findall(r"URMA_DRAIN_RESULT rank=(\d+) peer=(\d+) state=(\d+) checked=(\d+)", log)
+    assert len(proofs) == expected
+    reads = re.findall(r"URMA_CQE_DEVICE_READ request=\d+ address=0x[0-9a-fA-F]+ dw0=0x[0-9a-fA-F]+ rc=(-?\d+)", log)
+    assert len(reads) >= expected and all(rc == "0" for rc in reads)
+    if mode == "healthy":
+        assert not reads
+    if mode == "transient":
+        assert {rank for rank, _, _, _ in proofs} == {"0", "1"}
+        for rank, peer, state, checked in proofs:
+            assert rank != peer and state == "0" and int(checked) > 0
+            assert bindings["READY", rank] == bindings["COMMIT", rank], "URMA binding was replaced"
+    assert len(bindings) == 2 + expected
+    assert "SDMA_STOP_RESULT" not in log
+    print(f"[PTO_RECOVERY_TEST] URMA_COORDINATED_RECOVERY_PASS mode={mode} hardware_proofs={expected}", flush=True)

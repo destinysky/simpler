@@ -1,6 +1,14 @@
-/* Copyright (c) PyPTO Contributors.
- * Licensed under CANN Open Software License Agreement Version 2.0.
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
  */
+
 #include "orchestration_api.h"
 
 extern "C" {
@@ -14,7 +22,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     transfer.add_scalar(args.scalar<uint64_t>(0));
     rt_submit_aiv_task(0, transfer);
 
-    // Reading the produced tensor waits for the deferred SDMA completion.
+    // Reading the produced tensor waits for the deferred transport completion.
     const uint32_t first[1] = {0};
     (void)get_tensor_data<float>(args.tensor(1).ref(), 1, first);
     const uint32_t index[1] = {static_cast<uint32_t>(args.scalar<uint64_t>(3) - 1)};
@@ -44,6 +52,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     completion.add_scalar(args.scalar<uint64_t>(1));
     completion.add_scalar(args.scalar<uint64_t>(2));
     completion.add_scalar(args.scalar<uint64_t>(3));
+    completion.add_scalar(args.scalar<uint64_t>(0));
     rt_submit_aiv_task(2, completion);
 }
 }

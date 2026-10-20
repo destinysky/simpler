@@ -1377,7 +1377,13 @@ DomainRecoveryResult ChipWorker::recover_comm_domain_substrate(
         result.status = DomainRecoveryStatus::UNSUPPORTED;
         return result;
     }
-    int rc = comm_recover_domain_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, &request, &result);
+    using RecoverWithContext = int (*)(void *, void *, uint64_t, const DomainRecoveryRequest *, DomainRecoveryResult *);
+    dlerror();
+    auto with_context = reinterpret_cast<RecoverWithContext>(dlsym(lib_handle_, "comm_recover_domain_ctx"));
+    (void)dlerror();
+    int rc = with_context != nullptr ?
+                 with_context(device_ctx_, reinterpret_cast<void *>(comm_handle), allocation_id, &request, &result) :
+                 comm_recover_domain_fn_(reinterpret_cast<void *>(comm_handle), allocation_id, &request, &result);
     if (result.abi_version != 2 || result.struct_bytes != sizeof(DomainRecoveryResult)) {
         result.status = DomainRecoveryStatus::UNSUPPORTED;
         result.device_ctx = 0;
@@ -1501,8 +1507,8 @@ void ChipWorker::comm_destroy(uint64_t comm_handle) {
     }
 
     int rc = destroy_comm_session(*session);
-    while (!comm_sessions_.empty() && comm_sessions_.back().handle == nullptr &&
-           comm_sessions_.back().stream == nullptr) {
+    while (!comm_sessions_.empty() && comm_sessions_.back().handle == nullptr && comm_sessions_.back().stream == nullptr
+    ) {
         comm_sessions_.pop_back();
     }
 

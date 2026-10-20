@@ -21,8 +21,27 @@
 
 #include "device_runner.h"
 #include "runtime_c_api.h"
+#include "host/urma_cqe_reader.h"
 
 extern "C" {
+
+int comm_recover_domain_ctx(
+    DeviceContextHandle ctx, void *handle, uint64_t allocation_id, const DomainRecoveryRequest *request,
+    DomainRecoveryResult *result
+) {
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        auto *runner = static_cast<DeviceRunner *>(ctx);
+        return comm_recover_domain_with_reader(
+            handle, allocation_id, request, result,
+            [runner](uint64_t address, uint32_t &dw0, uint32_t timeout_ms) {
+                return runner->read_urma_cqe(address, dw0, timeout_ms);
+            }
+        );
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
 
 DeviceContextHandle create_device_context(void) {
     try {

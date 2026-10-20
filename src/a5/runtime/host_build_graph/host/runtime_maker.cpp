@@ -2181,7 +2181,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
 // host_build_graph resolves orchestration on the host, but the A5 platform
 // exports the topology query entry used before the first normal launch.
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count) {
-    static const char *const kExtra[] = {"simpler_aicpu_query_topology"};
+    static const char *const kExtra[] = {"simpler_aicpu_query_topology", "simpler_aicpu_read_urma_cqe"};
     if (count != nullptr) {
         *count = sizeof(kExtra) / sizeof(kExtra[0]);
     }

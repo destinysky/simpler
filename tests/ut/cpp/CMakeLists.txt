@@ -1226,6 +1226,11 @@ add_a2a3_runtime_test(test_a2a3_scope_stats_collector a2a3/test_scope_stats_coll
 # ---------------------------------------------------------------------------
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
 # ---------------------------------------------------------------------------
+add_a5_test(test_a5_urma_drain a5/test_urma_drain.cpp)
+target_sources(test_a5_urma_drain PRIVATE
+    ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/onboard/aicpu/urma_cqe_probe.cpp
+    ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu/cache_ops.cpp
+)
 add_a5_test(test_a5_urma_completion a5/test_urma_completion.cpp)
 target_compile_definitions(test_a5_urma_completion PRIVATE __CPU_SIM=1)
 target_sources(test_a5_urma_completion PRIVATE

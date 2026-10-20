@@ -65,6 +65,11 @@ inline CompletionPollResult counter_poll_op(const CompletionCondition &cond) {
     if (cond.counter_addr == nullptr) {
         return {CompletionPollState::FAILED, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID};
     }
+    if (cond.engine == ASYNC_ENGINE_URMA) {
+        // URMA notification counters are DMA-written and read-only to this poller.
+        const uintptr_t line = reinterpret_cast<uintptr_t>(cond.counter_addr) & ~(uintptr_t(CHIP_ALIGN_SIZE) - 1U);
+        cache_invalidate_range(reinterpret_cast<const void *>(line), CHIP_ALIGN_SIZE);
+    }
     return {
         *cond.counter_addr >= cond.expected_value ? CompletionPollState::READY : CompletionPollState::PENDING,
         SIMPLER_ERROR_NONE
