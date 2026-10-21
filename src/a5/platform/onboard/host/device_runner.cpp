@@ -729,24 +729,11 @@ int DeviceRunner::drain_execution(ActiveExecution &active) {
         cleanup_execution(prepared, /*launched=*/true);
     });
 
-    LOG_INFO(
-        "[PTO_RECOVERY_PROBE] HOST_STREAM_PAIR_DRAIN_BEGIN slot=%u run_epoch=%llu generation=%llu dispatch_id=%llu",
-        pipeline_slot, static_cast<unsigned long long>(prepared.identity.run_epoch),
-        static_cast<unsigned long long>(prepared.identity.generation),
-        static_cast<unsigned long long>(prepared.identity.dispatch_id)
-    );
     const int stream_rc = sync_run_streams();
     // A STOP can make sync succeed (or return COORDINATED_STOP's host status).
     // Neither erases the original host deadline failure. Preserve stream_rc in
     // diagnostics, and collect the independent PTO quiescence proof below.
     const int rc = run_poll_deadline_.timed_out() ? PTO_RUNTIME_ERR_EXECUTION_WAIT_TIMEOUT : stream_rc;
-    LOG_INFO(
-        "[PTO_RECOVERY_PROBE] HOST_STREAM_PAIR_DRAIN_END slot=%u run_epoch=%llu generation=%llu dispatch_id=%llu "
-        "rc=%d stream_rc=%d",
-        pipeline_slot, static_cast<unsigned long long>(prepared.identity.run_epoch),
-        static_cast<unsigned long long>(prepared.identity.generation),
-        static_cast<unsigned long long>(prepared.identity.dispatch_id), rc, stream_rc
-    );
     if (rc != 0) {
         // Stream status is diagnostic. Cooperative-stop publication supplies
         // the quiescence fact without a device-wide synchronization.

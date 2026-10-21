@@ -639,12 +639,7 @@ void SchedulerContext::log_chip_swimlane_summary(int32_t thread_idx, [[maybe_unu
 int32_t SchedulerContext::shutdown(int32_t thread_idx) {
     const int32_t *cores = core_trackers_[thread_idx].core_ids();
     int32_t core_num = core_trackers_[thread_idx].core_num();
-    if (core_num == 0) {
-        LOG_INFO(
-            "[PTO_RECOVERY_PROBE] AICORE_SHUTDOWN thread=%d total=0 acked=0 timed_out=0 invalid=0 rc=0", thread_idx
-        );
-        return 0;
-    }
+    if (core_num == 0) return 0;
 
 #if SIMPLER_DFX
     // Restore PMU CTRL registers for this thread's cores before AICore shutdown
@@ -677,7 +672,7 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
         }
     }
     LOG_INFO(
-        "[PTO_RECOVERY_PROBE] AICORE_SHUTDOWN thread=%d total=%d acked=%d timed_out=%d invalid=%d rc=%d", thread_idx,
+        "[PTO_RECOVERY] AICORE_SHUTDOWN thread=%d total=%d acked=%d timed_out=%d invalid=%d rc=%d", thread_idx,
         core_num, acked_count, timeout_count, invalid_count, rc
     );
     return rc;
@@ -1096,7 +1091,7 @@ void SchedulerContext::emergency_shutdown(Runtime *runtime) {
         if (header != nullptr) header->execution_quiesced.store(-1, std::memory_order_release);
     }
     LOG_INFO(
-        "[PTO_RECOVERY_PROBE] AICORE_EMERGENCY_SHUTDOWN total=%d initialized=%d acked=%d timed_out=%d "
+        "[PTO_RECOVERY] AICORE_EMERGENCY_SHUTDOWN total=%d initialized=%d acked=%d timed_out=%d "
         "uninitialized=%d",
         cores_total_num_, initialized_count, acked_count, timeout_count, cores_total_num_ - initialized_count
     );

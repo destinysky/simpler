@@ -14,6 +14,7 @@ import enum
 import gc
 import itertools
 import struct
+import subprocess
 import sys
 import weakref
 from multiprocessing.shared_memory import SharedMemory
@@ -60,6 +61,37 @@ from simpler.task_interface import (
 )
 
 _REF_BID = itertools.count(1)
+
+
+def test_packed_call_config_runtime_env_roundtrip():
+    """Nested packed ring arrays retain their public scalar/list behavior."""
+    source = """
+from _task_interface import CallConfig, RuntimeEnv
+
+cfg = CallConfig()
+for name in ("ring_task_window", "ring_heap", "ring_dep_pool"):
+    values = [1024, 2048, 4096, 8192]
+    setattr(cfg.runtime_env, name, values)
+    assert getattr(cfg.runtime_env, name) == values
+    assert name in repr(cfg.runtime_env) and name in repr(cfg)
+    setattr(cfg.runtime_env, name, 4096)
+    assert getattr(cfg.runtime_env, name) == [4096] * 4
+    try:
+        setattr(cfg.runtime_env, name, [1, 2])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("invalid ring array length was accepted")
+    assert getattr(cfg.runtime_env, name) == [4096] * 4
+
+replacement = RuntimeEnv()
+replacement.ring_heap = [1024, 2048, 4096, 8192]
+cfg.runtime_env = replacement
+assert cfg.runtime_env.ring_heap == [1024, 2048, 4096, 8192]
+cfg.validate()
+"""
+    result = subprocess.run([sys.executable, "-c", source], capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0, result.stderr
 
 
 def _dev_ref(addr, shapes, dtype, tag=None):

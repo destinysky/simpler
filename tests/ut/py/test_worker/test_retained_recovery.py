@@ -50,8 +50,15 @@ class _NativeRecovery:
 
 
 class RetainedRecoveryFacadeTest(unittest.TestCase):
-    def owner(self):
-        worker = Worker(level=3, platform="a5", device_ids=[0], num_sub_workers=0)
+    def owner(self, *, automatic=False):
+        worker = Worker(
+            level=3,
+            platform="a5",
+            device_ids=[0],
+            num_sub_workers=0,
+            enable_operator_recovery=True,
+            automatic_operator_recovery=automatic,
+        )
         native = _NativeRecovery()
         worker._worker = native
         worker._effective_operator_recovery = True
@@ -81,6 +88,16 @@ class RetainedRecoveryFacadeTest(unittest.TestCase):
                 worker.pending_recoveries()
         finally:
             worker._effective_operator_recovery = True
+            worker.close()
+
+    def test_automatic_owner_refuses_manual_give_up(self):
+        worker, native = self.owner(automatic=True)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "automatic RecoveryCoordinator"):
+                worker.give_up_recovery("ticket", "manual override")
+            self.assertEqual(native.calls, [])
+            self.assertEqual(worker._active_ops, 0)
+        finally:
             worker.close()
 
     def test_close_cancels_before_waiting_for_a_leased_recovery_owner(self):

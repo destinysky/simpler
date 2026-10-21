@@ -3113,20 +3113,20 @@ NB_MODULE(_task_interface, m) {
     // (broadcast to every ring) or a list of RUNTIME_ENV_RING_COUNT ints
     // (per-ring). The value always reads back as a list — the wire layout is the
     // four-entry array, so a broadcast scalar is stored as [v, v, v, v].
-    auto get_ring_values = [](const uint64_t values[RUNTIME_ENV_RING_COUNT]) -> std::vector<uint64_t> {
-        std::vector<uint64_t> out;
-        out.reserve(RUNTIME_ENV_RING_COUNT);
-        for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
-            out.push_back(values[i]);
-        }
+    // RuntimeEnv may reside at byte offset 28 inside packed CallConfig.
+    // Its arrays must cross this helper boundary as bytes, without promising
+    // the natural alignment of a uint64_t pointer.
+    auto get_ring_values = [](const void *values) -> std::vector<uint64_t> {
+        std::vector<uint64_t> out(RUNTIME_ENV_RING_COUNT);
+        std::memcpy(out.data(), values, out.size() * sizeof(uint64_t));
         return out;
     };
-    auto set_ring_values = [](uint64_t values[RUNTIME_ENV_RING_COUNT], nb::handle obj, const char *name) {
+    auto set_ring_values = [](void *values, nb::handle obj, const char *name) {
         uint64_t scalar = 0;
         if (nb::try_cast<uint64_t>(obj, scalar)) {  // int -> broadcast to every ring
-            for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
-                values[i] = scalar;
-            }
+            std::array<uint64_t, RUNTIME_ENV_RING_COUNT> input;
+            input.fill(scalar);
+            std::memcpy(values, input.data(), sizeof(input));
             return;
         }
         std::vector<uint64_t> input;
@@ -3137,9 +3137,7 @@ NB_MODULE(_task_interface, m) {
                     std::to_string(RUNTIME_ENV_RING_COUNT) + " entries"
                 );
             }
-            for (int i = 0; i < RUNTIME_ENV_RING_COUNT; ++i) {
-                values[i] = input[static_cast<size_t>(i)];
-            }
+            std::memcpy(values, input.data(), input.size() * sizeof(uint64_t));
             return;
         }
         throw std::invalid_argument(
@@ -3147,8 +3145,7 @@ NB_MODULE(_task_interface, m) {
             std::to_string(RUNTIME_ENV_RING_COUNT) + " ints"
         );
     };
-    auto append_ring_values = [](std::ostringstream &os, const char *name, bool leading_comma,
-                                 const uint64_t values[RUNTIME_ENV_RING_COUNT]) {
+    auto append_ring_values = [](std::ostringstream &os, const char *name, bool leading_comma, const void *values) {
         if (leading_comma) {
             os << ", ";
         }
@@ -3157,7 +3154,9 @@ NB_MODULE(_task_interface, m) {
             if (i != 0) {
                 os << ", ";
             }
-            os << values[i];
+            uint64_t value;
+            std::memcpy(&value, static_cast<const uint8_t *>(values) + i * sizeof(value), sizeof(value));
+            os << value;
         }
         os << "]";
     };
