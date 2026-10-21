@@ -397,7 +397,11 @@ class RuntimeBuilder:
                 if build_pto_isa_commit:
                     defines["SIMPLER_PTO_ISA_BUILD_COMMIT"] = build_pto_isa_commit
                 for opt_in_define in ("SIMPLER_ENABLE_PTO_URMA_WORKSPACE",):
-                    if os.environ.get(opt_in_define, "").upper() in {"1", "ON", "TRUE", "YES"}:
+                    enabled = os.environ.get(opt_in_define, "").upper() in {"1", "ON", "TRUE", "YES"}
+                    if arch == "a5" and variant == "onboard":
+                        # OFF must reach CMake too: omitting it retains an earlier URMA=ON cache entry.
+                        defines[opt_in_define] = "ON" if enabled else "OFF"
+                    elif enabled:
                         defines[opt_in_define] = "ON"
             cmake_defines = defines or None
             # compile() adds a {target}/ subdirectory inside build_dir

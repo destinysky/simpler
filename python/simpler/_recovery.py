@@ -21,8 +21,9 @@ from _task_interface import (
 )
 
 
-def capture_binding(native, comm, allocation_id, window_size):
-    snapshot = native.comm_recovery_snapshot(comm, allocation_id)
+def capture_binding(native, comm, allocation_id, window_size, *, snapshot=None):
+    if snapshot is None:
+        snapshot = native.comm_recovery_snapshot(comm, allocation_id)
     if not snapshot["allocation_present"]:
         raise RuntimeError("recovery binding requires a live domain")
     binding = RecoveryDomainBinding()

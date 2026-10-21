@@ -678,13 +678,17 @@ _CTRL_SHM_NAME_BYTES = 32
 # of rank_count parity; rank_ids come last (u32 has no alignment concern).
 _DOMAIN_REQ_HEADER = struct.Struct("<QIIQI4x")
 # fields: allocation_id (u64), rank_count (u32), domain_rank (u32),
-#         window_size (u64), buffer_count (u32), padding (4 bytes)
+#         window_size (u64), buffer_count (u32), workspace-kind query flag (u32)
 assert _DOMAIN_REQ_HEADER.size == 32
 
 # Domain-allocation reply shm layout: 32-byte header + buffer_ptrs (u64).
+# The final word of the fixed 32-byte header carries CommRecoveryWorkspaceKind.
+# Keep the four-value header view for existing commit/buffer-count consumers.
 _DOMAIN_REPLY_HEADER = struct.Struct("<QQQI4x")
+_DOMAIN_WORKSPACE_KIND = struct.Struct("<I")
+_OFF_DOMAIN_WORKSPACE_KIND = _DOMAIN_REPLY_HEADER.size - _DOMAIN_WORKSPACE_KIND.size
 # fields: committed (u64), device_ctx (u64), local_window_base (u64),
-#         buffer_count (u32), padding (4 bytes)
+#         buffer_count (u32), workspace_kind (u32)
 assert _DOMAIN_REPLY_HEADER.size == 32
 # `committed` leads the header and is written on the chip the instant its window
 # exists, before anything else that can fail. It is the only honest answer to
@@ -2445,6 +2449,7 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
     assert req_buf is not None
     try:
         (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
+        query_workspace_kind = _DOMAIN_WORKSPACE_KIND.unpack_from(req_buf, _OFF_DOMAIN_WORKSPACE_KIND)[0]
         # Layout: header | buffer_nbytes[buffer_count] (u64) | rank_ids[rank_count] (u32)
         nbytes_offset = _DOMAIN_REQ_HEADER.size
         nbytes_struct = struct.Struct(f"<{buffer_count}Q") if buffer_count else struct.Struct("")
@@ -2489,11 +2494,15 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
         _DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, 1, int(device_ctx), int(local_window_base), int(buffer_count))
         if buffer_ptrs:
             struct.pack_into(f"<{len(buffer_ptrs)}Q", reply_buf, _DOMAIN_REPLY_HEADER.size, *buffer_ptrs)
+        snapshot = None
+        if query_workspace_kind:
+            snapshot = cw._impl.comm_recovery_snapshot(int(handle), int(allocation_id))
+            _DOMAIN_WORKSPACE_KIND.pack_into(reply_buf, _OFF_DOMAIN_WORKSPACE_KIND, int(snapshot["workspace_kind"]))
         binding_offset = _DOMAIN_REPLY_HEADER.size + buffer_count * 8
         if len(reply_buf) > binding_offset:
             if len(reply_buf) - binding_offset != _RECOVERY_BINDING_BYTES:
                 raise RuntimeError("invalid allocation recovery trailer")
-            binding = capture_binding(cw._impl, int(handle), int(allocation_id), int(window_size))
+            binding = capture_binding(cw._impl, int(handle), int(allocation_id), int(window_size), snapshot=snapshot)
             _write_recovery_binding(_buffer_field_addr(reply_buf, binding_offset), binding)
     finally:
         reply_buf.release()
@@ -9267,6 +9276,10 @@ class Worker:
                         int(window_size),
                         int(buffer_count),
                     )
+                    # Only A5 onboard exports the resource-owner snapshot capability.
+                    _DOMAIN_WORKSPACE_KIND.pack_into(
+                        req_buf, _OFF_DOMAIN_WORKSPACE_KIND, int(self._config.get("platform") == "a5")
+                    )
                     nbytes_off = _DOMAIN_REQ_HEADER.size
                     if buffer_count:
                         struct.pack_into(f"<{buffer_count}Q", req_buf, nbytes_off, *[int(b.nbytes) for b in buffers])
@@ -9333,6 +9346,7 @@ class Worker:
                         contexts[chip_idx] = ChipDomainContext(
                             name=name,
                             recovery_binding=recovery_binding,
+                            workspace_kind=_DOMAIN_WORKSPACE_KIND.unpack_from(reply_buf, _OFF_DOMAIN_WORKSPACE_KIND)[0],
                             domain_rank=worker_to_rank[chip_idx],
                             domain_size=len(workers),
                             device_ctx=int(device_ctx),

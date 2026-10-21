@@ -561,11 +561,11 @@ def test_local_task_frame_count_uses_direct_a2a3_pipeline_depth(platform, runtim
 @pytest.mark.parametrize(
     ("platform", "worker_config", "expected_operator_recovery", "expected_frame_counts"),
     [
-        ("a5", {}, False, (1,1)),
-        ("a5", {"enable_operator_recovery": True}, True, (1,1)),
-        ("a5", {"enable_operator_recovery": True, "automatic_operator_recovery": False}, True, (1,1)),
-        ("a2a3", {"enable_operator_recovery": True}, False, (2,1)),
-        ("a5sim", {"enable_operator_recovery": True}, False, (1,1)),
+        ("a5", {}, False, (1, 1)),
+        ("a5", {"enable_operator_recovery": True}, True, (1, 1)),
+        ("a5", {"enable_operator_recovery": True, "automatic_operator_recovery": False}, True, (1, 1)),
+        ("a2a3", {"enable_operator_recovery": True}, False, (2, 1)),
+        ("a5sim", {"enable_operator_recovery": True}, False, (1, 1)),
     ],
 )
 def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(
@@ -650,7 +650,7 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(
     assert [call[1:] for call in fake_parent.next_level_calls] == [
         (12001, expected_frame_counts[0]),
         (12002, expected_frame_counts[1]),
-        ]
+    ]
     assert fake_parent.initialized
     assert startup_events[0] == ("log", 60, True)
     assert startup_events[1:] == [("fork",), ("fork",), ("writer",)]
@@ -5915,6 +5915,70 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         worker = Worker(level=3, num_sub_workers=0)
         worker._worker = cast(Any, object())
         return worker
+
+    @pytest.mark.parametrize(
+        ("platform", "workspace_kind", "recovery"),
+        [("a5", 1, False), ("a5", 1, True), ("a5", 2, False), ("a5", 2, True), ("a2a3", 0, False), ("a5sim", 0, False)],
+    )
+    def test_domain_reply_reports_resource_owner_backend(self, monkeypatch, platform, workspace_kind, recovery):
+        """Exercise child IPC and parent decoding with the real native binding codec."""
+        worker = self._worker()
+        worker._config = {"platform": platform, "device_ids": [0, 1]}
+        worker._effective_operator_recovery = recovery
+        worker._building_run_resources = worker_mod._RunResources()
+        monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
+        monkeypatch.setattr(worker_mod, "_comm_base_handle", lambda _cw: 9)
+        observations = []
+
+        def dispatch(*, workers, request_shms, reply_shms, **_kwargs):
+            for rank in workers:
+
+                def allocate(_comm, _allocation, _ranks, _rank, _size, committed):
+                    ctypes.c_uint64.from_address(committed).value = 1
+                    return 0xC7 + rank, 0xB000 + rank * 0x1000
+
+                def snapshot(_comm, _allocation):
+                    assert platform == "a5", "other platforms must not require an A5 snapshot API"
+                    observations.append(rank)
+                    return {
+                        "allocation_present": 1,
+                        "workspace_kind": workspace_kind,
+                        "device_ctx": 0xC7 + rank,
+                        "local_window_base": 0xB000 + rank * 0x1000,
+                        "workspace_addr": 0x90000 + rank * 0x1000,
+                    }
+
+                child = SimpleNamespace(
+                    _impl=SimpleNamespace(
+                        comm_alloc_domain_windows=allocate,
+                        comm_recovery_snapshot=snapshot,
+                    )
+                )
+                mailbox = memoryview(bytearray(MAILBOX_SIZE))
+                for offset, name in (
+                    (worker_mod._OFF_ARGS, request_shms[rank].name),
+                    (worker_mod._OFF_ARGS + worker_mod._CTRL_SHM_NAME_BYTES, reply_shms[rank].name),
+                ):
+                    encoded = name.encode("utf-8")
+                    mailbox[offset : offset + len(encoded)] = encoded
+                try:
+                    worker_mod._handle_ctrl_alloc_domain(child, mailbox)
+                finally:
+                    mailbox.release()
+
+        monkeypatch.setattr(worker, "_dispatch_control_domain", dispatch)
+        domain = worker._allocate_domain(name="d", workers=(0, 1), window_size=64, buffers=[])
+        assert observations == ([0, 1] if platform == "a5" else [])
+        for rank in domain.workers:
+            context = domain[rank]
+            assert context.workspace_kind == workspace_kind
+            assert context.device_ctx == 0xC7 + rank
+            assert context.local_window_base == 0xB000 + rank * 0x1000
+            if recovery:
+                assert context.recovery_binding.workspace == 0x90000 + rank * 0x1000
+                assert context.recovery_binding.device_ctx == context.device_ctx
+            else:
+                assert context.recovery_binding is None
 
     def test_a_partial_domain_allocation_keeps_its_original_release_ranks(self, monkeypatch):
         """Two chips of three committed a window and no handle exists.

@@ -1095,6 +1095,8 @@ class ChipDomainContext:
     # arg with ``buffers[name].tensor(shapes, dtype)`` and dispatch it only to this chip (``domain_rank``).
     buffers: dict[str, Buffer]
     recovery_binding: RecoveryDomainBinding | None = None
+    # CommRecoveryWorkspaceKind reported by the resource owner, independent of recovery enablement.
+    workspace_kind: int = 0
 
 
 class CommDomainHandle:

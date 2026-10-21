@@ -305,6 +305,21 @@ class TestRuntimeBuilderGetBinaries:
         return source
 
     @patch("simpler_setup.runtime_builder.RuntimeCompiler")
+    def test_a5_urma_to_sdma_switch_explicitly_clears_cmake_option(self, MockCompiler, tmp_path, monkeypatch):
+        """Reusing a build directory must not retain URMA after OFF or unset."""
+        self._make_runtime(tmp_path, "a5")
+        builder, compiler = self._isolated_builder(MockCompiler, tmp_path, monkeypatch, "a5")
+        for value, expected in (("ON", "ON"), ("OFF", "OFF"), (None, "OFF")):
+            compiler.compile.reset_mock()
+            if value is None:
+                monkeypatch.delenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", raising=False)
+            else:
+                monkeypatch.setenv("SIMPLER_ENABLE_PTO_URMA_WORKSPACE", value)
+            builder.get_binaries("test_rt", build=True)
+            host = next(call for call in compiler.compile.call_args_list if call.args[0] == "host")
+            assert host.kwargs["cmake_defines"]["SIMPLER_ENABLE_PTO_URMA_WORKSPACE"] == expected
+
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_warns_when_an_arch_with_warmup_source_staged_nothing(self, MockCompiler, tmp_path, monkeypatch, caplog):
         """A build/staging regression must be visible, not just slower.
 
