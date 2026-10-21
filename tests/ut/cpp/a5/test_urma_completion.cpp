@@ -13,8 +13,12 @@
 #include <array>
 #include <cstdint>
 
+#include "orchestration_api.h"
 #include "async_wait.h"
 #include "backend/urma/urma_completion_kernel.h"
+
+extern "C" void aicpu_orchestration_entry(const ChipTaskArgs &);
+[[noreturn]] void assert_impl(const char *, const char *, int) { throw "assert_impl"; }
 
 namespace {
 // Wire images follow PTO-ISA 138dbf86; the runtime decodes these separately.
@@ -125,6 +129,38 @@ TEST_F(UrmaCompletion, SequenceWrapDoesNotTurnAnOutstandingEventIntoANoop) {
     EXPECT_EQ(cq_tail, 0U);
 }
 
+TEST_F(UrmaCompletion, StopSampleDistinguishesHardwarePendingWithoutRetiring) {
+    entries[16] = 0;
+    auto result = urma_backend::sample_urma_stop_cqe((uint64_t{1} << 32) | 3, reinterpret_cast<uint64_t>(&info), 2);
+    EXPECT_EQ(result.flags, URMA_STOP_SAMPLED | URMA_STOP_PENDING);
+    EXPECT_EQ(result.sequence, 1U);
+    EXPECT_EQ(sq_tail, 0U);
+    EXPECT_EQ(cq_tail, 0U);
+    EXPECT_EQ(cq_db, 0U);
+    entries[16] = 4;
+    result = urma_backend::sample_urma_stop_cqe((uint64_t{1} << 32) | 3, reinterpret_cast<uint64_t>(&info), 2);
+    EXPECT_EQ(result.flags, URMA_STOP_SAMPLED);
+    EXPECT_EQ(cq_tail, 0U);
+    entries[16] |= 7U << 24;
+    result = urma_backend::sample_urma_stop_cqe((uint64_t{1} << 32) | 3, reinterpret_cast<uint64_t>(&info), 2);
+    EXPECT_EQ(result.flags, URMA_STOP_SAMPLED | URMA_STOP_ERROR);
+}
+TEST_F(UrmaCompletion, StopSampleRejectsUnpostedTargetsAndInvalidGeometry) {
+    sq_tail = 3;
+    cq_tail = 2;
+    EXPECT_EQ(
+        urma_backend::sample_urma_stop_cqe((uint64_t{1} << 32) | 3, reinterpret_cast<uint64_t>(&info), 2).flags, 0U
+    );
+    sq_tail = cq_tail = 0;
+    EXPECT_EQ(
+        urma_backend::sample_urma_stop_cqe((uint64_t{1} << 32) | 4, reinterpret_cast<uint64_t>(&info), 3).flags, 0U
+    );
+    cq[1].depth = 3;
+    EXPECT_EQ(
+        urma_backend::sample_urma_stop_cqe((uint64_t{1} << 32) | 3, reinterpret_cast<uint64_t>(&info), 2).flags, 0U
+    );
+}
+
 struct Event {
     uint64_t handle{(uint64_t{1} << 32) | 3};
     pto::comm::DmaEngine engine{pto::comm::DmaEngine::URMA};
@@ -165,5 +201,83 @@ TEST(UrmaRegistration, SynchronousFallbackPropagatesWaitFailure) {
     event.wait_result = false;
     EXPECT_FALSE(urma_backend::register_urma_async_event(ctx, event, 0, nullptr));
     EXPECT_EQ(event.wait_calls, 1);
+}
+
+struct ReplayArgsState {
+    RuntimeContext *runtime{};
+    bool fatal{};
+    uint32_t prior_attempt{};
+    uint64_t counter_addr{};
+    uint64_t flags_addr{};
+    int submissions{};
+    int completion_submissions{};
+};
+ReplayArgsState replay_args;
+
+extern "C" RuntimeContext *framework_current_runtime(void) { return replay_args.runtime; }
+extern "C" void framework_bind_runtime(RuntimeContext *rt) { replay_args.runtime = rt; }
+
+TaskOutputTensors inspect_replay_args(RuntimeContext *, const MixedKernels &kernels, const CoreTaskArgs &args) {
+    ++replay_args.submissions;
+    EXPECT_FALSE(args.has_error) << (args.error_msg ? args.error_msg : "");
+    if (args.has_error) {
+        replay_args.fatal = true;
+        return {};
+    }
+    EXPECT_EQ(args.tensor_count(), 2U);
+    if (kernels.aiv0_kernel_id == 2) {
+        ++replay_args.completion_submissions;
+        EXPECT_EQ(args.scalar_count(), 6U);
+        EXPECT_EQ(args.scalar<uint64_t>(0), 0xDEADU);
+        EXPECT_EQ(args.scalar<uint64_t>(3), 0xFEEDU);
+        EXPECT_EQ(args.scalar<uint64_t>(4), replay_args.flags_addr);
+    }
+    return {};
+}
+
+TEST(UrmaReplayArgs, ActualOrchestrationPreservesTheOrderKernelPrefix) {
+    RuntimeOps ops{};
+    ops.submit_task = inspect_replay_args;
+    ops.is_fatal = [](RuntimeContext *) {
+        return replay_args.fatal;
+    };
+    ops.get_tensor_data = [](RuntimeContext *, const simpler::tmr::Tensor &tensor, uint32_t,
+                             const uint32_t *) -> uint64_t {
+        return tensor.buffer.addr == replay_args.counter_addr ? replay_args.prior_attempt : 0;
+    };
+    ops.set_tensor_data = [](RuntimeContext *, const simpler::tmr::Tensor &, uint32_t, const uint32_t *, uint64_t) {};
+    RuntimeContext runtime{&ops, ScopeMode::AUTO};
+    struct Unbind {
+        ~Unbind() { framework_bind_runtime(nullptr); }
+    } unbind;
+    for (uint64_t mode = 0; mode <= 4; ++mode) {
+        for (uint64_t rank = 0; rank < 2; ++rank) {
+            for (uint32_t attempt = 1; attempt <= 2; ++attempt) {
+                SCOPED_TRACE(::testing::Message() << "mode=" << mode << " rank=" << rank << " attempt=" << attempt);
+                replay_args = {};
+                replay_args.runtime = &runtime;
+                replay_args.prior_attempt = attempt - 1;
+                std::array<simpler::tmr::Tensor, 7> tensors;
+                const uint32_t shape[] = {128};
+                for (uint32_t i = 0; i < tensors.size(); ++i) {
+                    tensors[i] = simpler::tmr::make_tensor_external(
+                        reinterpret_cast<void *>(uint64_t{0x124000000000} + 0x1000U * i), shape, 1, DataType::UINT32
+                    );
+                }
+                tensors[6].start_offset = 7;
+                replay_args.counter_addr = tensors[3].buffer.addr;
+                replay_args.flags_addr = tensors[6].buffer.addr + 7 * sizeof(uint32_t);
+                ChipTaskArgs args;
+                for (auto &tensor : tensors)
+                    args.add_input(tensor);
+                args.add_scalar(uint64_t{0xFEED}, uint64_t{0xDEAD}, uint64_t{0}, uint64_t{1}, mode, rank);
+                ASSERT_FALSE(args.has_error);
+                aicpu_orchestration_entry(args);
+                EXPECT_FALSE(replay_args.fatal);
+                EXPECT_EQ(replay_args.completion_submissions, 1);
+                EXPECT_EQ(replay_args.submissions, rank == 0 ? 4 : 3);
+            }
+        }
+    }
 }
 }  // namespace

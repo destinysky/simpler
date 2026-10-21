@@ -42,6 +42,7 @@ from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
 
 N = 16384
+TRAFFIC_WORDS = 256 * 1024 * 1024 // 4
 KERNELS = Path(__file__).parent / "kernels"
 
 
@@ -64,7 +65,7 @@ def _callable(backend="sdma"):
     for index, filename, signature in (
         (0, filenames[0], [D.IN, D.OUT, D.IN]),
         (1, filenames[1], [D.INOUT, D.OUT] + [D.IN] * 4),
-        (2, filenames[2], [D.IN, D.OUT, D.IN, D.IN, D.IN, D.IN]),
+        (2, filenames[2], [D.IN, D.OUT] + [D.IN] * 6),
     ):
         binary = compiler.compile_incore(
             source_path=str(KERNELS / "aiv" / filename),
@@ -101,7 +102,7 @@ def test_a5_original_graph_replay(st_device_ids, mode, capfd):
 @pytest.mark.device_count(2)
 @pytest.mark.timeout(240)
 @pytest.mark.skipif(not _urma_enabled(), reason="URMA test requires the URMA workspace build")
-@pytest.mark.parametrize("mode", ["healthy", "transient"])
+@pytest.mark.parametrize("mode", ["healthy", "transient", "burst-healthy", "burst-transient"])
 def test_a5_urma_protocol_recovery(st_device_ids, mode, capfd, caplog):
     caplog.set_level(logging.INFO, logger="simpler")
     _run_original_graph_replay(st_device_ids, mode, capfd, backend="urma")
@@ -109,6 +110,11 @@ def test_a5_urma_protocol_recovery(st_device_ids, mode, capfd, caplog):
 
 def _run_original_graph_replay(st_device_ids, mode, capfd, *, backend):  # noqa: PLR0912, PLR0915
     assert len(st_device_ids) == 2
+    burst = mode.startswith("burst-")
+    healthy = mode in {"healthy", "burst-healthy"}
+    evidence_mode = "healthy" if healthy else ("transient" if burst else mode)
+    handshake_words = 64 + 2 * TRAFFIC_WORDS if burst else 64
+    marker_words = 16 if burst else 8
     worker = Worker(
         level=3,
         platform="a5",
@@ -131,6 +137,7 @@ def _run_original_graph_replay(st_device_ids, mode, capfd, *, backend):  # noqa:
     counters, orders, outputs, markers, tasks = {}, {}, {}, {}, {}
     budget_exhausted = False
     outputs_verified = False
+    contained_failure = None
 
     def allocation(rank, count, dtype):
         value = worker.alloc_child_tensor(rank, (count,), dtype)
@@ -154,7 +161,7 @@ def _run_original_graph_replay(st_device_ids, mode, capfd, *, backend):  # noqa:
             orders[rank] = allocation(rank, 8, DataType.UINT32)
             for seq in range(1, 4):
                 outputs[rank, seq] = allocation(rank, N, DataType.FLOAT32)
-                markers[rank, seq] = allocation(rank, 8, DataType.UINT32)
+                markers[rank, seq] = allocation(rank, marker_words, DataType.UINT32)
 
         def graph(orch, _args, _config):
             try:
@@ -163,10 +170,10 @@ def _run_original_graph_replay(st_device_ids, mode, capfd, *, backend):  # noqa:
                     orch.allocate_domain(
                         name="replay",
                         workers=[0, 1],
-                        window_size=4 * 1024 * 1024,
+                        window_size=1024 * 1024 * 1024 if burst else 4 * 1024 * 1024,
                         buffers=[
                             CommBufferSpec("source", "float32", N, N * 4),
-                            CommBufferSpec("handshake", "uint32", 64, 256),
+                            CommBufferSpec("handshake", "uint32", handshake_words, handshake_words * 4),
                         ],
                     ) as domain,
                 ):
@@ -178,7 +185,13 @@ def _run_original_graph_replay(st_device_ids, mode, capfd, *, backend):  # noqa:
                         zero = worker.create_buffer(256)
                         host_buffers.append(zero)
                         zero.shm.buf[:] = bytes(256)
-                        orch.copy_to(domain[rank].buffers["handshake"], zero)
+                        orch.copy_to(domain[rank].buffers["handshake"], zero, nbytes=256)
+                        if burst:
+                            for word, value in ((64, 1000 + rank), (64 + TRAFFIC_WORDS - 1, 2000 + rank)):
+                                sentinel = worker.create_buffer(4)
+                                host_buffers.append(sentinel)
+                                sentinel.shm.buf[:] = value.to_bytes(4, "little")
+                                orch.copy_to(domain[rank].buffers["handshake"], sentinel, dst_offset=word * 4, nbytes=4)
                     gate_buffer = orch.alloc((1,), DataType.UINT32)
                     gate_args = TaskArgs()
                     gate_args.add_tensor(gate_buffer.tensor((1,), DataType.UINT32), TensorArgType.OUTPUT)
@@ -197,20 +210,21 @@ def _run_original_graph_replay(st_device_ids, mode, capfd, *, backend):  # noqa:
                                 outputs[rank, seq].tensor((N,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING
                             )
                             args.add_tensor(
-                                markers[rank, seq].tensor((8,), DataType.UINT32), TensorArgType.OUTPUT_EXISTING
+                                markers[rank, seq].tensor((marker_words,), DataType.UINT32),
+                                TensorArgType.OUTPUT_EXISTING,
                             )
                             args.add_tensor(counters[rank].tensor((8,), DataType.UINT32), TensorArgType.OUTPUT_EXISTING)
                             args.add_tensor(gate_buffer.tensor((1,), DataType.UINT32), TensorArgType.INPUT)
                             args.add_tensor(orders[rank].tensor((8,), DataType.UINT32), TensorArgType.OUTPUT_EXISTING)
                             args.add_tensor(
-                                context.buffers["handshake"].tensor((64,), DataType.UINT32),
+                                context.buffers["handshake"].tensor((handshake_words,), DataType.UINT32),
                                 TensorArgType.OUTPUT_EXISTING,
                             )
-                            fault = int(
-                                rank == 0 and ((seq == 1 and mode != "healthy") or (seq == 2 and mode == "two-ops"))
-                            )
+                            fault = int(rank == 0 and ((seq == 1 and not healthy) or (seq == 2 and mode == "two-ops")))
                             if fault and mode == "persistent":
                                 fault = 2
+                            if burst and seq == 1:
+                                fault = 4 if healthy else 3
                             for scalar in (context.device_ctx, orders[rank].base, seq - 1, seq, fault, rank):
                                 args.add_scalar(scalar)
                             binding = TaskDomainBinding()
@@ -252,12 +266,18 @@ def _run_original_graph_replay(st_device_ids, mode, capfd, *, backend):  # noqa:
             budget_exhausted = True
             print("[PTO_RECOVERY_TEST] ORIGINAL_GRAPH_BUDGET_GIVE_UP_PASS", flush=True)
             return
-        run.wait(90)
-        episode_count = 0 if mode == "healthy" else (2 if mode == "two-ops" else 1)
+        try:
+            run.wait(90)
+        except RuntimeError as error:
+            if mode != "burst-transient" or "resource recovery failed" not in str(error):
+                raise
+            contained_failure = error
+            return
+        episode_count = 0 if healthy else (2 if mode == "two-ops" else 1)
         for rank in range(2):
             identities = []
             expected_counts = [1, 1, 1, 0, 0, 0, 0, 0]
-            if mode != "healthy":
+            if not healthy:
                 expected_counts[0] = 2
             if mode == "two-ops":
                 expected_counts[1] = 2
@@ -265,10 +285,14 @@ def _run_original_graph_replay(st_device_ids, mode, capfd, *, backend):  # noqa:
             assert read(orders[rank], 8, ctypes.c_uint32)[0] == 3
             for seq in range(1, 4):
                 assert all(value == 101.0 - rank for value in read(outputs[rank, seq], N, ctypes.c_float))
-                marker = read(markers[rank, seq], 8, ctypes.c_uint32)
+                marker = read(markers[rank, seq], marker_words, ctypes.c_uint32)
                 assert marker[0] == 1 and marker[1] in (seq - 1, seq)
                 if backend == "urma":
                     identities.append(marker[3:8])
+                if burst and rank == 1 and seq == 1:
+                    assert marker[8:10] == [1000, 2000], "large READ payload was not visible after completion"
+                    assert marker[10] >= 2
+                    print(f"[URMA_OUTSTANDING_TEST] POSTED requests={marker[10]} target_cqe={marker[11]}", flush=True)
                 if seq == 3:
                     assert marker[1:3] == [2, 1]
             if backend == "urma":
@@ -295,7 +319,9 @@ def _run_original_graph_replay(st_device_ids, mode, capfd, *, backend):  # noqa:
         try:
             worker.close()
         except RuntimeError as error:
-            if not budget_exhausted or "retry budget exhausted" not in str(error):
+            expected_budget = budget_exhausted and "retry budget exhausted" in str(error)
+            expected_containment = contained_failure is not None and "resource recovery failed" in str(error)
+            if not (expected_budget or expected_containment):
                 raise
             print(f"[PTO_RECOVERY_TEST] TERMINAL_CLOSE_FAULT {error}", flush=True)
         finally:
@@ -310,9 +336,12 @@ def _run_original_graph_replay(st_device_ids, mode, capfd, *, backend):  # noqa:
                 print(captured.err, end="", file=sys.stderr, flush=True)
             if outputs_verified or budget_exhausted:
                 with capfd.disabled():
-                    _assert_automatic_evidence(captured.out + captured.err, mode)
+                    _assert_automatic_evidence(captured.out + captured.err, evidence_mode)
                     if backend == "urma":
-                        _assert_urma_evidence(captured.out + captured.err, mode)
+                        _assert_urma_evidence(captured.out + captured.err, evidence_mode)
+            if burst and (outputs_verified or contained_failure is not None):
+                with capfd.disabled():
+                    _assert_outstanding_evidence(captured.out + captured.err, mode, contained_failure is not None)
 
 
 def _assert_automatic_evidence(log, mode):
@@ -366,3 +395,66 @@ def _assert_urma_evidence(log, mode):
     assert len(bindings) == 2 + expected
     assert "SDMA_STOP_RESULT" not in log
     print(f"[PTO_RECOVERY_TEST] URMA_COORDINATED_RECOVERY_PASS mode={mode} hardware_proofs={expected}", flush=True)
+
+
+def _assert_outstanding_evidence(log, mode, failed):
+    assert "507014" not in log and "Segmentation fault" not in log
+    assert "URMA_CQE_QUERY_FAILED" not in log
+    if mode == "burst-healthy":
+        assert not failed
+        print("[URMA_OUTSTANDING_TEST] BURST_HEALTHY_PASS", flush=True)
+        return
+    samples = []
+    for fields in re.findall(r"URMA_STOP_CQE ([^\n]+)", log):
+        sample = {key: int(value, 0) for key, value in re.findall(r"(\w+)=(0x[0-9a-fA-F]+|\d+)", fields)}
+        samples.append(sample)
+    pending = [
+        sample
+        for sample in samples
+        if sample.get("peer") == 0
+        and sample.get("valid") == 1
+        and sample.get("pending") == 1
+        and sample.get("busy") == 0
+    ]
+    if not pending:
+        if failed:
+            raise AssertionError("recovery failed without proof of hardware-pending work at STOP")
+        print("[URMA_OUTSTANDING_TEST] COVERAGE_MISSING reason=no_hardware_pending_cqe_at_stop", flush=True)
+        pytest.skip("burst completed correctly, but no hardware-pending CQE was witnessed at STOP")
+    assert len(pending) == 1
+    sample = pending[0]
+    assert sample["target_cqe"] - sample["retired_cqe"] >= 2
+    assert sample["target_bb"] - sample["retired_bb"] >= 2
+    quiescence = re.findall(r"EXECUTION_QUIESCENCE[^\n]* proved=(\d+)", log)
+    assert quiescence == ["1", "1"]
+    members = re.findall(
+        r"AUTO_MEMBER_TERMINAL recovery_id=(\d+) worker=(\d+) raw_rc=(-?\d+) runtime_status=(-?\d+)", log
+    )
+    assert len(members) == 2 and len({episode for episode, *_ in members}) == 1
+    assert sample["run_epoch"] != 0
+    assert re.search(rf"EXECUTION_QUIESCENCE run_epoch={sample['run_epoch']} proved=1", log)
+    assert len(re.findall(r"STOP_DELIVERED[^\n]* active=1", log)) == 1
+    assert {rank: int(status) for _, rank, _, status in members} == {"0": -101, "1": -12}
+    print("[URMA_OUTSTANDING_TEST] HARDWARE_PENDING_AT_STOP " + json.dumps(sample, sort_keys=True), flush=True)
+    if not failed:
+        print("[URMA_OUTSTANDING_TEST] OUTSTANDING_REUSE_PASS", flush=True)
+        return
+    assert "REPLAY_DISPATCH" not in log and "REPLAY_COMMIT" not in log
+    assert not re.search(r"name=node\.(?:dispatch|frame_submit) [^\n]*task_slot=[34](?: |$)", log)
+    proofs = []
+    for fields in re.findall(r"URMA_DRAIN_RESULT ([^\n]+)", log):
+        proof = {key: int(value, 0) for key, value in re.findall(r"(\w+)=(-?0x[0-9a-fA-F]+|-?\d+)", fields)}
+        if proof.get("rank") == 1:
+            proofs.append(proof)
+    assert len(proofs) == 1
+    proof = proofs[0]
+    assert (proof["wqn"], proof["cqn"]) == (sample["wqn"], sample["cqn"])
+    if proof["state"] == 2:
+        assert proof["dw0"] & 0xFFFF0000
+        reason = "CQE_ERROR"
+    else:
+        assert proof["timed_out"] == 1 and proof["state"] in {1, 4}
+        reason = "PROOF_DEADLINE"
+    cleaned = re.findall(r"aclrtResetDeviceForce\((\d+)\) cleared the poisoned card", log)
+    assert len(set(cleaned)) == 2, "terminal cleanup did not confirm both devices clean"
+    print(f"[URMA_OUTSTANDING_TEST] OUTSTANDING_CONTAINMENT_PASS reason={reason}", flush=True)

@@ -158,6 +158,7 @@ void SharedMemoryHandle::init_header_per_ring(
 
     // Error reporting
     header->execution_quiesced.store(0, std::memory_order_relaxed);
+    header->urma_stop_evidence = {};
     header->orch_error_code.store(SIMPLER_ERROR_NONE, std::memory_order_relaxed);
     header->sched_error_bitmap.store(0, std::memory_order_relaxed);
     header->sched_error_code.store(SIMPLER_ERROR_NONE, std::memory_order_relaxed);

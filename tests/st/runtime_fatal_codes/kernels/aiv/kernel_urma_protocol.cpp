@@ -41,7 +41,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     auto *comm = reinterpret_cast<__gm__ CommContext *>(args[2]);
     const uint32_t epoch = static_cast<uint32_t>(args[3]);
     const bool publish = args[4] != 0;
-    const bool fail = args[5] != 0;
+    const bool fail = (args[5] & 1) != 0;
+    const bool burst = (args[5] & 4) != 0;
     auto *local = reinterpret_cast<__gm__ uint32_t *>(flags->buffer.addr) + flags->start_offset;
     AsyncCtx ctx = get_async_ctx(args);
     if (publish && fail) {
@@ -73,6 +74,39 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     auto event = pto::comm::TPUT_ASYNC_NOTIFY<pto::comm::DmaEngine::URMA>(
         destination, source, signal, static_cast<int32_t>(epoch), pto::comm::NotifyOp::Set, session, peer
     );
+    if (burst && !publish) {
+        if (!event.Wait(session)) {
+            pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            pto2::detail::defer_flush(ctx);
+            return;
+        }
+        constexpr uint32_t kWords = 256U * 1024U * 1024U / sizeof(uint32_t);
+        auto *info = reinterpret_cast<__gm__ pto::comm::urma::UrmaInfo *>(workspace);
+        auto *wq = reinterpret_cast<__gm__ pto::comm::urma::UrmaWQCtx *>(info->sqPtr) + peer;
+        auto *cq = reinterpret_cast<__gm__ pto::comm::urma::UrmaCqCtx *>(info->scqPtr) + peer;
+        if (wq->depth <= 2 || cq->depth <= 2) {
+            pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            pto2::detail::defer_flush(ctx);
+            return;
+        }
+        uint32_t requests = 128;
+        if (requests > wq->depth - 1) requests = wq->depth - 1;
+        if (requests > cq->depth - 1) requests = cq->depth - 1;
+        if (requests < 2) {
+            pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            pto2::detail::defer_flush(ctx);
+            return;
+        }
+        using Traffic =
+            pto::GlobalTensor<uint32_t, pto::Shape<1, 1, 1, 1, kWords>, pto::Stride<kWords, kWords, kWords, kWords, 1>>;
+        Traffic source(urma_backend::peer_mr_ptr<uint32_t>(workspace, peer, offset) + 64);
+        Traffic destination(local + 64 + kWords);
+        for (uint32_t i = 0; i < requests; ++i)
+            event = pto::comm::TGET_ASYNC<pto::comm::DmaEngine::URMA>(destination, source, session);
+        local[48] = requests;
+        local[49] = event.urmaTargetCqe;
+        pto::comm::urma::DcciCachelines(reinterpret_cast<__gm__ uint8_t *>(local + 48), 2 * sizeof(uint32_t));
+    }
     (void)urma_backend::register_urma_async_event(ctx, event, session, workspace);
     if (!publish) wait_counter(ctx, local + 32, epoch);
     pto2::detail::defer_flush(ctx);

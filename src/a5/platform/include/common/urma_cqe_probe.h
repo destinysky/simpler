@@ -34,3 +34,24 @@ static_assert(std::is_trivially_copyable_v<UrmaCqeProbeResult> && std::is_standa
 inline bool urma_cqe_probe_matches(const UrmaCqeProbeArgs &args, const UrmaCqeProbeResult &result) {
     return args.request_id != 0 && result.request_id == args.request_id && result.cqe_addr == args.cqe_addr;
 }
+
+inline constexpr uint32_t URMA_STOP_SAMPLED = 1U;
+inline constexpr uint32_t URMA_STOP_PENDING = 2U;
+inline constexpr uint32_t URMA_STOP_ERROR = 4U;
+inline constexpr uint32_t URMA_STOP_BUSY = 8U;
+
+struct UrmaStopEvidence {
+    uint64_t run_epoch{};
+    uint32_t peer{};
+    uint32_t wqn{};
+    uint32_t cqn{};
+    uint32_t target_cqe{};
+    uint32_t retired_cqe{};
+    uint32_t sequence{};
+    uint32_t dw0{};
+    uint32_t flags{};
+    uint32_t target_bb{};
+    uint32_t retired_bb{};
+};
+static_assert(sizeof(UrmaStopEvidence) == 48);
+static_assert(std::is_trivially_copyable_v<UrmaStopEvidence> && std::is_standard_layout_v<UrmaStopEvidence>);

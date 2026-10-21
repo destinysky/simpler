@@ -960,6 +960,20 @@ extern "C" int validate_runtime_impl(Runtime *runtime, const HostApi *api, int e
         int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
         int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
         LOG_RUNTIME_FAILURE(orch_error_code, sched_error_code, runtime_status);
+        const auto &stop = host_header.urma_stop_evidence;
+        if (stop.run_epoch != 0) {
+            LOG_WARN(
+                "[PTO_RECOVERY] URMA_STOP_CQE run_epoch=%llu peer=%u wqn=%u cqn=%u "
+                "target_cqe=%u retired_cqe=%u target_bb=%u retired_bb=%u sequence=%u dw0=0x%x "
+                "valid=%u pending=%u error=%u busy=%u",
+                static_cast<unsigned long long>(stop.run_epoch), stop.peer, stop.wqn, stop.cqn, stop.target_cqe,
+                stop.retired_cqe, stop.target_bb, stop.retired_bb, stop.sequence, stop.dw0,
+                static_cast<unsigned>((stop.flags & URMA_STOP_SAMPLED) != 0),
+                static_cast<unsigned>((stop.flags & URMA_STOP_PENDING) != 0),
+                static_cast<unsigned>((stop.flags & URMA_STOP_ERROR) != 0),
+                static_cast<unsigned>((stop.flags & URMA_STOP_BUSY) != 0)
+            );
+        }
         // A scheduler no-progress timeout (code 100) carries a device-classified
         // sub-reason + locators so the failure line is self-diagnosing without a
         // device-log dive. The full stall snapshot stays in the device log / plog.

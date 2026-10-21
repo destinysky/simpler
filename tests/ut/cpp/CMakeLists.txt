@@ -1235,6 +1235,7 @@ add_a5_test(test_a5_urma_completion a5/test_urma_completion.cpp)
 target_compile_definitions(test_a5_urma_completion PRIVATE __CPU_SIM=1)
 target_sources(test_a5_urma_completion PRIVATE
     ${CMAKE_SOURCE_DIR}/../../../src/common/platform/sim/aicpu/cache_ops.cpp
+    ../../st/runtime_fatal_codes/kernels/orchestration/replay_sdma_orch.cpp
 )
 add_a5_test(test_a5_fatal a5/test_a5_fatal.cpp)
 target_sources(test_a5_fatal PRIVATE

@@ -42,9 +42,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         rt_submit_aiv_task(1, task);
         (void)get_tensor_data<uint32_t>(args.tensor(2).ref(), 1, first);
     };
-    protocol(0, 0);
+    protocol(0, (mode == 3 || mode == 4) && attempt == 1 ? 4 : 0);
     // Rank0 produces the ready notification. Rank1 cannot finish A without it.
-    if (args.scalar<uint64_t>(5) == 0) protocol(1, mode == 2 || (mode == 1 && attempt == 1));
+    if (args.scalar<uint64_t>(5) == 0) protocol(1, mode == 2 || ((mode == 1 || mode == 3) && attempt == 1));
 
     CoreTaskArgs completion;
     completion.add_input(args.tensor(1).ref());
@@ -53,6 +53,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     completion.add_scalar(args.scalar<uint64_t>(2));
     completion.add_scalar(args.scalar<uint64_t>(3));
     completion.add_scalar(args.scalar<uint64_t>(0));
+    // Protocol completion was awaited above. Keep the order kernel's six-slot
+    // prefix and pass its diagnostic buffer address after the existing scalars.
+    const auto &handshake = args.tensor(6).ref();
+    completion.add_scalar(handshake.buffer.addr + handshake.start_offset * sizeof(uint32_t));
+    completion.add_scalar(mode == 3 || mode == 4);
     rt_submit_aiv_task(2, completion);
 }
 }

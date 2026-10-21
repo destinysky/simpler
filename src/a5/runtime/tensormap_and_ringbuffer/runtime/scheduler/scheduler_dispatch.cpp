@@ -981,6 +981,30 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     "[PTO_RECOVERY] COORDINATED_STOP_OBSERVED run_epoch=%llu",
                     static_cast<unsigned long long>(header->execution_stop.run_epoch)
                 );
+                auto &evidence = header->urma_stop_evidence;
+                evidence = {};
+                auto &waits = sched_->async_wait_list;
+                if (waits.try_lock()) {
+                    for (int32_t i = 0; i < waits.count; ++i) {
+                        const auto &entry = waits.entries[i];
+                        for (int32_t j = 0; j < entry.condition_count; ++j) {
+                            const auto &condition = entry.conditions[j];
+                            if (condition.engine != ASYNC_ENGINE_URMA ||
+                                condition.completion_type != COMPLETION_TYPE_URMA_EVENT_HANDLE || condition.retired)
+                                continue;
+                            const auto sample = urma_backend::sample_urma_stop_cqe(
+                                condition.addr, condition.backend_cookie, condition.expected_value
+                            );
+                            if ((evidence.flags & URMA_STOP_PENDING) == 0 && (sample.flags & URMA_STOP_SAMPLED) != 0)
+                                evidence = sample;
+                        }
+                    }
+                    waits.unlock();
+                } else {
+                    evidence.flags = URMA_STOP_BUSY;
+                }
+                evidence.run_epoch = header->execution_stop.run_epoch;
+                cache_flush_range(&evidence, sizeof(evidence));
                 abort_and_shutdown(runtime);
                 break;
             }

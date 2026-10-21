@@ -15,6 +15,7 @@
 #include <cstdint>
 
 #include "aicpu/platform_regs.h"
+#include "common/urma_cqe_probe.h"
 #include "aicore_completion_mailbox.h"
 #include "completion_token.h"
 #include "runtime_status.h"
@@ -194,6 +195,46 @@ poll_urma_event_handle(uint64_t event_handle, uint64_t workspace_addr, uint32_t 
     // SQ counts basic blocks; notify/FAA can use multiple blocks per CQE.
     update_tail_info(cq_ctx, wq_ctx, target_bb, target_cqe);
     return {CompletionPollState::READY, SIMPLER_ERROR_NONE};
+}
+
+// This samples the target CQE without retiring requests or ringing a doorbell.
+inline UrmaStopEvidence sample_urma_stop_cqe(uint64_t handle, uint64_t workspace, uint32_t target_cqe) {
+    UrmaStopEvidence sample{};
+    if (handle == 0 || workspace == 0) return sample;
+    decode_urma_event_handle(handle, sample.peer, sample.target_bb);
+    auto *info = reinterpret_cast<const volatile UrmaInfo *>(workspace);
+    invalidate_object(info, sizeof(*info));
+    if (info->qp_num != 1 || sample.peer >= info->rank_count || info->sq_ptr == 0 || info->scq_ptr == 0) return sample;
+    auto *wq = reinterpret_cast<const volatile UrmaWqCtx *>(info->sq_ptr + sample.peer * sizeof(UrmaWqCtx));
+    auto *cq = reinterpret_cast<const volatile UrmaCqCtx *>(info->scq_ptr + sample.peer * sizeof(UrmaCqCtx));
+    invalidate_object(wq, sizeof(*wq));
+    invalidate_object(cq, sizeof(*cq));
+    if (wq->head_addr == 0 || wq->tail_addr == 0 || cq->tail_addr == 0 || cq->buf_addr == 0 ||
+        !is_power_of_two(wq->depth) || !is_power_of_two(cq->depth) || wq->depth >= (1U << 31) ||
+        cq->depth >= (1U << 31) || cq->cqe_shift_size < 6 || cq->cqe_shift_size > kMaxCqeShift)
+        return sample;
+    invalidate_object(reinterpret_cast<const void *>(wq->head_addr), sizeof(uint32_t));
+    invalidate_object(reinterpret_cast<const void *>(wq->tail_addr), sizeof(uint32_t));
+    invalidate_object(reinterpret_cast<const void *>(cq->tail_addr), sizeof(uint32_t));
+    sample.target_cqe = target_cqe;
+    sample.retired_cqe = load_device_u32(cq->tail_addr);
+    sample.retired_bb = load_device_u32(wq->tail_addr);
+    if (has_reached(sample.retired_cqe, target_cqe) || has_reached(sample.retired_bb, sample.target_bb) ||
+        !has_reached(wq->submitted_wqe_count, target_cqe) ||
+        !has_reached(load_device_u32(wq->head_addr), sample.target_bb) || target_cqe - sample.retired_cqe > cq->depth ||
+        sample.target_bb - sample.retired_bb > wq->depth)
+        return sample;
+    sample.sequence = target_cqe - 1;
+    const uint64_t offset = static_cast<uint64_t>(sample.sequence & (cq->depth - 1)) << cq->cqe_shift_size;
+    if (cq->buf_addr > UINT64_MAX - offset) return sample;
+    sample.dw0 = load_cqe_dw0(cq->buf_addr + offset);
+    sample.wqn = wq->wqn;
+    sample.cqn = cq->cqn;
+    sample.flags = URMA_STOP_SAMPLED;
+    const bool old_owner = ((sample.sequence / cq->depth) & 1U) != 0;
+    if (((sample.dw0 >> 2) & 1U) == static_cast<uint32_t>(old_owner)) sample.flags |= URMA_STOP_PENDING;
+    else if ((sample.dw0 & 0xFFFF0000U) != 0) sample.flags |= URMA_STOP_ERROR;
+    return sample;
 }
 
 inline void retire_urma_event_handle(uint64_t /*event_handle*/, uint64_t /*workspace_addr*/) {}

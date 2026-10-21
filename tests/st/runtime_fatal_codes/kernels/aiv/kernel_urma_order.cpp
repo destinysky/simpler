@@ -48,6 +48,22 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     marker[5] = static_cast<uint32_t>(comm->workSpace);
     marker[6] = static_cast<uint32_t>(comm->workSpace >> 32);
     marker[7] = static_cast<uint32_t>(info->sqPtr);
+    if (args[7] != 0) {
+        constexpr uint32_t kWords = 256U * 1024U * 1024U / sizeof(uint32_t);
+        auto *data = reinterpret_cast<__gm__ uint32_t *>(args[6]);
+        if (comm->rankId == 1) {
+            pto::comm::urma::DcciCachelines(reinterpret_cast<__gm__ uint8_t *>(data + 64 + kWords), sizeof(uint32_t));
+            pto::comm::urma::DcciCachelines(
+                reinterpret_cast<__gm__ uint8_t *>(data + 64 + 2 * kWords - 1), sizeof(uint32_t)
+            );
+            marker[8] = data[64 + kWords];
+            marker[9] = data[64 + 2 * kWords - 1];
+            pto::comm::urma::DcciCachelines(reinterpret_cast<__gm__ uint8_t *>(data + 48), 2 * sizeof(uint32_t));
+            marker[10] = data[48];
+            marker[11] = data[49];
+        }
+        pto::comm::urma::DcciCachelines(reinterpret_cast<__gm__ uint8_t *>(marker + 8), 8 * sizeof(uint32_t));
+    }
     *order = static_cast<uint32_t>(args[4]);
     pto::comm::urma::DcciCachelines(reinterpret_cast<__gm__ uint8_t *>(marker), 8 * sizeof(uint32_t));
     pto::comm::urma::DcciCachelines(reinterpret_cast<__gm__ uint8_t *>(order), sizeof(uint32_t));
