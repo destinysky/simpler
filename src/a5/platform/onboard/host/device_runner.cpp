@@ -243,7 +243,7 @@ int DeviceRunner::read_urma_cqe(uint64_t address, uint32_t &dw0, uint32_t timeou
         UrmaCqeProbeResult result{};
         rc = aclrtMemcpy(&result, sizeof(result), urma_query_result_, sizeof(result), ACL_MEMCPY_DEVICE_TO_HOST);
         if (rc == 0 && !urma_cqe_probe_matches(args, result)) rc = PTO_RUNTIME_ERR_INVALID_STATE;
-        LOG_INFO(
+        LOG_DEBUG(
             "[PTO_RECOVERY] URMA_CQE_DEVICE_READ request=%llu address=0x%llx dw0=0x%x rc=%d",
             static_cast<unsigned long long>(args.request_id), static_cast<unsigned long long>(address), result.dw0, rc
         );

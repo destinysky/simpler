@@ -1,5 +1,11 @@
 # Copyright (c) PyPTO Contributors.
-# Licensed under CANN Open Software License Agreement Version 2.0.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """Local chip recovery controls. Policy and logical dispatch belong to L3."""
 
 from _task_interface import (
@@ -117,14 +123,20 @@ class EndpointRecoverySession:
                     else DomainRecoveryStatus.PRESERVED
                 )
                 if self.domain.status != expected:
-                    raise RuntimeError(f"domain PREPARE failed: {self.domain.status}, rc={self.domain.recovery_rc}")
+                    raise RuntimeError(
+                        f"domain PREPARE failed: {self.domain.status}, rc={self.domain.recovery_rc}, "
+                        f"detail={self.domain.transport_detail}"
+                    )
         elif phase == Phase.COMMIT:
             self._require_phase(Phase.PREPARE)
             self.domain = self.native.recover_comm_domain(
                 self.comm_handle(), packet.before.allocation_id, self._request(packet, DomainRecoveryPhase.COMMIT)
             )
             if self.domain.status != DomainRecoveryStatus.REARMED:
-                raise RuntimeError(f"domain COMMIT failed: {self.domain.status}, rc={self.domain.recovery_rc}")
+                raise RuntimeError(
+                    f"domain COMMIT failed: {self.domain.status}, rc={self.domain.recovery_rc}, "
+                    f"detail={self.domain.transport_detail}"
+                )
         elif phase == Phase.REARM:
             self._require_phase(
                 Phase.COMMIT if packet.impact == DomainRecoveryImpact.DOMAIN_TRANSPORT else Phase.PREPARE

@@ -25,16 +25,18 @@ are diagnostics; they do not select a recovery mode or authorize replay.
 `EXECUTION_ONLY` with `PREPARE` returns `PRESERVED`: domain generation, Context C,
 HCCL, comm stream, workspace, windows and device CommContext remain unchanged.
 `DOMAIN_TRANSPORT` requests the backend's supported recovery mechanism, currently
-SDMA in-place rearm. There is no caller choice of stream replacement or domain
-rebuild. The owner fences all producers on every member before setting
+SDMA in-place rearm or URMA drain-and-reuse. There is no caller choice of
+stream replacement or domain rebuild. The owner fences all producers on every member before setting
 `collective_quiescence = 1`; cooperative PTO retirement alone does not certify
 outstanding async DMA stop. SDMA accepts one full-communicator domain with no
 base/derived context users or pending allocation cleanup.
 
 The transaction is local and explicit:
 
-1. `PREPARE` stops every manager-owned SDMA stream through `aclrtStreamAbort`,
-   validates the complete stop report, and requeries the existing workspace.
+1. `PREPARE` obtains the backend's complete transport proof. SDMA stops every
+   manager-owned stream through `aclrtStreamAbort`, validates the complete stop
+   report, and requeries the existing workspace. URMA checks real CQEs after
+   PTO retirement and preserves completed queues without aborting or replacing them.
    `PREPARED` retains generation and resource addresses. Execution admission
    stays fenced, and `recover_execution` returns `BUSY` while a domain is prepared.
    Window allocation/release, context derivation and business comm barriers are
@@ -59,12 +61,59 @@ all-member acknowledgment; replay eligibility and logical task dispatch remain s
 
 `DomainRecoveryResult` (ABI 2, 136 bytes) includes `transport_channel_count`,
 `stopped_channel_count`, and `transport_stopped`. These describe local provider
-stop proof, unlike queue snapshots. Exact duplicate PREPARE is `PREPARED` before
+proof that no old request remains active under the producer fence, unlike queue
+snapshots. For URMA this means confirmed completion, not a queue-abort operation.
+`transport_detail` classifies evidence as `NONE`, `IN_FLIGHT`, `CQE_ERROR`,
+`INVALID_STATE`, `READ_FAILED`, or `DEADLINE_EXCEEDED`. It occupies the output
+extension word at offset 132; ABI version and size remain 2 and 136 bytes.
+Backends without detailed observations return `NONE`. The detail is diagnostic;
+it does not authorize recovery, choose its scope, or establish replay safety.
+Raw host recovery errors and CQE DW0 remain available separately.
+Exact duplicate PREPARE is `PREPARED` before
 commit and `ALREADY_RECOVERED` afterward; duplicate COMMIT never advances generation
 twice. Changed/reused ids, stale generations and COMMIT without PREPARE are rejected.
 Domain recovery never clears execution admission poison. Failures return no
 dispatchable binding and permanently fence soft recovery. Unproved DMA/query
 resources belong to terminal device cleanup; the primitive never resets a device.
+
+## URMA transport proof and reuse
+
+URMA recovery requires one exclusive full-communicator domain, dense rank IDs,
+one QP per peer, no base/derived CommContext users, and an available device CQE
+reader. The owner first stops and retires every participating PTO generation;
+the backend does not stop an active AIV producer by resetting its queues.
+
+`PREPARE` snapshots submitted and retired SQ basic-block and CQE sequences.
+Each unretired CQE must have a fresh owner and zero error status; an already
+software-retired target still requires its last hardware CQE checked. Basic-block
+and CQE counts are independent. Descriptor identity and producer/consumer
+sequences must remain stable across inspection. Queue pointers, doorbells and
+workspace descriptions are not reset or replaced by this proof.
+
+The real CQE read runs on AICPU through a lazily allocated control stream in E.
+Host code copies only an ordinary HBM result with matching request identity;
+it never treats HCOMM's CQ mapping as a host-copyable device allocation. The
+business AICPU/AICore streams and C/E contexts remain unchanged. Successful
+`COMMIT` preserves HCCL, MR/window, queues and workspace, advances the domain
+generation once, and requires the existing argument-generation rebind.
+
+The backend uses one three-second proof budget across its peers, passing the
+remaining budget to each device read. This bounds its polling/query phase,
+not every underlying driver metadata copy. Pending requests may complete
+naturally after PTO exits. Error CQEs, expired proof budget, failed reads,
+unstable descriptors or unproved stop reject recovery and keep admission fenced.
+The original fault, recovery return code and transport detail reach the owner;
+only the existing terminal lifecycle may reset a device. There is no second
+soft-recovery mode that resets a device and resumes replay.
+
+Two-rank A5 validation covers protocol stall, coordinator STOP while real READs
+remain hardware-pending, later successful CQE drain, resource preservation,
+replay of A, and continuation of original B/C. Healthy and transient system
+regressions both post the same bounded large-READ batch and validate payload
+sentinels. An unexpected recovery failure fails the transient regression; it
+is not a containment PASS. The runtime has no test-only STOP-CQE sampling block.
+Physical link interruption, permanent remote failure, real error-CQE recovery,
+and transport-resource replacement are outside this validated scope.
 
 ## Retained local recovery graphs
 
@@ -103,7 +152,7 @@ new failure. `COORDINATED_STOP` (12) describes the peer's intentional stop and i
 separate from the original rank's fault.
 
 STOP delivery is not termination proof. The owner first collects all terminal
-outcomes, then validates native retirement/quiescence and SDMA provider stop
+outcomes, then validates native retirement/quiescence and provider transport
 proofs through the existing INSPECT/PREPARE transaction. An accepted STOP without
 terminal evidence, a failed proof, an identity mismatch or unsupported backend
 ends soft recovery. The retained run receives the original and recovery faults;
@@ -120,9 +169,9 @@ Only all-member logical A success releases original dependent B/C, once. Retry
 budget/backoff are L3 configuration; L2 has no retry credit. Close cancels the
 owner before draining the graph. A local group requiring cross-host agreement,
 missing semantic metadata, input restoration or an open graph is refused.
-The stop interface and proof contract are backend-neutral; only the A5 TMR/SDMA
-provider is implemented and requires hardware validation of live H2D stop delivery.
-URMA/CCU and L4+ control-plane transport are not added by this mechanism.
+The stop interface and proof contract are backend-neutral. A5 TMR supports
+SDMA abort/rearm and URMA drain/reuse. CCU and L4+ control-plane transport remain
+unsupported by this recovery mechanism.
 
 The A5 L3 facade currently selects one task frame even with recovery disabled;
 this recovery feature does not reduce an existing two-frame A5 L3 path. Native
@@ -295,8 +344,8 @@ The transaction keeps ordinary dispatch frozen:
    before calling a provider. A rejected INSPECT does not consume the identity.
    Host TASK_DONE alone grants no DMA stop proof.
 2. PREPARE all domains; only matching all-member acknowledgments permit COMMIT.
-   The current SDMA provider aborts its private transport streams and rearms in
-   place. Context C/E, execution streams, HCCL and windows are preserved.
+   SDMA aborts and rearms its private transport streams; URMA proves CQE drain
+   and reuses its queues. Context C/E, execution streams, HCCL and windows are preserved.
 3. Rearm failed execution substrates, verify persistent identities, and atomically
    rebind the original failed task plus every unlaunched bound consumer. A
    committed domain generation therefore reaches retained B/C before dispatch.
@@ -315,8 +364,8 @@ The old ticket cannot dispatch twice or resolve a later attempt.
 
 The default impact covers communication transport; `EXECUTION_ONLY` is available
 when the owner has evidence for that narrower scope. Host error numbers do not
-select it. URMA/CCU use the same binding/result contract but still need their
-transport providers. Cross-host stop/commit, data restoration, compiler-side
+select it. URMA implements the same binding/result contract through CQE drain;
+CCU still needs a transport provider. Cross-host stop/commit, data restoration, compiler-side
 automatic annotation and resource migration are outside this local API.
 
 ## Retained argument rebinding
@@ -359,7 +408,7 @@ The retained-TaskSlot API refuses a changed canonical backing identity: publishi
 its graph aliases and rebinding downstream consumers is not implemented yet.
 Standalone copy/materialization can describe relocated resources, but must not
 be mistaken for a complete retained-graph migration transaction.
-The current SDMA provider preserves addresses and needs no replacement descriptor.
+The SDMA and URMA providers preserve addresses and need no replacement descriptor.
 
 `rebind_materialized(chip_args, domain_bindings, worker_id)` is the same mechanism
 for already-materialized local L2 arguments. It returns `MaterializedRecoveryBinding`

@@ -952,7 +952,10 @@ static void log_urma_binding(CommHandle h, uint64_t allocation_id, const DomainA
 
 static int
 drain_urma_domain(CommHandle h, DomainAllocation &alloc, DomainRecoveryResult &proof, const UrmaCqeReader &read_cqe) {
-    if (!read_cqe) return -1;
+    if (!read_cqe) {
+        proof.transport_detail = DomainRecoveryDetail::READ_FAILED;
+        return -1;
+    }
     using namespace pto::comm::urma;
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     auto copy = [](void *dst, uint64_t address, size_t bytes) {
@@ -965,6 +968,7 @@ drain_urma_domain(CommHandle h, DomainAllocation &alloc, DomainRecoveryResult &p
     const int info_rc = copy(&info, alloc.workspace_addr, sizeof(info));
     if (info_rc != 0 || info.qpNum != 1 || info.rankCount != static_cast<uint32_t>(alloc.nranks) || info.sqPtr == 0 ||
         info.scqPtr == 0) {
+        proof.transport_detail = info_rc != 0 ? DomainRecoveryDetail::READ_FAILED : DomainRecoveryDetail::INVALID_STATE;
         LOG_WARN("[PTO_RECOVERY] URMA_DRAIN_REJECTED rank=%d stage=workspace rc=%d", h->rank, info_rc);
         return info_rc != 0 ? info_rc : -1;
     }
@@ -1037,14 +1041,16 @@ drain_urma_domain(CommHandle h, DomainAllocation &alloc, DomainRecoveryResult &p
         const bool timed_out = std::chrono::steady_clock::now() >= deadline;
         if (timed_out && observation.state == urma_drain::State::DRAINED)
             observation.state = urma_drain::State::PENDING;
+        proof.transport_detail = urma_drain::proof_detail(observation, timed_out);
         const bool drained = observation.state == urma_drain::State::DRAINED;
         LOG_INFO(
             "[PTO_RECOVERY] URMA_DRAIN_RESULT rank=%d peer=%u state=%u checked=%u "
             "target_bb=%u retired_bb=%u target_cqe=%u retired_cqe=%u sequence=%u dw0=0x%x "
-            "read_rc=%d timed_out=%u wqn=%u cqn=%u",
+            "read_rc=%d timed_out=%u wqn=%u cqn=%u detail=%u",
             h->rank, peer, static_cast<unsigned>(observation.state), observation.checked, target.submitted_bb,
             target.retired_bb, target.submitted_cqe, target.retired_cqe, observation.sequence, observation.dw0,
-            observation.read_rc, static_cast<unsigned>(timed_out), wq.wqn, cq.cqn
+            observation.read_rc, static_cast<unsigned>(timed_out), wq.wqn, cq.cqn,
+            static_cast<unsigned>(proof.transport_detail)
         );
         if (!drained) return observation.read_rc != 0 ? observation.read_rc : -1;
         ++proof.stopped_channel_count;
@@ -1743,11 +1749,12 @@ int comm_recover_domain_with_reader(
                                                                                       "DOMAIN_RECOVERY_REJECTED";
     LOG_INFO(
         "[PTO_RECOVERY] %s rank=%d allocation_id=%llu recovery_id=%llu status=%u "
-        "generation=%llu engine=%u preserved=%u rebind_required=%u original_rc=%d recovery_rc=%d",
+        "generation=%llu engine=%u preserved=%u rebind_required=%u original_rc=%d recovery_rc=%d detail=%u",
         outcome, h->rank, static_cast<unsigned long long>(allocation_id),
         static_cast<unsigned long long>(request->recovery_id), static_cast<unsigned>(result->status),
         static_cast<unsigned long long>(result->generation), static_cast<unsigned>(result->engine),
-        result->domain_preserved, result->rebind_required, result->original_rc, result->recovery_rc
+        result->domain_preserved, result->rebind_required, result->original_rc, result->recovery_rc,
+        static_cast<unsigned>(result->transport_detail)
     );
     return 0;
 } catch (const std::exception &e) {

@@ -38,6 +38,7 @@ TEST_F(UrmaDrain, CoversActualCqesWithoutEquatingBbAndCqeCounts) {
     const auto result = inspect();
     EXPECT_EQ(result.state, urma_drain::State::DRAINED);
     EXPECT_EQ(result.checked, 2U);
+    EXPECT_EQ(urma_drain::proof_detail(result, false), DomainRecoveryDetail::NONE);
     EXPECT_EQ(queue.retired_bb, 0U);
     EXPECT_EQ(queue.retired_cqe, 0U);
 }
@@ -58,7 +59,9 @@ TEST_F(UrmaDrain, ErrorCqeCannotBecomeASuccessfulDrain) {
 }
 TEST_F(UrmaDrain, PendingPrefixDoesNotRetireAnything) {
     cqes[1] = 0;
-    EXPECT_EQ(inspect().state, urma_drain::State::PENDING);
+    const auto pending = inspect();
+    EXPECT_EQ(pending.state, urma_drain::State::PENDING);
+    EXPECT_EQ(urma_drain::proof_detail(pending, false), DomainRecoveryDetail::IN_FLIGHT);
     EXPECT_EQ(queue.retired_bb, 0U);
     EXPECT_EQ(queue.retired_cqe, 0U);
 }
@@ -115,6 +118,58 @@ TEST_F(UrmaDrain, UnprovedDrainCannotReachRearmOrCommit) {
     EXPECT_EQ(rearms, 0);
     EXPECT_EQ(manager.generation(), 1U);
 }
+TEST_F(UrmaDrain, FailedProofPreservesDiagnosticsAndCannotCommit) {
+    struct Case {
+        urma_drain::State state;
+        bool expired;
+        DomainRecoveryDetail detail;
+        int rc;
+    };
+    const Case cases[] = {
+        {urma_drain::State::PENDING, true, DomainRecoveryDetail::DEADLINE_EXCEEDED, -1},
+        {urma_drain::State::CQE_ERROR, false, DomainRecoveryDetail::CQE_ERROR, -1},
+        {urma_drain::State::READ_FAILED, false, DomainRecoveryDetail::READ_FAILED, -77},
+        {urma_drain::State::INVALID, false, DomainRecoveryDetail::INVALID_STATE, -1},
+        {urma_drain::State::DRAINED, true, DomainRecoveryDetail::DEADLINE_EXCEEDED, -1},
+    };
+    for (const auto &test : cases) {
+        SCOPED_TRACE(static_cast<unsigned>(test.detail));
+        DomainRecoveryManager manager;
+        DomainRecoveryRequest request;
+        request.recovery_id = request.expected_generation = 1;
+        request.collective_quiescence = 1;
+        request.original_rc = 507018;
+        request.impact = DomainRecoveryImpact::DOMAIN_TRANSPORT;
+        DomainRecoveryResult binding;
+        binding.engine = DomainRecoveryEngine::URMA;
+        DomainRecoveryManager::Operations operations;
+        operations.rearm_supported = true;
+        operations.quiesce = [&](DomainRecoveryResult &proof) {
+            urma_drain::Observation observation;
+            observation.state = test.state;
+            observation.read_rc = test.state == urma_drain::State::READ_FAILED ? test.rc : 0;
+            proof.transport_detail = urma_drain::proof_detail(observation, test.expired);
+            return test.rc;
+        };
+        int rearms = 0;
+        operations.rearm = [&] {
+            ++rearms;
+            return 0;
+        };
+        const auto failed = manager.recover(request, binding, operations);
+        EXPECT_EQ(failed.status, DomainRecoveryStatus::RECOVERY_FAILED);
+        EXPECT_EQ(failed.transport_detail, test.detail);
+        EXPECT_EQ(failed.original_rc, 507018);
+        EXPECT_EQ(failed.recovery_rc, test.rc);
+        request.phase = DomainRecoveryPhase::COMMIT;
+        const auto repeated = manager.recover(request, binding, operations);
+        EXPECT_EQ(repeated.status, DomainRecoveryStatus::RECOVERY_FAILED);
+        EXPECT_EQ(repeated.transport_detail, test.detail);
+        EXPECT_EQ(rearms, 0);
+        EXPECT_EQ(manager.generation(), 1U);
+    }
+}
+
 TEST(UrmaCqeProbe, DeviceEntryPublishesRawCqeWithRequestIdentity) {
     alignas(64) uint32_t cqe = (7U << 24) | 4U;
     UrmaCqeProbeResult result{};

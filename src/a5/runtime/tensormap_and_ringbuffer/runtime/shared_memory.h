@@ -39,7 +39,6 @@
 #pragma once
 
 #include "task_interface/execution_control.h"
-#include "common/urma_cqe_probe.h"
 #include <stddef.h>
 
 #include "utils/device_arena.h"
@@ -166,12 +165,9 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
     // 0: pending, -1: a shutdown prerequisite failed, 1: all participants
     // acknowledged and RuntimeContext/AicpuExecutor retirement completed.
     std::atomic<int32_t> execution_quiesced;
-    // Device-written STOP evidence is separate from the host DMA control line.
-    UrmaStopEvidence urma_stop_evidence;
     ExecutionStopControl execution_stop;
 };
 
-static_assert(offsetof(SharedMemoryHeader, urma_stop_evidence) == 848);
 static_assert(offsetof(SharedMemoryHeader, execution_stop) == 896);
 static_assert(sizeof(SharedMemoryHeader) == 960, "SharedMemoryHeader layout drift");
 static_assert(offsetof(SharedMemoryHeader, total_size) == 776, "SharedMemoryHeader total_size layout drift");

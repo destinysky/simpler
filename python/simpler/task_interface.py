@@ -69,6 +69,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     DeviceMemoryInfo,
     DistributedOpMember,
     DistributedOpRecord,
+    DomainRecoveryDetail,
     DomainRecoveryEngine,
     DomainRecoveryImpact,
     DomainRecoveryPhase,
@@ -204,6 +205,7 @@ from .global_comm_domain import GlobalDomainAttachment, GlobalDomainBuffer, Glob
 __all__ = [
     "DataType",
     "DeviceMemoryInfo",
+    "DomainRecoveryDetail",
     "DomainRecoveryEngine",
     "DomainRecoveryImpact",
     "DomainRecoveryRequest",

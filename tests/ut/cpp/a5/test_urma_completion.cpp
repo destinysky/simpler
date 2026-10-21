@@ -129,38 +129,6 @@ TEST_F(UrmaCompletion, SequenceWrapDoesNotTurnAnOutstandingEventIntoANoop) {
     EXPECT_EQ(cq_tail, 0U);
 }
 
-TEST_F(UrmaCompletion, StopSampleDistinguishesHardwarePendingWithoutRetiring) {
-    entries[16] = 0;
-    auto result = urma_backend::sample_urma_stop_cqe((uint64_t{1} << 32) | 3, reinterpret_cast<uint64_t>(&info), 2);
-    EXPECT_EQ(result.flags, URMA_STOP_SAMPLED | URMA_STOP_PENDING);
-    EXPECT_EQ(result.sequence, 1U);
-    EXPECT_EQ(sq_tail, 0U);
-    EXPECT_EQ(cq_tail, 0U);
-    EXPECT_EQ(cq_db, 0U);
-    entries[16] = 4;
-    result = urma_backend::sample_urma_stop_cqe((uint64_t{1} << 32) | 3, reinterpret_cast<uint64_t>(&info), 2);
-    EXPECT_EQ(result.flags, URMA_STOP_SAMPLED);
-    EXPECT_EQ(cq_tail, 0U);
-    entries[16] |= 7U << 24;
-    result = urma_backend::sample_urma_stop_cqe((uint64_t{1} << 32) | 3, reinterpret_cast<uint64_t>(&info), 2);
-    EXPECT_EQ(result.flags, URMA_STOP_SAMPLED | URMA_STOP_ERROR);
-}
-TEST_F(UrmaCompletion, StopSampleRejectsUnpostedTargetsAndInvalidGeometry) {
-    sq_tail = 3;
-    cq_tail = 2;
-    EXPECT_EQ(
-        urma_backend::sample_urma_stop_cqe((uint64_t{1} << 32) | 3, reinterpret_cast<uint64_t>(&info), 2).flags, 0U
-    );
-    sq_tail = cq_tail = 0;
-    EXPECT_EQ(
-        urma_backend::sample_urma_stop_cqe((uint64_t{1} << 32) | 4, reinterpret_cast<uint64_t>(&info), 3).flags, 0U
-    );
-    cq[1].depth = 3;
-    EXPECT_EQ(
-        urma_backend::sample_urma_stop_cqe((uint64_t{1} << 32) | 3, reinterpret_cast<uint64_t>(&info), 2).flags, 0U
-    );
-}
-
 struct Event {
     uint64_t handle{(uint64_t{1} << 32) | 3};
     pto::comm::DmaEngine engine{pto::comm::DmaEngine::URMA};

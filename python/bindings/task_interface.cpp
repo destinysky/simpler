@@ -3475,6 +3475,13 @@ NB_MODULE(_task_interface, m) {
         .value("SDMA", DomainRecoveryEngine::SDMA)
         .value("URMA", DomainRecoveryEngine::URMA)
         .value("CCU", DomainRecoveryEngine::CCU);
+    nb::enum_<DomainRecoveryDetail>(m, "DomainRecoveryDetail")
+        .value("NONE", DomainRecoveryDetail::NONE)
+        .value("IN_FLIGHT", DomainRecoveryDetail::IN_FLIGHT)
+        .value("CQE_ERROR", DomainRecoveryDetail::CQE_ERROR)
+        .value("INVALID_STATE", DomainRecoveryDetail::INVALID_STATE)
+        .value("READ_FAILED", DomainRecoveryDetail::READ_FAILED)
+        .value("DEADLINE_EXCEEDED", DomainRecoveryDetail::DEADLINE_EXCEEDED);
     nb::enum_<DomainRecoveryStatus>(m, "DomainRecoveryStatus")
         .value("PRESERVED", DomainRecoveryStatus::PRESERVED)
         .value("ALREADY_RECOVERED", DomainRecoveryStatus::ALREADY_RECOVERED)
@@ -3521,7 +3528,8 @@ NB_MODULE(_task_interface, m) {
         .def_ro("rebind_required", &DomainRecoveryResult::rebind_required)
         .def_ro("transport_channel_count", &DomainRecoveryResult::transport_channel_count)
         .def_ro("stopped_channel_count", &DomainRecoveryResult::stopped_channel_count)
-        .def_ro("transport_stopped", &DomainRecoveryResult::transport_stopped);
+        .def_ro("transport_stopped", &DomainRecoveryResult::transport_stopped)
+        .def_ro("transport_detail", &DomainRecoveryResult::transport_detail);
 
     nb::enum_<ExecutionRecoveryStatus>(m, "ExecutionRecoveryStatus")
         .value("RECOVERED", ExecutionRecoveryStatus::RECOVERED)

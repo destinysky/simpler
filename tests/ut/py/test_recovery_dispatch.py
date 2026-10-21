@@ -1,5 +1,11 @@
 # Copyright (c) PyPTO Contributors.
-# Licensed under CANN Open Software License Agreement Version 2.0.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """Child resource transaction gates without an NPU."""
 
 import struct
@@ -8,6 +14,7 @@ from types import SimpleNamespace as Record
 
 import pytest
 from _task_interface import (
+    DomainRecoveryDetail,
     DomainRecoveryImpact,
     DomainRecoveryPhase,
     DomainRecoveryStatus,
@@ -47,6 +54,8 @@ class Native:
         }
         self.calls = []
         self.prepare_status = DomainRecoveryStatus.PREPARED
+        self.prepare_detail = DomainRecoveryDetail.NONE
+        self.prepare_rc = 0
         self.rearm_status = ExecutionRecoveryStatus.RECOVERED
         self.replace_execution = False
         self.replace_communication = False
@@ -68,7 +77,8 @@ class Native:
             else DomainRecoveryStatus.REARMED,
             generation=1 if request.phase == DomainRecoveryPhase.PREPARE else 2,
             stopped_channel_count=48,
-            recovery_rc=0,
+            recovery_rc=self.prepare_rc,
+            transport_detail=self.prepare_detail,
         )
 
     def recover_execution(self, epoch):
@@ -130,13 +140,21 @@ def test_failed_generation_requires_structural_stop_proof(field, value):
     assert native.calls == []
 
 
-def test_domain_prepare_failure_cannot_reach_execution_rearm():
+@pytest.mark.parametrize(
+    "status,detail,rc",
+    [
+        (DomainRecoveryStatus.GIVE_UP, DomainRecoveryDetail.NONE, 0),
+        (DomainRecoveryStatus.RECOVERY_FAILED, DomainRecoveryDetail.READ_FAILED, -77),
+    ],
+)
+def test_domain_prepare_failure_cannot_reach_execution_rearm(status, detail, rc):
     native = Native()
-    native.prepare_status = DomainRecoveryStatus.GIVE_UP
+    native.prepare_status, native.prepare_detail, native.prepare_rc = status, detail, rc
     session = EndpointRecoverySession(native, lambda: 9)
     session.handle(packet(Phase.INSPECT), True, 1)
-    with pytest.raises(RuntimeError, match="PREPARE failed"):
+    with pytest.raises(RuntimeError, match="PREPARE failed") as raised:
         session.handle(packet(Phase.PREPARE), True, 1)
+    assert f"rc={rc}" in str(raised.value) and str(detail) in str(raised.value)
     assert native.calls == [DomainRecoveryPhase.PREPARE]
 
 

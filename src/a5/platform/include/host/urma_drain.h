@@ -13,6 +13,8 @@
 
 #include <cstdint>
 
+#include "platform_comm/domain_recovery.h"
+
 namespace urma_drain {
 
 enum class State : uint32_t { DRAINED = 0, PENDING = 1, CQE_ERROR = 2, INVALID = 3, READ_FAILED = 4 };
@@ -33,6 +35,15 @@ struct Observation {
     uint32_t dw0{};
     int read_rc{};
 };
+
+inline DomainRecoveryDetail proof_detail(const Observation &observation, bool deadline_exceeded) {
+    if (observation.state == State::CQE_ERROR) return DomainRecoveryDetail::CQE_ERROR;
+    if (observation.state == State::INVALID) return DomainRecoveryDetail::INVALID_STATE;
+    if (deadline_exceeded) return DomainRecoveryDetail::DEADLINE_EXCEEDED;
+    if (observation.state == State::READ_FAILED) return DomainRecoveryDetail::READ_FAILED;
+    if (observation.state == State::PENDING) return DomainRecoveryDetail::IN_FLIGHT;
+    return DomainRecoveryDetail::NONE;
+}
 
 inline bool power_of_two(uint32_t n) { return n != 0 && (n & (n - 1)) == 0 && n < (1U << 31); }
 

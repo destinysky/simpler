@@ -2,6 +2,11 @@
  * Copyright (c) PyPTO Contributors.
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
  */
 
 #pragma once
@@ -21,6 +26,16 @@ enum class DomainRecoveryImpact : uint32_t {
 
 enum class DomainRecoveryPhase : uint32_t { PREPARE = 0, COMMIT = 1, ABORT = 2 };
 enum class DomainRecoveryEngine : uint32_t { NONE = 0, SDMA = 1, URMA = 2, CCU = 3 };
+
+// Evidence diagnostics never select recovery scope or replay policy.
+enum class DomainRecoveryDetail : uint32_t {
+    NONE = 0,
+    IN_FLIGHT = 1,
+    CQE_ERROR = 2,
+    INVALID_STATE = 3,
+    READ_FAILED = 4,
+    DEADLINE_EXCEEDED = 5,
+};
 
 enum class DomainRecoveryStatus : uint32_t {
     PRESERVED = 0,
@@ -75,16 +90,18 @@ struct DomainRecoveryResult {
     uint64_t workspace{0};
     uint32_t domain_preserved{0};
     uint32_t rebind_required{0};
-    // Provider-owned transport channels: SDMA streams, or a future backend equivalent.
+    // Provider-owned transport channels: SDMA streams or URMA peer queues.
+    // transport_stopped proves no old request remains active under the producer fence.
     uint32_t transport_channel_count{0};
     uint32_t stopped_channel_count{0};
     uint32_t transport_stopped{0};
-    uint32_t reserved{0};
+    DomainRecoveryDetail transport_detail{DomainRecoveryDetail::NONE};
 };
 
 static_assert(std::is_standard_layout_v<DomainRecoveryRequest> && std::is_trivially_copyable_v<DomainRecoveryRequest>);
 static_assert(std::is_standard_layout_v<DomainRecoveryResult> && std::is_trivially_copyable_v<DomainRecoveryResult>);
 static_assert(sizeof(DomainRecoveryRequest) == 56 && offsetof(DomainRecoveryRequest, impact) == 32);
+static_assert(offsetof(DomainRecoveryResult, transport_detail) == 132);
 static_assert(sizeof(DomainRecoveryResult) == 136 && offsetof(DomainRecoveryResult, device_ctx) == 80);
 
 // Optional host-runtime symbol. Unsupported backends keep their existing ABI.
